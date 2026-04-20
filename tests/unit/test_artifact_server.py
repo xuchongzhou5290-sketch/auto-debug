@@ -1,0 +1,59 @@
+from pathlib import Path
+import json
+import tempfile
+import unittest
+
+from autodbg.host.artifact_server import build_manifest, write_manifest, write_pull_script
+
+
+class ArtifactServerTest(unittest.TestCase):
+    def test_build_manifest_collects_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "payload").mkdir(parents=True, exist_ok=True)
+            (root / "payload" / "agent.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8", newline="\n")
+            (root / "manifest-ignore.json").write_text("{}", encoding="utf-8", newline="\n")
+
+            manifest = build_manifest(root, base_url="http://127.0.0.1:8765", manifest_name="manifest-ignore.json")
+
+        self.assertEqual(manifest["artifact_count"], 1)
+        self.assertEqual(manifest["root"], ".")
+        self.assertEqual(manifest["artifacts"][0]["relative_path"], "payload/agent.sh")
+        self.assertEqual(manifest["artifacts"][0]["url"], "http://127.0.0.1:8765/payload/agent.sh")
+
+    def test_write_manifest_persists_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "artifact.bin").write_bytes(b"demo")
+
+            manifest_path = write_manifest(root, manifest_name="autodbg-manifest.json")
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["artifact_count"], 1)
+        self.assertEqual(payload["root"], ".")
+        self.assertEqual(payload["artifacts"][0]["relative_path"], "artifact.bin")
+
+    def test_write_pull_script_embeds_workspace_and_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "payload").mkdir(parents=True, exist_ok=True)
+            (root / "payload" / "agent.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8", newline="\n")
+
+            script_path = write_pull_script(
+                root,
+                base_url="http://127.0.0.1:8765",
+                workspace="/mnt/sdcard/autodbg",
+                script_name="autodbg-pull.sh",
+                manifest_name="autodbg-manifest.json",
+            )
+            script_text = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("DEFAULT_WORKSPACE='/mnt/sdcard/autodbg'", script_text)
+        self.assertIn('fetch_to_file "$BASE_URL/$MANIFEST_NAME"', script_text)
+        self.assertIn('fetch_to_file "$BASE_URL/payload/agent.sh"', script_text)
+        self.assertIn('verify_file "$WORKSPACE/payload/agent.sh"', script_text)
+        self.assertIn("AUTODBG_PULL_OK", script_text)
+
+
+if __name__ == "__main__":
+    unittest.main()

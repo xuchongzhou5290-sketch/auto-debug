@@ -1,0 +1,30 @@
+model_id = "ak-av130n-ucm55me2"
+platform = "AK_AV130N"
+app_name = "LeCam"
+debug_workspace = "/tmp/debug"
+log_control_strategy = "cmdline_log_mode"
+supported_actions = [
+  "get_status",
+  "set_log_mode",
+  "app_restart",
+  "collect_evidence",
+]
+artifact_paths = [
+  "/mnt/sdcard",
+  "/tmp/debug",
+  "/opt/lecam",
+]
+app_start_markers = [
+  "LeCam goto start...",
+  "Starting DeviceManager...",
+]
+app_ready_markers = [
+  "LeCamCoreStart",
+  "MsgQueueThread_Start",
+]
+panic_markers = [
+  "start coredump...",
+  "Segmentation fault",
+  "panic",
+  "Oops",
+]

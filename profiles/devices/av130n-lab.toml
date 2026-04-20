@@ -1,0 +1,26 @@
+device_id = "av130n-lab"
+model_id = "ak-av130n-ucm55me2"
+notes = "Sample profile for one lab device."
+
+[serial]
+port = "COM16"
+baudrate = 115200
+login_prompt = "closeli login:"
+shell_prompt = "[root@closeli:~]#"
+
+[credentials]
+username = "root"
+password_env = "AUTO_DBG_DEVICE_PASSWORD"
+
+[network]
+expected_ip = "192.168.1.44"
+bootstrap_commands = []
+connectivity_checks = []
+pull_workspace = "/mnt/sdcard/autodbg"
+wifi_ssid = "xiaotudou"
+wifi_password = "12345678"
+wifi_mode = "WPA2"
+network_dir = "/opt/network"
+
+[storage]
+sdcard_drive = "E:\\"

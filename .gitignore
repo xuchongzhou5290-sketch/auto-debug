@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+artifacts/
+retrieved/
+_req_*.json
+_reboot_req.json
+config/user-settings.toml
+.pytest_cache/
+payloads/b200se-upgrade/*.tar

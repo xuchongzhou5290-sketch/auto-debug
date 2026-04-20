@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "action": "run",
+  "connection": {
+    "serial_port": "COM19",
+    "device_password": "your-root-password"
+  }
+}

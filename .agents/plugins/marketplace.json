@@ -1,0 +1,20 @@
+{
+  "name": "auto-debug-local",
+  "interface": {
+    "displayName": "Auto-Debug Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "embedded-device-auto-debug-mcp",
+      "source": {
+        "source": "local",
+        "path": "./plugins/embedded-device-auto-debug-mcp"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+transport_id = "network_serial_fallback"
+control_channels = ["network", "serial"]
+deploy_channels = ["network", "sdcard"]
+artifact_pull_channels = ["network", "serial"]
+fallback_order = ["network", "serial", "sdcard"]

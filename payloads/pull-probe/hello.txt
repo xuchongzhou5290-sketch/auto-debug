@@ -1,0 +1,2 @@
+auto-debug device pull probe
+timestamp_marker=static-fixture

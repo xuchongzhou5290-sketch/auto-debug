@@ -1,0 +1,5 @@
+[profiles]
+device = "devices/av130n-lab.toml"
+model = "models/ak-av130n-ucm55me2.toml"
+task = "tasks/startup-check.toml"
+transport = "transports/network-serial-fallback.toml"

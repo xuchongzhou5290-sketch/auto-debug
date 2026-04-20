@@ -1,0 +1,20 @@
+# Local lab settings template.
+# 常用参数尽量都放这里改，profile 侧保留机型/模板级默认值。
+# 同名环境变量会覆盖这里的值，例如 AUTO_DBG_SERIAL_PORT / AUTO_DBG_WIFI_SSID。
+
+[serial]
+port = "COM19"
+baudrate = 115200
+
+[network]
+preferred_interfaces = ["eth0", "wlan0", "usb0", "wlan1", "ra0", "apcli0"]
+wifi_ssid = "your-ssid"
+wifi_password = "your-password"
+wifi_mode = "WPA2"
+network_dir = "/opt/network"
+pull_workspace = "/mnt/sdcard/autodbg"
+# host_ip = "192.168.1.2"
+
+[storage]
+sdcard_drive = "E:\\"
+retrieved_root = "../retrieved"

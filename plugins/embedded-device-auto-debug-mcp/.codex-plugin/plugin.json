@@ -1,0 +1,35 @@
+{
+  "name": "embedded-device-auto-debug-mcp",
+  "version": "0.1.0",
+  "description": "Expose the embedded auto-debug workflow as MCP tools for AI agents.",
+  "author": {
+    "name": "Codex"
+  },
+  "license": "MIT",
+  "keywords": [
+    "embedded",
+    "serial",
+    "debug",
+    "mcp",
+    "autodbg"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Embedded Auto-Debug",
+    "shortDescription": "MCP tools for serial observation, control, evidence, and transfer.",
+    "longDescription": "Wrap the X:\\Auto-Debug embedded device automation workflow as MCP tools so other AI agents can observe serial output, run checks, collect evidence, and pull structured session results.",
+    "developerName": "Codex",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Inspect available serial ports and tell me which device to debug.",
+      "Run a startup debug session on COM19 and summarize the evidence.",
+      "Collect a health report from the current embedded device session."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

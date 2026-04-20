@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-04-16T23:38:16",
+  "root": ".",
+  "artifact_count": 1,
+  "artifacts": [
+    {
+      "relative_path": "hello.txt",
+      "size_bytes": 61,
+      "sha256": "266143c8ca32d8684f31dd7a0e953d20a9f90029cc5d2a77c5cb229d87371aac",
+      "url": null
+    }
+  ]
+}

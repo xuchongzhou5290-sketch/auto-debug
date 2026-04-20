@@ -1,0 +1,10 @@
+task_type = "startup_check"
+description = "Observe startup, establish control, and collect baseline evidence."
+deploy_strategy = "manual_or_existing_payload"
+success_template = "startup_default"
+evidence_template = "startup_default"
+initial_workflow = "startup_check"
+manual_check_items = [
+  "Confirm whether live view looks normal.",
+  "Confirm whether PTZ behavior matches expectation.",
+]

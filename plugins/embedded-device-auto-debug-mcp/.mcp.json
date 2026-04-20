@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "embedded-device-auto-debug": {
+      "command": "X:\\Auto-Debug\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-u",
+        "X:\\Auto-Debug\\plugins\\embedded-device-auto-debug-mcp\\scripts\\autodbg_mcp_server.py"
+      ],
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

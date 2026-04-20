@@ -1,0 +1,4124 @@
+from __future__ import annotations
+
+import base64
+import argparse
+import copy
+import getpass
+import io
+import hashlib
+import json
+import os
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path, PurePosixPath
+import socket
+import time
+from typing import Any
+from urllib.parse import urlparse
+
+from autodbg.agent import (
+    AgentCallError,
+    build_agent_error_response,
+    build_agent_tool_manifest,
+    build_agent_invocation,
+    build_agent_response,
+    execute_agent_request,
+    list_session_dirs,
+    load_agent_request,
+    render_agent_tool_markdown,
+    temporary_agent_environment,
+)
+from autodbg.config import apply_user_settings, default_user_settings_path, load_user_settings
+from autodbg.control.controller import CommandResult, DeviceController, LoginRequiredError
+from autodbg.deploy.deployer import Deployer
+from autodbg.evidence.collector import EvidenceCollector
+from autodbg.host.bundle import build_serial_bundle, split_base64_payload
+from autodbg.host.artifact_server import serve_directory, write_manifest, write_pull_script
+from autodbg.host.network import detect_host_ipv4
+from autodbg.host.storage import get_drive_info, list_host_drives
+from autodbg.mcp.install import HOME_PLUGIN_NAME, install_home_plugin
+from autodbg.profiles.loader import (
+    ProfileResolutionError,
+    default_profile_defaults_path,
+    load_device_profile,
+    load_run_profiles,
+    resolve_run_profile_paths,
+)
+from autodbg.serial.broker import SerialBroker
+from autodbg.serial.observer import MarkerHit, SerialObserver
+from autodbg.serial.runtime import (
+    SerialSupportError,
+    SerialTraceStreamClient,
+    SerialTraceEntry,
+    list_serial_ports,
+    list_serial_broker_registries,
+    load_serial_broker_registry,
+    open_serial_port,
+    serial_trace_log_path,
+    stop_serial_broker,
+)
+from autodbg.session.manager import SessionManager
+from autodbg.state.machine import DeviceState, StateSnapshot, TaskState
+from autodbg.workflows.evaluation import evaluate_health_checks, evaluate_startup_run
+from autodbg.workflows.runner import WorkflowRunner
+
+_FETCH_META_PREFIX = "__AUTODBG_META__"
+_FETCH_B64_PREFIX = "__AUTODBG_B64__"
+_STRUCTURED_OUTPUT_PREFIX = "__AUTODBG_CMD__"
+_DEFAULT_PREFERRED_INTERFACES = ("eth0", "wlan0", "usb0", "wlan1", "ra0", "apcli0")
+_RUN_DEFAULT_EVIDENCE_TIMEOUT = 30.0
+
+
+def _project_root() -> Path:
+    return Path(__file__).absolute().parents[3]
+
+
+def _default_settings_path() -> Path:
+    return default_user_settings_path(_project_root())
+
+
+def _default_profile_defaults_path() -> Path:
+    return default_profile_defaults_path(_project_root())
+
+
+def _default_payload_root() -> Path:
+    project_root = _project_root()
+    preferred = project_root / "payloads" / "pull-probe"
+    if preferred.is_dir():
+        return preferred
+    return project_root / "payloads"
+
+
+def _load_user_settings_from_args(args: argparse.Namespace):
+    cached = getattr(args, "_autodbg_user_settings", None)
+    if cached is not None:
+        return cached
+    settings = load_user_settings(getattr(args, "settings", _default_settings_path()))
+    setattr(args, "_autodbg_user_settings", settings)
+    return settings
+
+
+def _load_profiles_from_args(args: argparse.Namespace):
+    device_path, model_path, task_path, transport_path = resolve_run_profile_paths(
+        _project_root(),
+        device_path=getattr(args, "device", None),
+        model_path=getattr(args, "model", None),
+        task_path=getattr(args, "task", None),
+        transport_path=getattr(args, "transport", None),
+        defaults_path=getattr(args, "profiles_defaults", _default_profile_defaults_path()),
+    )
+    profiles = load_run_profiles(device_path, model_path, task_path, transport_path)
+    profiles = apply_user_settings(profiles, _load_user_settings_from_args(args))
+    if getattr(args, "serial_port", None):
+        profiles = copy.deepcopy(profiles)
+        profiles.device.serial.port = args.serial_port
+    if getattr(args, "baudrate", None):
+        profiles = copy.deepcopy(profiles)
+        profiles.device.serial.baudrate = args.baudrate
+    return profiles
+
+
+def _resolve_serial_connection_from_settings(
+    args: argparse.Namespace,
+    *,
+    serial_port: str | None,
+    baudrate: int | None,
+    require_port: bool = True,
+) -> tuple[str | None, int]:
+    settings = _load_user_settings_from_args(args)
+    resolved_port = serial_port or settings.serial.port
+    resolved_baudrate = baudrate or settings.serial.baudrate or 115200
+    if require_port and not resolved_port:
+        raise ValueError(
+            "No serial port was provided. Set AUTO_DBG_SERIAL_PORT, "
+            "fill config/user-settings.toml, or pass --serial-port."
+        )
+    return resolved_port, resolved_baudrate
+
+
+def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--device",
+        type=Path,
+        help="Optional path to the device profile TOML; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        help="Optional path to the model profile TOML; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--task",
+        type=Path,
+        help="Optional path to the task profile TOML; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--transport",
+        type=Path,
+        help="Optional path to the transport profile TOML; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--profiles-defaults",
+        type=Path,
+        default=_default_profile_defaults_path(),
+        help="Manifest that defines the default device/model/task/transport profile paths",
+    )
+    parser.add_argument(
+        "--artifacts-root",
+        type=Path,
+        default=_project_root() / "artifacts",
+        help="Root directory for generated sessions",
+    )
+    parser.add_argument(
+        "--settings",
+        type=Path,
+        default=_default_settings_path(),
+        help="Path to the shared user-settings TOML; missing files are ignored",
+    )
+    parser.add_argument("--serial-port", help="Override the serial port from the device profile")
+    parser.add_argument("--baudrate", type=int, help="Override the serial baudrate from the device profile")
+
+
+def _add_watch_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--device",
+        type=Path,
+        help="Optional path to the device profile TOML used for watch hotkeys; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        help="Optional path to the model profile TOML used for watch hotkeys; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--task",
+        type=Path,
+        help="Optional path to the task profile TOML used for watch hotkeys; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--transport",
+        type=Path,
+        help="Optional path to the transport profile TOML used for watch hotkeys; falls back to profiles/defaults.toml",
+    )
+    parser.add_argument(
+        "--profiles-defaults",
+        type=Path,
+        default=_default_profile_defaults_path(),
+        help="Manifest that defines the default device/model/task/transport profile paths",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="autodbg", description="Embedded device auto-debug scaffold")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Create a session and render the MVP workflow plan")
+    _add_profile_arguments(run_parser)
+    run_parser.add_argument("--observe-seconds", type=float, default=3.0, help="Initial serial observation window")
+    run_parser.add_argument(
+        "--skip-evidence",
+        action="store_true",
+        help="Skip the default evidence bundle so run stops after baseline startup checks",
+    )
+    run_parser.add_argument(
+        "--evidence-timeout",
+        type=float,
+        default=_RUN_DEFAULT_EVIDENCE_TIMEOUT,
+        help="Timeout in seconds for each default evidence command during run",
+    )
+
+    stage_sd_parser = subparsers.add_parser("stage-sd", help="Copy a local file into the configured SD card drive")
+    _add_profile_arguments(stage_sd_parser)
+    stage_sd_parser.add_argument("--source", type=Path, required=True, help="Local file to stage onto the SD card")
+    stage_sd_parser.add_argument(
+        "--target-subdir",
+        default=r"debug\autodbg",
+        help="Relative subdirectory under the SD card drive used for staged files",
+    )
+    stage_sd_parser.add_argument("--dest-name", help="Optional destination filename on the SD card")
+    stage_sd_parser.add_argument("--no-verify", action="store_true", help="Skip SHA256 verification after copy")
+    stage_sd_parser.add_argument(
+        "--allow-non-removable",
+        action="store_true",
+        help="Allow staging onto a drive that is not detected as removable",
+    )
+
+    storage_parser = subparsers.add_parser("storage", help="Inspect host drive letters and removable-drive candidates")
+    storage_parser.add_argument("--device", type=Path, help="Optional device profile path used for configured-drive validation")
+    storage_parser.add_argument(
+        "--settings",
+        type=Path,
+        default=_default_settings_path(),
+        help="Path to the shared user-settings TOML; missing files are ignored",
+    )
+
+    bootstrap_parser = subparsers.add_parser("bootstrap-network", help="Bring up device networking over serial shell")
+    _add_profile_arguments(bootstrap_parser)
+    bootstrap_parser.add_argument(
+        "--mode",
+        choices=["lan_ready", "wlan_script", "offline"],
+        default="lan_ready",
+        help="How the device is expected to get online for this task",
+    )
+    bootstrap_parser.add_argument(
+        "--bootstrap-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Shell command used to bootstrap networking (repeatable)",
+    )
+    bootstrap_parser.add_argument(
+        "--check-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Shell command used to verify networking (repeatable)",
+    )
+    bootstrap_parser.add_argument("--wifi-ssid", help="WiFi SSID used when auto-building wlan_script bootstrap commands")
+    bootstrap_parser.add_argument(
+        "--wifi-password",
+        help="WiFi password used when auto-building wlan_script bootstrap commands",
+    )
+    bootstrap_parser.add_argument(
+        "--wifi-mode",
+        help="WiFi auth mode such as WPA2, used when auto-building wlan_script bootstrap commands",
+    )
+    bootstrap_parser.add_argument(
+        "--network-dir",
+        help="Device-side directory that contains wlan_run.sh and wifi_cmd.sh",
+    )
+    bootstrap_parser.add_argument("--timeout", type=float, default=20.0, help="Timeout in seconds for each shell command")
+
+    serve_parser = subparsers.add_parser("serve-artifacts", help="Serve a local artifact directory over HTTP for device pull")
+    serve_parser.add_argument(
+        "--root",
+        type=Path,
+        default=_default_payload_root(),
+        help="Directory to expose over HTTP; defaults to the local payload root",
+    )
+    serve_parser.add_argument("--bind", default="0.0.0.0", help="Bind address for the local HTTP server")
+    serve_parser.add_argument("--port", type=int, default=8765, help="TCP port for the local HTTP server")
+    serve_parser.add_argument(
+        "--settings",
+        type=Path,
+        default=_default_settings_path(),
+        help="Path to the shared user-settings TOML; missing files are ignored",
+    )
+    serve_parser.add_argument("--base-url", help="Public base URL used when generating the manifest")
+    serve_parser.add_argument(
+        "--manifest-name",
+        default="autodbg-manifest.json",
+        help="Filename used for the generated artifact manifest",
+    )
+    serve_parser.add_argument(
+        "--duration-seconds",
+        type=float,
+        help="Optional auto-stop duration for the local HTTP server",
+    )
+    serve_parser.add_argument(
+        "--workspace",
+        default="/mnt/sdcard/autodbg",
+        help="Default device-side workspace embedded into the generated pull script",
+    )
+    serve_parser.add_argument(
+        "--pull-script-name",
+        default="autodbg-pull.sh",
+        help="Filename used for the generated device pull script",
+    )
+
+    device_pull_parser = subparsers.add_parser(
+        "device-pull",
+        help="Serve local artifacts and trigger a device-side pull over the serial shell",
+    )
+    _add_profile_arguments(device_pull_parser)
+    device_pull_parser.add_argument(
+        "--root",
+        type=Path,
+        default=_default_payload_root(),
+        help="Directory to expose over HTTP; defaults to the local payload root",
+    )
+    device_pull_parser.add_argument(
+        "--mode",
+        choices=["lan_ready", "wlan_script", "offline"],
+        default="lan_ready",
+        help="How the device is expected to get online for this task",
+    )
+    device_pull_parser.add_argument(
+        "--bootstrap-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Shell command used to bootstrap networking before the pull (repeatable)",
+    )
+    device_pull_parser.add_argument(
+        "--check-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Shell command used to verify networking before the pull (repeatable)",
+    )
+    device_pull_parser.add_argument("--wifi-ssid", help="WiFi SSID used when auto-building wlan_script bootstrap commands")
+    device_pull_parser.add_argument(
+        "--wifi-password",
+        help="WiFi password used when auto-building wlan_script bootstrap commands",
+    )
+    device_pull_parser.add_argument(
+        "--wifi-mode",
+        help="WiFi auth mode such as WPA2, used when auto-building wlan_script bootstrap commands",
+    )
+    device_pull_parser.add_argument(
+        "--network-dir",
+        help="Device-side directory that contains wlan_run.sh and wifi_cmd.sh",
+    )
+    device_pull_parser.add_argument("--bind", default="0.0.0.0", help="Bind address for the local HTTP server")
+    device_pull_parser.add_argument("--port", type=int, default=8765, help="TCP port for the local HTTP server")
+    device_pull_parser.add_argument("--base-url", help="Public base URL used by the device to fetch artifacts")
+    device_pull_parser.add_argument(
+        "--workspace",
+        help="Device-side workspace where the pull script should place files",
+    )
+    device_pull_parser.add_argument(
+        "--manifest-name",
+        default="autodbg-manifest.json",
+        help="Filename used for the generated artifact manifest",
+    )
+    device_pull_parser.add_argument(
+        "--pull-script-name",
+        default="autodbg-pull.sh",
+        help="Filename used for the generated device pull script",
+    )
+    device_pull_parser.add_argument(
+        "--transfer-mode",
+        choices=["auto", "http", "serial_bundle"],
+        default="auto",
+        help="Prefer HTTP pull, force serial bundle transfer, or auto-select based on device capabilities",
+    )
+    device_pull_parser.add_argument(
+        "--serial-bundle-chunk-size",
+        type=int,
+        default=768,
+        help="Chunk size used when sending a base64-encoded tar bundle over the serial shell",
+    )
+    device_pull_parser.add_argument(
+        "--list-command",
+        help="Optional follow-up command that lists the pulled files for verification",
+    )
+    device_pull_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds for each shell command")
+
+    observe_parser = subparsers.add_parser("observe", help="Capture serial output into a new session")
+    _add_profile_arguments(observe_parser)
+    observe_parser.add_argument("--seconds", type=float, default=10.0, help="How long to observe the serial port")
+    observe_parser.add_argument("--live", action="store_true", help="Print serial lines in real time while capturing")
+    observe_parser.add_argument("--follow", action="store_true", help="Keep watching until Ctrl+C")
+    observe_parser.add_argument(
+        "--markers-only",
+        action="store_true",
+        help="When used with --live, only print lines that hit known markers",
+    )
+    observe_parser.add_argument(
+        "--focus",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="When used with --live, also print non-marker lines that contain TEXT (repeatable)",
+    )
+    observe_parser.add_argument(
+        "--poke-newline",
+        action="store_true",
+        help="Send one newline after opening the serial port to wake the current prompt",
+    )
+
+    exec_parser = subparsers.add_parser("exec", help="Login over serial and execute a shell command")
+    _add_profile_arguments(exec_parser)
+    exec_parser.add_argument("--shell-command", required=True, help="Command to execute once a shell prompt is reached")
+    exec_parser.add_argument("--timeout", type=float, default=20.0, help="Command timeout in seconds")
+
+    fetch_parser = subparsers.add_parser("fetch-file", help="Fetch a device-side file over the serial shell using base64")
+    _add_profile_arguments(fetch_parser)
+    fetch_parser.add_argument("--remote-path", required=True, help="Absolute device-side file path to fetch")
+    fetch_parser.add_argument("--output", type=Path, help="Optional local output path")
+    fetch_parser.add_argument("--timeout", type=float, default=60.0, help="Fetch timeout in seconds")
+
+    fetch_path_parser = subparsers.add_parser(
+        "fetch-path",
+        help="Fetch a device-side file or directory; directories are returned as tar streams",
+    )
+    _add_profile_arguments(fetch_path_parser)
+    fetch_path_parser.add_argument("--remote-path", required=True, help="Absolute device-side file or directory path to fetch")
+    fetch_path_parser.add_argument("--output", type=Path, help="Optional local output path")
+    fetch_path_parser.add_argument("--timeout", type=float, default=90.0, help="Fetch timeout in seconds")
+
+    collect_parser = subparsers.add_parser(
+        "collect-evidence",
+        help="Run a default evidence command bundle and fetch selected small device files",
+    )
+    _add_profile_arguments(collect_parser)
+    collect_parser.add_argument(
+        "--shell-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Additional shell command to capture as evidence (repeatable)",
+    )
+    collect_parser.add_argument(
+        "--remote-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Additional small device-side file to fetch with base64 (repeatable)",
+    )
+    collect_parser.add_argument(
+        "--skip-defaults",
+        action="store_true",
+        help="Only run explicitly provided shell/file evidence items",
+    )
+    collect_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds for each evidence action")
+
+    health_parser = subparsers.add_parser("health", help="Run the serial health probe bundle against the device")
+    _add_profile_arguments(health_parser)
+    health_parser.add_argument("--timeout", type=float, default=20.0, help="Timeout in seconds for each health probe")
+    health_parser.add_argument(
+        "--skip-sd-write-probe",
+        action="store_true",
+        help="Skip the temporary write/read/delete probe on /mnt/sdcard",
+    )
+
+    resume_parser = subparsers.add_parser("resume", help="Show the stored session summary")
+    resume_parser.add_argument("--session-dir", type=Path, required=True, help="Path to the session directory")
+
+    summary_parser = subparsers.add_parser("summary", help="Print summary.json for a session")
+    summary_parser.add_argument("--session-dir", type=Path, required=True, help="Path to the session directory")
+
+    report_parser = subparsers.add_parser("report", help="Print report.md for a session")
+    report_target = report_parser.add_mutually_exclusive_group(required=True)
+    report_target.add_argument("--session-dir", type=Path, help="Path to the session directory")
+    report_target.add_argument("--latest", action="store_true", help="Use the latest session under artifacts root")
+    report_parser.add_argument(
+        "--artifacts-root",
+        type=Path,
+        default=_project_root() / "artifacts",
+        help="Root directory for generated sessions",
+    )
+
+    watch_parser = subparsers.add_parser(
+        "watch-serial",
+        help="Tail the shared serial TX/RX trace without opening the COM port",
+    )
+    _add_watch_profile_arguments(watch_parser)
+    watch_parser.add_argument(
+        "--serial-port",
+        help="Serial port name, for example COM19; defaults to AUTO_DBG_SERIAL_PORT or config/user-settings.toml",
+    )
+    watch_parser.add_argument("--tail", type=int, default=20, help="How many existing trace lines to show first")
+    watch_parser.add_argument("--follow", action="store_true", help="Keep following the shared serial trace until Ctrl+C")
+    watch_parser.add_argument("--show-system", action="store_true", help="Include OPEN/CLOSE system trace lines")
+    watch_parser.add_argument(
+        "--raw-live",
+        action="store_true",
+        help="Start or attach to a local serial broker so the trace contains the full raw serial stream",
+    )
+    watch_parser.add_argument(
+        "--baudrate",
+        type=int,
+        help="Baudrate used when starting the raw serial broker; defaults to settings or 115200",
+    )
+    watch_parser.add_argument(
+        "--stdin-probe",
+        action="store_true",
+        help="When following a live broker, pressing Enter in this window sends a newline probe and reports the result",
+    )
+    watch_parser.add_argument(
+        "--stdin-shell",
+        action="store_true",
+        help="When following a live broker, type shell commands in this window and press Enter to send them over serial",
+    )
+    watch_parser.add_argument(
+        "--settings",
+        type=Path,
+        default=_default_settings_path(),
+        help="Path to the shared user-settings TOML; missing files are ignored",
+    )
+
+    broker_parser = subparsers.add_parser("serial-broker", help="List or stop local raw serial brokers")
+    broker_subparsers = broker_parser.add_subparsers(dest="broker_command", required=True)
+    broker_list_parser = broker_subparsers.add_parser("list", help="List active raw serial brokers")
+    broker_list_parser.add_argument("--serial-port", help="Optional serial port filter, for example COM19")
+    broker_stop_parser = broker_subparsers.add_parser(
+        "stop",
+        help="Stop one or more raw serial brokers and release the physical COM port",
+    )
+    broker_stop_target = broker_stop_parser.add_mutually_exclusive_group(required=True)
+    broker_stop_target.add_argument("--serial-port", help="Serial port name, for example COM19")
+    broker_stop_target.add_argument("--all", action="store_true", help="Stop every active raw serial broker")
+
+    agent_parser = subparsers.add_parser(
+        "agent-call",
+        help="Execute a structured JSON request for another AI agent and return structured JSON",
+    )
+    agent_parser.add_argument(
+        "--request",
+        default="-",
+        help="Path to the agent request JSON file, or - to read the JSON request from stdin",
+    )
+    agent_parser.add_argument("--pretty", action="store_true", help="Pretty-print the JSON response")
+
+    describe_agent_parser = subparsers.add_parser(
+        "describe-agent-tool",
+        help="Print an AI-oriented self-description of the embedded auto-debug tool",
+    )
+    describe_agent_parser.add_argument(
+        "--format",
+        choices=["json", "markdown"],
+        default="json",
+        help="Output format for the self-description",
+    )
+    describe_agent_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+
+    install_home_plugin_parser = subparsers.add_parser(
+        "install-home-plugin",
+        help="Install or upgrade the home-local MCP plugin under the current user's home directory",
+    )
+    install_home_plugin_parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=_project_root(),
+        help="Path to the independent auto-debug project root; defaults to the current project",
+    )
+    install_home_plugin_parser.add_argument(
+        "--home-root",
+        type=Path,
+        default=Path.home(),
+        help="Target home directory for plugin installation; defaults to the current user home",
+    )
+    install_home_plugin_parser.add_argument(
+        "--plugin-name",
+        default=HOME_PLUGIN_NAME,
+        help=f"Plugin folder name; defaults to {HOME_PLUGIN_NAME}",
+    )
+
+    subparsers.add_parser("show-mvp", help="Print the MVP workflow document path and command entry")
+    subparsers.add_parser("ports", help="List serial ports using pyserial")
+    return parser
+
+
+def _print_run_report(summary: dict[str, Any]) -> None:
+    session = summary["session"]
+    profiles = summary["profiles"]
+    evaluation = summary.get("evaluation", {})
+    evidence = summary.get("evidence_results", {})
+    print("[ ooo.. ] 3/5 steps")
+    print(f"[DONE] Session created: {session['session_id']}")
+    print(f"[DONE] Device: {profiles['device']['device_id']} ({profiles['model']['model_id']})")
+    print(f"[ACTIVE] Workflow: {summary['workflow']}")
+    if evaluation:
+        print(f"[DONE] Startup verdict: {evaluation.get('verdict', 'unknown')}")
+        print(f"[ACTIVE] {evaluation.get('summary', '')}")
+        findings = evaluation.get("findings", [])
+        if findings:
+            print("[TODO] Findings:")
+            for finding in findings:
+                print(f"  - {finding['level'].upper()} {finding['check_name']}: {finding['message']}")
+    if evidence:
+        command_results = evidence.get("command_results", [])
+        file_results = evidence.get("file_results", [])
+        command_failures = [item for item in command_results if item.get("exit_code") != 0]
+        file_failures = [item for item in file_results if item.get("status") != "ok"]
+        print(f"[DONE] Evidence commands: {len(command_results)}")
+        if file_results:
+            ok_files = sum(1 for item in file_results if item.get("status") == "ok")
+            print(f"[DONE] Evidence files: {ok_files}/{len(file_results)}")
+        if command_failures:
+            print(f"[ERROR] Evidence command failures: {len(command_failures)}")
+        if file_failures:
+            print(f"[ERROR] Evidence file failures: {len(file_failures)}")
+    manual_items = profiles.get("task", {}).get("manual_check_items", [])
+    if manual_items:
+        print("[TODO] Manual checks:")
+        for item in manual_items:
+            print(f"  - {item}")
+    print("[TODO] Session directory:")
+    print(f"  {session['session_paths']['root']}")
+
+
+def _build_health_checks(*, include_sd_write_probe: bool) -> list[tuple[str, str]]:
+    checks = [
+        ("appver", "cat /opt/appver.txt"),
+        ("lecam_process", "ps | grep LeCam"),
+        ("mmc_devices", "ls /dev | grep mmc"),
+        ("mmc_partitions", "cat /proc/partitions | grep mmc"),
+        ("mmc_mount", "mount | grep mmc"),
+        ("sdcard_listing", "ls /mnt/sdcard"),
+        ("sdcard_capacity", "df -h /mnt/sdcard"),
+    ]
+    if include_sd_write_probe:
+        checks.append(
+            (
+                "sdcard_write_probe",
+                "echo autodbg_probe > /mnt/sdcard/autodbg_probe.txt && "
+                "cat /mnt/sdcard/autodbg_probe.txt && "
+                "rm -f /mnt/sdcard/autodbg_probe.txt && "
+                "echo PROBE_OK",
+            )
+        )
+    checks.append(("mmc_dmesg_tail", "dmesg | grep mmc | tail -n 20"))
+    return checks
+
+
+def _build_collect_evidence_commands(profiles) -> list[tuple[str, str]]:
+    commands = [
+        ("uname", "uname -a"),
+        ("mounts", "mount"),
+        ("disk_usage", "df -h"),
+        ("ifconfig", "ifconfig -a"),
+        (
+            "app_process",
+            f"ps | grep -F {_sh_single_quote(profiles.model.app_name)} | grep -v grep || "
+            f"echo 'AUTODBG_PROCESS_MISSING {profiles.model.app_name}'",
+        ),
+        ("mmc_dmesg_tail", "dmesg | grep mmc | tail -n 50 || true"),
+    ]
+    for index, artifact_path in enumerate(profiles.model.artifact_paths, start=1):
+        commands.append(
+            (
+                f"artifact_path_{index}",
+                f"if [ -e {_sh_single_quote(artifact_path)} ]; then "
+                f"ls -al {_sh_single_quote(artifact_path)}; "
+                f"else echo 'AUTODBG_MISSING_PATH {artifact_path}'; fi",
+            )
+        )
+    return commands
+
+
+def _default_collect_evidence_files(profiles) -> list[str]:
+    candidates = ["/etc/wlanname"]
+    return list(dict.fromkeys(candidates))
+
+
+def _execute_named_command(
+    *,
+    name: str,
+    shell_command: str,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    event_type: str,
+    event_summary: str,
+    artifact_prefix: str,
+    timeout: float = 20.0,
+    serial_port=None,
+) -> dict[str, Any]:
+    result = _execute_structured_command(
+        controller=controller,
+        shell_command=shell_command,
+        timeout=timeout,
+        serial_port=serial_port,
+    )
+    transcript = "\n".join(result.transcript) + ("\n" if result.transcript else "")
+    output = "\n".join(result.output_lines) + ("\n" if result.output_lines else "")
+    collector.write_text_artifact(f"logs/{artifact_prefix}-transcript.log", transcript)
+    collector.write_text_artifact(f"logs/{artifact_prefix}-output.log", output)
+    payload = {
+        "name": name,
+        "command": shell_command,
+        "exit_code": result.exit_code,
+        "output_lines": result.output_lines,
+    }
+    collector.append_event(
+        event_type=event_type,
+        source="workflow_runner",
+        summary=event_summary,
+        payload=payload,
+    )
+    return payload
+
+
+def _run_baseline_check(
+    *,
+    name: str,
+    shell_command: str,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    timeout: float = 20.0,
+    serial_port=None,
+) -> dict[str, Any]:
+    return _execute_named_command(
+        name=name,
+        shell_command=shell_command,
+        controller=controller,
+        collector=collector,
+        event_type="baseline_check",
+        event_summary=f"Baseline check completed: {name}",
+        artifact_prefix=f"check-{name}",
+        timeout=timeout,
+        serial_port=serial_port,
+    )
+
+
+def _collect_evidence_bundle(
+    *,
+    profiles,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    timeout: float,
+    serial_port=None,
+    command_items: list[tuple[str, str]] | None = None,
+    remote_files: list[str] | None = None,
+    command_prefix: str = "collect-evidence",
+    file_prefix: str = "collect-evidence-file",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    command_plan = list(command_items) if command_items is not None else _build_collect_evidence_commands(profiles)
+    file_plan = list(dict.fromkeys(remote_files)) if remote_files is not None else _default_collect_evidence_files(profiles)
+
+    command_results: list[dict[str, Any]] = []
+    file_results: list[dict[str, Any]] = []
+
+    for name, shell_command in command_plan:
+        command_results.append(
+            _execute_named_command(
+                name=name,
+                shell_command=shell_command,
+                controller=controller,
+                collector=collector,
+                event_type="evidence_command",
+                event_summary=f"Evidence command completed: {name}",
+                artifact_prefix=f"{command_prefix}-{name}",
+                timeout=timeout,
+                serial_port=serial_port,
+            )
+        )
+
+    for index, remote_path in enumerate(file_plan, start=1):
+        fetch_result = _fetch_remote_file_artifact(
+            controller=controller,
+            collector=collector,
+            remote_path=remote_path,
+            timeout=timeout,
+            prefix=f"{file_prefix}-{index}",
+            serial_port=serial_port,
+        )
+        file_results.append(fetch_result)
+        collector.append_event(
+            event_type="collect_evidence_file",
+            source="device_controller",
+            summary=f"Fetched evidence file: {remote_path}",
+            payload=fetch_result,
+            severity="warning" if fetch_result["status"] != "ok" else "info",
+        )
+
+    return command_results, file_results
+
+
+def _format_output_excerpt(output_lines: list[str], *, max_length: int = 88) -> str:
+    if not output_lines:
+        return "(no output)"
+    first_line = output_lines[0].strip()
+    if len(first_line) > max_length:
+        first_line = first_line[: max_length - 3] + "..."
+    if len(output_lines) > 1:
+        return f"{first_line} (+{len(output_lines) - 1} lines)"
+    return first_line
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+        size /= 1024
+    return f"{size:.1f}TiB"
+
+
+def _write_command_artifacts(
+    *,
+    collector: EvidenceCollector,
+    prefix: str,
+    result,
+) -> None:
+    transcript = "\n".join(result.transcript) + ("\n" if result.transcript else "")
+    output = "\n".join(result.output_lines) + ("\n" if result.output_lines else "")
+    collector.write_text_artifact(f"logs/{prefix}-transcript.log", transcript)
+    collector.write_text_artifact(f"logs/{prefix}-output.log", output)
+
+
+def _resolve_bootstrap_commands(
+    profiles,
+    mode: str,
+    override_commands: list[str],
+    *,
+    wifi_ssid: str | None = None,
+    wifi_password: str | None = None,
+    wifi_mode: str | None = None,
+    network_dir: str | None = None,
+) -> list[str]:
+    if override_commands:
+        return override_commands
+    network = profiles.device.network
+    if network is None:
+        return []
+    if mode == "wlan_script":
+        if network.bootstrap_commands:
+            return list(network.bootstrap_commands)
+        wifi_settings = _resolve_wifi_settings(
+            profiles,
+            wifi_ssid=wifi_ssid,
+            wifi_password=wifi_password,
+            wifi_mode=wifi_mode,
+            network_dir=network_dir,
+        )
+        return _build_auto_wlan_bootstrap_commands(**wifi_settings)
+    return []
+
+
+def _resolve_preferred_interfaces(profiles) -> list[str]:
+    network = profiles.device.network
+    if network is not None and network.preferred_interfaces:
+        return list(dict.fromkeys(network.preferred_interfaces))
+    return list(_DEFAULT_PREFERRED_INTERFACES)
+
+
+def _resolve_host_ip(profiles, *, base_url: str | None = None) -> str | None:
+    network = profiles.device.network
+    if network is not None and network.host_ip:
+        return network.host_ip
+    return _host_from_base_url(base_url) or detect_host_ipv4()
+
+
+def _build_existing_network_check(profiles) -> str:
+    interface_tokens = " ".join(_sh_single_quote(item) for item in _resolve_preferred_interfaces(profiles))
+    return (
+        "AUTODBG_FOUND_IFACE=''; "
+        f"for AUTODBG_IFACE in {interface_tokens}; do "
+        "if ifconfig \"$AUTODBG_IFACE\" >/dev/null 2>&1; then "
+        "if ifconfig \"$AUTODBG_IFACE\" | grep -E 'inet addr|inet ' >/dev/null 2>&1; then "
+        "AUTODBG_FOUND_IFACE=\"$AUTODBG_IFACE\"; "
+        "break; "
+        "fi; "
+        "fi; "
+        "done; "
+        "if [ -n \"$AUTODBG_FOUND_IFACE\" ]; then "
+        "printf 'AUTODBG_ACTIVE_IFACE=%s\\n' \"$AUTODBG_FOUND_IFACE\"; "
+        "ifconfig \"$AUTODBG_FOUND_IFACE\"; "
+        "else "
+        "echo 'AUTODBG_NO_ACTIVE_NETWORK' >&2; "
+        "false; "
+        "fi"
+    )
+
+
+def _resolve_connectivity_checks(
+    profiles,
+    override_commands: list[str],
+    *,
+    mode: str = "lan_ready",
+    base_url: str | None = None,
+) -> list[str]:
+    if override_commands:
+        return override_commands
+    network = profiles.device.network
+    if network is not None and network.connectivity_checks:
+        return list(network.connectivity_checks)
+    if mode == "offline":
+        return []
+    commands = [_build_existing_network_check(profiles)]
+    host_ip = _resolve_host_ip(profiles, base_url=base_url)
+    if host_ip:
+        commands.append(f"ping -c 1 {_sh_single_quote(host_ip)}")
+    elif network.expected_ip:
+        commands.append(f"ifconfig | grep {_sh_single_quote(network.expected_ip)}")
+    return commands
+
+
+def _resolve_pull_base_url(profiles, override_base_url: str | None, *, bind: str, port: int) -> str:
+    if override_base_url:
+        return override_base_url.rstrip("/")
+    network = profiles.device.network
+    if network is not None and network.pull_base_url:
+        return network.pull_base_url.rstrip("/")
+    return _default_base_url(bind, port, host_ip=_resolve_host_ip(profiles))
+
+
+def _resolve_wifi_settings(
+    profiles,
+    *,
+    wifi_ssid: str | None,
+    wifi_password: str | None,
+    wifi_mode: str | None,
+    network_dir: str | None,
+) -> dict[str, str | None]:
+    network = profiles.device.network
+    return {
+        "wifi_ssid": wifi_ssid or (network.wifi_ssid if network is not None else None),
+        "wifi_password": wifi_password or (network.wifi_password if network is not None else None),
+        "wifi_mode": wifi_mode or (network.wifi_mode if network is not None else "WPA2"),
+        "network_dir": network_dir or (network.network_dir if network is not None else None),
+    }
+
+
+def _build_auto_wlan_bootstrap_commands(
+    *,
+    wifi_ssid: str | None,
+    wifi_password: str | None,
+    wifi_mode: str | None,
+    network_dir: str | None,
+) -> list[str]:
+    if not wifi_ssid or wifi_password is None:
+        return []
+    net_dir_expr = _build_network_dir_resolver(network_dir)
+    quoted_ssid = _sh_single_quote(wifi_ssid)
+    quoted_password = _sh_single_quote(wifi_password)
+    quoted_mode = _sh_single_quote(wifi_mode or "WPA2")
+    return [
+        f"{net_dir_expr} && sh \"$NET_DIR/wlan_run.sh\" start",
+        f"{net_dir_expr} && sh \"$NET_DIR/wifi_cmd.sh\" connect {quoted_ssid} {quoted_password} {quoted_mode}",
+    ]
+
+
+def _resolve_pull_workspace(profiles, override_workspace: str | None) -> str:
+    if override_workspace:
+        return override_workspace
+    network = profiles.device.network
+    if network is not None and network.pull_workspace:
+        return network.pull_workspace
+    if any(path.startswith("/mnt/sdcard") for path in profiles.model.artifact_paths):
+        return "/mnt/sdcard/autodbg"
+    return profiles.model.debug_workspace
+
+
+def _default_base_url(bind: str, port: int, *, host_ip: str | None = None) -> str:
+    host = bind
+    if bind == "0.0.0.0":
+        host = host_ip or detect_host_ipv4() or socket.gethostbyname(socket.gethostname())
+    return f"http://{host}:{port}"
+
+
+def _host_from_base_url(base_url: str | None) -> str | None:
+    if not base_url:
+        return None
+    parsed = urlparse(base_url)
+    return parsed.hostname
+
+
+def _build_network_dir_resolver(network_dir: str | None) -> str:
+    if network_dir:
+        return f"NET_DIR={_sh_single_quote(network_dir)}"
+    candidates = [
+        "/opt/network",
+        "/mnt/sdcard/network",
+        "/mnt/sdcard/autodbg/network",
+        "/tmp/debug/network",
+        "/opt/lecam/network",
+        "/usr/local/wifi",
+        "/system/network",
+    ]
+    lines = ["NET_DIR=''"]
+    for candidate in candidates:
+        lines.append(
+            f'if [ -z "$NET_DIR" ] && [ -f "{candidate}/wifi_cmd.sh" ] && [ -f "{candidate}/wlan_run.sh" ]; then NET_DIR="{candidate}"; fi'
+        )
+    lines.append('if [ -z "$NET_DIR" ]; then NET_FILE=$(find / -path "*/network/wifi_cmd.sh" 2>/dev/null | head -n 1); [ -n "$NET_FILE" ] && NET_DIR=$(dirname "$NET_FILE"); fi')
+    lines.append('[ -n "$NET_DIR" ]')
+    return "; ".join(lines)
+
+
+def _normalize_focus_terms(focus_terms: list[str]) -> list[str]:
+    return [term.strip().lower() for term in focus_terms if term.strip()]
+
+
+def _line_matches_focus_terms(line: str, focus_terms: list[str]) -> bool:
+    if not focus_terms:
+        return True
+    lower_line = line.lower()
+    return any(term in lower_line for term in focus_terms)
+
+
+def _build_remote_pull_command(base_url: str, *, workspace: str, script_name: str) -> str:
+    quoted_workspace = _sh_single_quote(workspace)
+    quoted_script_name = _sh_single_quote(script_name)
+    quoted_script_url = _sh_single_quote(f"{base_url.rstrip('/')}/{script_name}")
+    return (
+        f"mkdir -p {quoted_workspace} && "
+        f"cd {quoted_workspace} && "
+        "if command -v curl >/dev/null 2>&1; then "
+        f"curl -fsSL {quoted_script_url} -o {quoted_script_name}; "
+        "elif command -v wget >/dev/null 2>&1 && wget --help >/dev/null 2>&1; then "
+        f"wget -q -O {quoted_script_name} {quoted_script_url}; "
+        "elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx 'wget'; then "
+        f"busybox wget -q -O {quoted_script_name} {quoted_script_url}; "
+        "else "
+        "echo 'No downloader available (curl/wget/busybox wget).' >&2; "
+        "exit 127; "
+        "fi && "
+        f"WORKSPACE={quoted_workspace} sh {quoted_script_name}"
+    )
+
+
+def _build_transfer_probe_command() -> str:
+    return (
+        "printf 'AUTODBG_DOWNLOADER='; "
+        "if command -v curl >/dev/null 2>&1; then printf 'curl\\n'; "
+        "elif command -v wget >/dev/null 2>&1 && wget --help >/dev/null 2>&1; then printf 'wget\\n'; "
+        "elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx 'wget'; then printf 'busybox_wget\\n'; "
+        "else printf 'none\\n'; fi; "
+        "printf 'AUTODBG_BASE64='; "
+        "if command -v base64 >/dev/null 2>&1; then printf 'yes\\n'; else printf 'no\\n'; fi; "
+        "printf 'AUTODBG_TAR='; "
+        "if command -v tar >/dev/null 2>&1; then printf 'yes\\n'; else printf 'no\\n'; fi"
+    )
+
+
+def _build_fetch_file_command(remote_path: str) -> str:
+    quoted_remote_path = _sh_single_quote(remote_path)
+    return (
+        f"if [ ! -f {quoted_remote_path} ]; then "
+        f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
+        "exit 2; "
+        "fi; "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=file\\n')}; "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"base64 < {quoted_remote_path} | "
+        "while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done"
+    )
+
+
+def _build_fetch_path_command(remote_path: str) -> str:
+    quoted_remote_path = _sh_single_quote(remote_path)
+    return (
+        f"if [ -f {quoted_remote_path} ]; then "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=file\\n')}; "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"base64 < {quoted_remote_path} | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
+        f"elif [ -d {quoted_remote_path} ]; then "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=tar\\n')}; "
+        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"tar -cf - {quoted_remote_path} | base64 | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
+        "else "
+        f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
+        "exit 2; "
+        "fi"
+    )
+
+
+def _fetch_artifact_relative_path(remote_path: str) -> str:
+    parts = [part for part in PurePosixPath(remote_path).parts if part not in {"", "/"}]
+    safe_parts = [part.replace(":", "_") for part in parts] or ["fetched-device-file.bin"]
+    return str(Path("fetched").joinpath(*safe_parts))
+
+
+def _parse_fetch_output_lines(output_lines: list[str]) -> tuple[dict[str, str], list[str]]:
+    metadata: dict[str, str] = {}
+    payload_lines: list[str] = []
+    for line in output_lines:
+        if line.startswith(_FETCH_META_PREFIX):
+            key_value = line[len(_FETCH_META_PREFIX) :]
+            key, _, value = key_value.partition("=")
+            if key:
+                metadata[key.lower()] = value
+            continue
+        if line.startswith(_FETCH_B64_PREFIX):
+            payload_lines.append(line[len(_FETCH_B64_PREFIX) :])
+    return metadata, payload_lines
+
+
+def _fetch_remote_file_artifact(
+    *,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    remote_path: str,
+    timeout: float,
+    prefix: str,
+    serial_port=None,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    result = controller.execute(
+        _build_fetch_file_command(remote_path),
+        timeout=timeout,
+        serial_port=serial_port,
+    )
+    return _finalize_fetch_result(
+        collector=collector,
+        remote_path=remote_path,
+        prefix=prefix,
+        result=result,
+        output_path=output_path,
+    )
+
+
+def _fetch_remote_path_artifact(
+    *,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    remote_path: str,
+    timeout: float,
+    prefix: str,
+    serial_port=None,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    result = controller.execute(
+        _build_fetch_path_command(remote_path),
+        timeout=timeout,
+        serial_port=serial_port,
+    )
+    return _finalize_fetch_result(
+        collector=collector,
+        remote_path=remote_path,
+        prefix=prefix,
+        result=result,
+        output_path=output_path,
+    )
+
+
+def _finalize_fetch_result(
+    *,
+    collector: EvidenceCollector,
+    remote_path: str,
+    prefix: str,
+    result,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    _write_command_artifacts(collector=collector, prefix=prefix, result=result)
+    fetch_summary: dict[str, Any] = {
+        "remote_path": remote_path,
+        "command_result": result.to_dict(),
+        "status": "error",
+    }
+    if result.exit_code != 0:
+        fetch_summary["error"] = f"Remote fetch command returned exit code {result.exit_code}"
+        return fetch_summary
+
+    metadata, payload_lines = _parse_fetch_output_lines(result.output_lines)
+    mode = metadata.get("mode", "file")
+    fetch_summary["mode"] = mode
+    if not payload_lines:
+        fetch_summary["error"] = "No prefixed payload lines were found in fetch output."
+        return fetch_summary
+    try:
+        payload = base64.b64decode("".join(payload_lines), validate=False)
+    except Exception as exc:
+        fetch_summary["error"] = f"Failed to decode base64 output: {exc}"
+        return fetch_summary
+
+    if output_path is None:
+        relative_path = _fetch_artifact_relative_path(remote_path)
+        if mode == "tar":
+            relative_path += ".tar"
+        local_path = collector.write_retrieved_artifact(
+            relative_path,
+            payload,
+            artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
+        )
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(payload)
+        collector.write_text_artifact("logs/fetched-external-output-path.txt", str(output_path) + "\n")
+        local_path = collector.register_artifact(
+            output_path,
+            artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
+        )
+
+    fetch_summary.update(
+        {
+            "status": "ok",
+            "local_path": str(local_path),
+            "size_bytes": len(payload),
+            "sha256": _sha256_bytes(payload),
+        }
+    )
+    return fetch_summary
+
+
+def _parse_transfer_capabilities(output_lines: list[str]) -> dict[str, Any]:
+    capabilities: dict[str, Any] = {
+        "downloader": "unknown",
+        "has_base64": False,
+        "has_tar": False,
+    }
+    for raw_line in output_lines:
+        line = raw_line.strip()
+        if line.startswith("AUTODBG_DOWNLOADER="):
+            capabilities["downloader"] = line.partition("=")[2] or "unknown"
+        elif line.startswith("AUTODBG_BASE64="):
+            capabilities["has_base64"] = line.partition("=")[2].lower() == "yes"
+        elif line.startswith("AUTODBG_TAR="):
+            capabilities["has_tar"] = line.partition("=")[2].lower() == "yes"
+    return capabilities
+
+
+def _select_transfer_mode(requested_mode: str, *, capabilities: dict[str, Any], network_mode: str) -> str:
+    downloader = capabilities.get("downloader", "unknown")
+    has_base64 = bool(capabilities.get("has_base64"))
+    has_tar = bool(capabilities.get("has_tar"))
+
+    if requested_mode == "http":
+        if downloader in {"none", "unknown"}:
+            raise RuntimeError("HTTP transfer requested, but the device has no usable downloader.")
+        return "http"
+
+    if requested_mode == "serial_bundle":
+        if not has_base64 or not has_tar:
+            raise RuntimeError("Serial bundle transfer requested, but the device lacks base64/tar support.")
+        return "serial_bundle"
+
+    if network_mode == "offline":
+        if has_base64 and has_tar:
+            return "serial_bundle"
+        raise RuntimeError("Offline mode requires serial bundle support (base64 + tar), but the device does not provide it.")
+
+    if downloader not in {"none", "unknown"}:
+        return "http"
+    if has_base64 and has_tar:
+        return "serial_bundle"
+    raise RuntimeError("No usable transfer path found: downloader unavailable and serial bundle support missing.")
+
+
+def _build_serial_bundle_commands(
+    *,
+    base64_payload: str,
+    workspace: str,
+    chunk_size: int,
+    bundle_name: str = ".autodbg-bundle.tar",
+    artifact_count: int | None = None,
+) -> tuple[str, list[str], str]:
+    if chunk_size <= 0:
+        raise ValueError("serial bundle chunk size must be positive")
+    quoted_workspace = _sh_single_quote(workspace)
+    quoted_bundle_name = _sh_single_quote(bundle_name)
+    quoted_base64_name = _sh_single_quote(f"{bundle_name}.b64")
+    chunks = split_base64_payload(base64_payload, chunk_size=chunk_size)
+    prepare_command = (
+        f"mkdir -p {quoted_workspace} && "
+        f"cd {quoted_workspace} && "
+        f"rm -f {quoted_base64_name} {quoted_bundle_name} && "
+        f": > {quoted_base64_name}"
+    )
+    upload_commands = [
+        f"cd {quoted_workspace} && printf '%s' '{chunk}' >> {quoted_base64_name}"
+        for chunk in chunks
+    ]
+    files_label = artifact_count if artifact_count is not None else "unknown"
+    finalize_command = (
+        f"cd {quoted_workspace} && "
+        f"base64 -d < {quoted_base64_name} > {quoted_bundle_name} && "
+        f"tar -xf {quoted_bundle_name} && "
+        f"rm -f {quoted_base64_name} {quoted_bundle_name} && "
+        f"printf 'AUTODBG_SERIAL_BUNDLE_OK workspace=%s chunks={len(chunks)} files={files_label}\\n' \"$PWD\""
+    )
+    return prepare_command, upload_commands, finalize_command
+
+
+def _sh_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _build_structured_command(shell_command: str) -> str:
+    quoted_prefix = _sh_single_quote(_STRUCTURED_OUTPUT_PREFIX + "%s\\n")
+    return (
+        "( "
+        "AUTODBG_TMP=\"/tmp/.autodbg_cmd_$$.log\"; "
+        f"{{ {shell_command}; }} >\"$AUTODBG_TMP\" 2>&1; "
+        "AUTODBG_RC=$?; "
+        "while IFS= read -r AUTODBG_LINE || [ -n \"$AUTODBG_LINE\" ]; do "
+        f"printf {quoted_prefix} \"$AUTODBG_LINE\"; "
+        "done < \"$AUTODBG_TMP\"; "
+        "rm -f \"$AUTODBG_TMP\"; "
+        "exit \"$AUTODBG_RC\""
+        " )"
+    )
+
+
+def _extract_structured_output_lines(output_lines: list[str]) -> list[str]:
+    structured_lines = [
+        line[len(_STRUCTURED_OUTPUT_PREFIX) :]
+        for line in output_lines
+        if line.startswith(_STRUCTURED_OUTPUT_PREFIX)
+    ]
+    return structured_lines or output_lines
+
+
+def _execute_structured_command(
+    *,
+    controller: DeviceController,
+    shell_command: str,
+    timeout: float,
+    serial_port=None,
+) -> CommandResult:
+    result = controller.execute(
+        _build_structured_command(shell_command),
+        timeout=timeout,
+        serial_port=serial_port,
+    )
+    return CommandResult(
+        command=shell_command,
+        exit_code=result.exit_code,
+        output_lines=_extract_structured_output_lines(result.output_lines),
+        transcript=result.transcript,
+    )
+
+
+def _format_live_tag(hit: MarkerHit | None) -> str:
+    if hit is None:
+        return "SERIAL"
+    tag_map = {
+        "boot": "BOOT",
+        "kernel": "KERNEL",
+        "login": "LOGIN",
+        "shell": "SHELL",
+        "app_start": "APP_START",
+        "app_ready": "APP_READY",
+        "panic": "PANIC",
+    }
+    return tag_map.get(hit.tag, hit.tag.upper())
+
+
+def _build_live_serial_printer(*, markers_only: bool, focus_terms: list[str]):
+    normalized_focus_terms = _normalize_focus_terms(focus_terms)
+
+    def _printer(line: str, hit: MarkerHit | None) -> None:
+        if hit is None:
+            if markers_only:
+                return
+            if not _line_matches_focus_terms(line, normalized_focus_terms):
+                return
+        stamp = time.strftime("%H:%M:%S")
+        tag = _format_live_tag(hit)
+        print(f"[{tag} {stamp}] {line}", flush=True)
+
+    return _printer
+
+
+def _format_trace_entry(entry: SerialTraceEntry) -> str:
+    stamp = entry.timestamp.split("T")[-1]
+    direction = entry.direction.upper()
+    payload = entry.payload if entry.payload else "(empty line)"
+    return f"[{direction} {stamp}] {payload}"
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _session_manager(args: argparse.Namespace, profiles=None) -> SessionManager:
+    retrieved_root: Path | None = None
+    settings = _load_user_settings_from_args(args)
+    if settings.storage.retrieved_root is not None:
+        retrieved_root = settings.storage.retrieved_root
+    if profiles is not None and profiles.device.storage is not None and profiles.device.storage.retrieved_root:
+        retrieved_root = Path(profiles.device.storage.retrieved_root)
+    return SessionManager(args.artifacts_root, retrieved_root=retrieved_root)
+
+
+def _read_trace_entries(trace_path: Path) -> list[SerialTraceEntry]:
+    if not trace_path.exists():
+        return []
+    entries: list[SerialTraceEntry] = []
+    for raw_line in trace_path.read_text(encoding="utf-8").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            entries.append(SerialTraceEntry.from_json_line(raw_line))
+        except Exception:
+            continue
+    return entries
+
+
+def _resolve_watch_start_index(*, last_count: int, entry_count: int, tail: int, replay_existing: bool) -> int:
+    if replay_existing:
+        if tail <= 0:
+            return 0
+        return max(entry_count - tail, 0)
+    return min(last_count, entry_count)
+
+
+def _print_trace_entries(entries: list[SerialTraceEntry], *, show_system: bool) -> None:
+    for entry in entries:
+        _print_watch_trace_entry(entry, show_system=show_system)
+
+
+def _print_watch_trace_entry(entry: SerialTraceEntry, *, show_system: bool) -> bool:
+    if entry.direction == "sys":
+        if entry.payload.startswith("SERIAL_CONNECTED"):
+            baudrate = entry.payload.partition("baudrate=")[2] or "unknown"
+            print(f"[DONE] {entry.port} connected successfully @ {baudrate}", flush=True)
+            return True
+        if entry.payload.startswith("SERIAL_UNAVAILABLE"):
+            error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
+            print(f"[ERROR] {entry.port} is unavailable: {error_summary}", flush=True)
+            print(f"[TODO] Press Enter to retry reconnecting {entry.port}.", flush=True)
+            return True
+        if not show_system:
+            return False
+    print(_format_trace_entry(entry), flush=True)
+    return True
+
+
+class _WatchStdinShellState:
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.prompt_visible = False
+        self.status_message = _default_watch_status()
+        self.status_expires_at: float | None = None
+        self.recent_lines: list[str] = []
+        self.scroll_offset = 0
+        self.screen_dirty = True
+
+
+_WATCH_TUI_SCROLLBACK_LIMIT = 2000
+_WATCH_TUI_TRANSIENT_STATUS_SECONDS = 4.0
+
+
+def _default_watch_status() -> str:
+    return "Enter=send/probe | Ctrl+L=login | PgUp/PgDn=history | Ctrl+C=exit"
+
+
+def _set_watch_status_message(
+    state: _WatchStdinShellState,
+    message: str,
+    *,
+    transient_seconds: float | None = None,
+) -> None:
+    state.status_message = message or _default_watch_status()
+    state.status_expires_at = (
+        time.monotonic() + max(transient_seconds, 0.1)
+        if transient_seconds is not None
+        else None
+    )
+    state.screen_dirty = True
+
+
+def _refresh_watch_status_message(
+    state: _WatchStdinShellState,
+    *,
+    now: float | None = None,
+) -> bool:
+    if state.status_expires_at is None:
+        return False
+    current = time.monotonic() if now is None else now
+    if current < state.status_expires_at:
+        return False
+    state.status_expires_at = None
+    default_message = _default_watch_status()
+    if state.status_message != default_message:
+        state.status_message = default_message
+        state.screen_dirty = True
+        return True
+    return False
+
+
+def _watch_terminal_columns() -> int:
+    try:
+        return max(os.get_terminal_size().columns, 40)
+    except OSError:
+        return 120
+
+
+def _watch_terminal_lines() -> int:
+    try:
+        return max(os.get_terminal_size().lines, 8)
+    except OSError:
+        return 30
+
+
+def _watch_console_viewport(
+    writer=None,
+) -> tuple[object | None, tuple[int, int] | None, int | None, int | None, int | None, int | None]:
+    if writer not in {None, sys.stdout} or os.name != "nt":
+        return None, None, None, None, None, None
+    try:
+        import ctypes
+    except ImportError:
+        return None, None, None, None, None, None
+
+    class _Coord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class _SmallRect(ctypes.Structure):
+        _fields_ = [
+            ("Left", ctypes.c_short),
+            ("Top", ctypes.c_short),
+            ("Right", ctypes.c_short),
+            ("Bottom", ctypes.c_short),
+        ]
+
+    class _ConsoleScreenBufferInfo(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _Coord),
+            ("dwCursorPosition", _Coord),
+            ("wAttributes", ctypes.c_ushort),
+            ("srWindow", _SmallRect),
+            ("dwMaximumWindowSize", _Coord),
+        ]
+
+    handle = ctypes.windll.kernel32.GetStdHandle(-11)
+    if handle in (0, -1):
+        return None, None, None, None, None, None
+    info = _ConsoleScreenBufferInfo()
+    if not ctypes.windll.kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+        return None, None, None, None, None, None
+    return (
+        handle,
+        (int(info.dwCursorPosition.X), int(info.dwCursorPosition.Y)),
+        int(info.srWindow.Left),
+        int(info.srWindow.Top),
+        int(info.srWindow.Right),
+        int(info.srWindow.Bottom),
+    )
+
+
+def _watch_console_move_cursor(handle, x: int, y: int) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+
+    class _Coord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    kernel32 = ctypes.windll.kernel32
+    try:
+        kernel32.SetConsoleCursorPosition.argtypes = [ctypes.c_void_p, _Coord]
+        kernel32.SetConsoleCursorPosition.restype = ctypes.c_bool
+    except Exception:
+        pass
+    return bool(kernel32.SetConsoleCursorPosition(handle, _Coord(x, y)))
+
+
+def _watch_console_write_text(handle, x: int, y: int, text: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+
+    class _Coord(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    written = ctypes.c_ulong(0)
+    kernel32 = ctypes.windll.kernel32
+    try:
+        kernel32.WriteConsoleOutputCharacterW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_ulong,
+            _Coord,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.WriteConsoleOutputCharacterW.restype = ctypes.c_bool
+    except Exception:
+        pass
+    return bool(kernel32.WriteConsoleOutputCharacterW(handle, text, len(text), _Coord(x, y), ctypes.byref(written)))
+
+
+def _watch_console_set_cursor_visible(visible: bool, *, writer=None) -> bool:
+    handle, _cursor, _left_col, _top_row, _right_col, _bottom_row = _watch_console_viewport(writer)
+    if handle is None or os.name != "nt":
+        return False
+    try:
+        import ctypes
+    except ImportError:
+        return False
+
+    class _ConsoleCursorInfo(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_ulong), ("bVisible", ctypes.c_bool)]
+
+    info = _ConsoleCursorInfo()
+    kernel32 = ctypes.windll.kernel32
+    if not kernel32.GetConsoleCursorInfo(handle, ctypes.byref(info)):
+        return False
+    info.bVisible = bool(visible)
+    return bool(kernel32.SetConsoleCursorInfo(handle, ctypes.byref(info)))
+
+
+def _watch_tui_geometry(writer=None) -> tuple[object | None, int | None, int | None, int | None, int | None]:
+    handle, _cursor, left_col, top_row, right_col, bottom_row = _watch_console_viewport(writer)
+    if handle is None or left_col is None or top_row is None or right_col is None or bottom_row is None:
+        return None, None, None, None, None
+    viewport_width = max((right_col - left_col) + 1, 40)
+    viewport_height = max((bottom_row - top_row) + 1, 8)
+    return handle, left_col, top_row, viewport_width, viewport_height
+
+
+def _fit_watch_tui_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    cleaned = text.replace("\r", " ").replace("\n", " ")
+    if len(cleaned) <= width:
+        return cleaned.ljust(width)
+    if width <= 3:
+        return cleaned[:width]
+    return cleaned[: width - 3] + "..."
+
+
+def _append_watch_recent_line(state: _WatchStdinShellState, line: str) -> None:
+    state.recent_lines.append(line)
+    if state.scroll_offset > 0:
+        state.scroll_offset += 1
+    overflow = len(state.recent_lines) - _WATCH_TUI_SCROLLBACK_LIMIT
+    if overflow > 0:
+        del state.recent_lines[:overflow]
+        state.scroll_offset = max(state.scroll_offset - overflow, 0)
+
+
+def _watch_tui_log_rows(height: int) -> int:
+    return max(max(height, 8) - 4, 1)
+
+
+def _clamp_watch_scroll_offset(state: _WatchStdinShellState, *, log_rows: int) -> int:
+    max_offset = max(len(state.recent_lines) - log_rows, 0)
+    if state.scroll_offset > max_offset:
+        state.scroll_offset = max_offset
+    elif state.scroll_offset < 0:
+        state.scroll_offset = 0
+    return state.scroll_offset
+
+
+def _page_watch_history(
+    state: _WatchStdinShellState,
+    *,
+    height: int,
+    direction: str,
+) -> bool:
+    log_rows = _watch_tui_log_rows(height)
+    page_step = max((log_rows * 3 + 3) // 4, 1)
+    current_offset = _clamp_watch_scroll_offset(state, log_rows=log_rows)
+    max_offset = max(len(state.recent_lines) - log_rows, 0)
+    if direction == "page_up":
+        next_offset = min(current_offset + page_step, max_offset)
+    elif direction == "page_down":
+        next_offset = max(current_offset - page_step, 0)
+    elif direction == "home":
+        next_offset = max_offset
+    elif direction == "end":
+        next_offset = 0
+    else:
+        return False
+    if next_offset == current_offset:
+        return False
+    state.scroll_offset = next_offset
+    state.screen_dirty = True
+    return True
+
+
+def _build_watch_tui_rows(
+    state: _WatchStdinShellState,
+    *,
+    serial_port: str,
+    width: int,
+    height: int,
+    baudrate: int | None = None,
+    input_label: str | None = None,
+    input_value: str | None = None,
+    status_message: str | None = None,
+) -> tuple[list[str], int, int]:
+    safe_width = max(width, 40)
+    safe_height = max(height, 8)
+    effective_status = status_message if status_message is not None else state.status_message
+    if not effective_status:
+        effective_status = _default_watch_status()
+    effective_input_label = input_label or f"[INPUT {serial_port}]"
+    effective_input_value = state.buffer if input_value is None else input_value
+    baudrate_text = f" @ {baudrate}" if baudrate else ""
+    header = (
+        f"[AUTO-DEBUG SERIAL TUI] {serial_port}{baudrate_text} | "
+        "Ctrl+L=login | PgUp/PgDn=history | Ctrl+C=exit"
+    )
+    separator = "-" * safe_width
+    log_rows = _watch_tui_log_rows(safe_height)
+    scroll_offset = _clamp_watch_scroll_offset(state, log_rows=log_rows)
+    end_index = len(state.recent_lines) - scroll_offset if scroll_offset > 0 else len(state.recent_lines)
+    start_index = max(end_index - log_rows, 0)
+    visible_lines = state.recent_lines[start_index:end_index]
+    history_prefix = f"[history +{scroll_offset}] " if scroll_offset > 0 else ""
+    rows = [_fit_watch_tui_text(header, safe_width)]
+    for index in range(log_rows):
+        line = visible_lines[index] if index < len(visible_lines) else ""
+        rows.append(_fit_watch_tui_text(line, safe_width))
+    rows.append(separator)
+    rows.append(_fit_watch_tui_text(f"Status: {history_prefix}{effective_status}", safe_width))
+    input_prefix = f"{effective_input_label} "
+    input_body_width = max(safe_width - len(input_prefix), 0)
+    visible_input = effective_input_value[-input_body_width:] if input_body_width > 0 else ""
+    rows.append(_fit_watch_tui_text(f"{input_prefix}{visible_input}", safe_width))
+    cursor_col = min(len(input_prefix) + len(visible_input), max(safe_width - 1, 0))
+    cursor_row = len(rows) - 1
+    return rows, cursor_col, cursor_row
+
+
+def _clear_watch_stdin_shell_prompt(*, writer=None) -> None:
+    if writer is None:
+        writer = sys.stdout
+    handle, left_col, top_row, width, height = _watch_tui_geometry(writer)
+    if handle is None or left_col is None or top_row is None or width is None or height is None:
+        return
+    blank = " " * width
+    for row in range(height):
+        _watch_console_write_text(handle, left_col, top_row + row, blank)
+    _watch_console_set_cursor_visible(True, writer=writer)
+    _watch_console_move_cursor(handle, left_col, top_row + height - 1)
+    writer.flush()
+
+
+def _render_watch_shell_screen(
+    state: _WatchStdinShellState,
+    *,
+    serial_port: str,
+    baudrate: int | None = None,
+    input_label: str | None = None,
+    input_value: str | None = None,
+    status_message: str | None = None,
+    writer=None,
+) -> None:
+    if writer is None:
+        writer = sys.stdout
+    handle, left_col, top_row, width, height = _watch_tui_geometry(writer)
+    if handle is None or left_col is None or top_row is None or width is None or height is None:
+        return
+    rows, cursor_col, cursor_row = _build_watch_tui_rows(
+        state,
+        serial_port=serial_port,
+        width=width,
+        height=height,
+        baudrate=baudrate,
+        input_label=input_label,
+        input_value=input_value,
+        status_message=status_message,
+    )
+    writer.flush()
+    _watch_console_set_cursor_visible(False, writer=writer)
+    for index, row in enumerate(rows):
+        _watch_console_write_text(handle, left_col, top_row + index, row)
+    _watch_console_move_cursor(handle, left_col + cursor_col, top_row + cursor_row)
+    writer.flush()
+    state.screen_dirty = False
+
+
+def _set_watch_stdin_shell_status(
+    state: _WatchStdinShellState,
+    *,
+    serial_port: str,
+    baudrate: int | None = None,
+    message: str,
+    transient_seconds: float | None = None,
+    writer=None,
+) -> None:
+    _set_watch_status_message(state, message, transient_seconds=transient_seconds)
+    if state.prompt_visible:
+        _render_watch_shell_screen(
+            state,
+            serial_port=serial_port,
+            baudrate=baudrate,
+            writer=writer,
+        )
+
+
+def _run_watch_auto_login(
+    args: argparse.Namespace,
+    *,
+    serial_port: str,
+    state: _WatchStdinShellState | None = None,
+    writer=None,
+    status_writer=None,
+) -> tuple[bool, str]:
+    if status_writer is None:
+        status_writer = lambda _message: None
+    status_writer(f"Logging in on {serial_port}...")
+    try:
+        profiles = _load_profiles_from_args(args)
+        controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+        login_result = controller.login(timeout=20.0)
+    except ProfileResolutionError as exc:
+        return False, f"Failed to resolve the login profile for {serial_port}: {exc}"
+    except Exception as exc:
+        return False, f"Auto login failed on {serial_port}: {exc}"
+
+    if login_result.success:
+        status_writer(f"Auto login reached the root shell on {serial_port}")
+        return True, f"Auto login reached the root shell on {serial_port}"
+    if login_result.login_prompt_seen and not login_result.shell_prompt_seen:
+        return _retry_watch_auto_login_with_password(
+            controller,
+            serial_port=serial_port,
+            state=state,
+            writer=writer,
+            status_writer=status_writer,
+        )
+    return False, f"Auto login did not reach the shell on {serial_port}"
+
+
+def _retry_watch_auto_login_with_password(
+    controller: DeviceController,
+    *,
+    serial_port: str,
+    state: _WatchStdinShellState | None = None,
+    writer=None,
+    status_writer=None,
+) -> tuple[bool, str]:
+    credentials = controller.device_profile.credentials
+    username = credentials.username if credentials is not None else "root"
+    password_env = credentials.password_env if credentials is not None and credentials.password_env else "AUTO_DBG_DEVICE_PASSWORD"
+    original_present = password_env in os.environ
+    original_value = os.environ.get(password_env)
+    if status_writer is None:
+        status_writer = lambda _message: None
+
+    status_writer(f"Login failed; enter the password for {username} on {serial_port}. Enter=confirm Esc=cancel")
+    for attempt in range(1, 4):
+        if attempt > 1:
+            status_writer(f"Retry password attempt {attempt}/3 for {username} on {serial_port}. Enter=confirm Esc=cancel")
+        password = _prompt_watch_password(
+            serial_port=serial_port,
+            username=username,
+            password_env=password_env,
+            state=state,
+            writer=writer,
+            status_message=f"Password attempt {attempt}/3 | Enter=confirm Esc=cancel",
+        )
+        if password is None:
+            _restore_watch_password_env(password_env, original_present=original_present, original_value=original_value)
+            return False, f"Auto login canceled on {serial_port}; password was not updated."
+        retry_result = controller.login(timeout=20.0)
+        if retry_result.success:
+            status_writer(f"Auto login reached the root shell on {serial_port}")
+            return True, f"Auto login reached the root shell on {serial_port}"
+        if not retry_result.login_prompt_seen:
+            _restore_watch_password_env(password_env, original_present=original_present, original_value=original_value)
+            return False, f"Auto login retry on {serial_port} did not reach the login prompt or shell."
+
+    _restore_watch_password_env(password_env, original_present=original_present, original_value=original_value)
+    return False, f"Auto login failed after 3 password attempts on {serial_port}."
+
+
+def _prompt_watch_password(
+    *,
+    serial_port: str,
+    username: str,
+    password_env: str,
+    state: _WatchStdinShellState | None = None,
+    writer=None,
+    status_message: str = "",
+) -> str | None:
+    if writer is None:
+        writer = sys.stdout
+    if os.name != "nt":
+        try:
+            password = getpass.getpass("")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not password:
+            return None
+        os.environ[password_env] = password
+        return password
+    try:
+        import msvcrt  # type: ignore
+    except ImportError:
+        return None
+
+    password = ""
+    label = f"[PASSWORD {serial_port} {username}]"
+    while True:
+        if state is not None:
+            _render_watch_shell_screen(
+                state,
+                serial_port=serial_port,
+                input_label=label,
+                input_value="*" * len(password),
+                status_message=status_message,
+                writer=writer,
+            )
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+            continue
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == "\x1b":
+            return None
+        if char in ("\r", "\n"):
+            if not password:
+                return None
+            os.environ[password_env] = password
+            return password
+        if char in ("\b", "\x7f"):
+            if password:
+                password = password[:-1]
+            continue
+        if char.isprintable():
+            password += char
+
+
+def _restore_watch_password_env(password_env: str, *, original_present: bool, original_value: str | None) -> None:
+    if original_present and original_value is not None:
+        os.environ[password_env] = original_value
+        return
+    os.environ.pop(password_env, None)
+
+
+def _watch_probe_key_pressed() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import msvcrt  # type: ignore
+    except ImportError:
+        return False
+    pressed = False
+    while msvcrt.kbhit():
+        char = msvcrt.getwch()
+        if char in ("\r", "\n"):
+            pressed = True
+    return pressed
+
+
+def _send_watch_newline_probe(serial_port: str, baudrate: int) -> tuple[bool, str]:
+    return _send_watch_serial_text(serial_port, baudrate, "\n")
+
+
+def _send_watch_serial_text(serial_port: str, baudrate: int, text: str) -> tuple[bool, str]:
+    payload = text.encode("utf-8")
+    display = text.rstrip("\r\n")
+    try:
+        with open_serial_port(serial_port, baudrate, timeout=0.2) as handle:
+            handle.write(payload)
+            handle.flush()
+        if not display:
+            return True, f"Sent newline probe to {serial_port}"
+        if len(display) > 80:
+            display = display[:77] + "..."
+        return True, f"Sent command to {serial_port}: {display}"
+    except Exception as exc:
+        if not display:
+            return False, f"Failed to send newline probe to {serial_port}: {exc}"
+        return False, f"Failed to send command to {serial_port}: {exc}"
+
+
+def _consume_watch_stdin_probe(
+    *,
+    serial_port: str,
+    baudrate: int,
+    enabled: bool,
+    key_reader=None,
+    probe_sender=None,
+) -> None:
+    if not enabled:
+        return
+    if key_reader is None:
+        key_reader = _watch_probe_key_pressed
+    if probe_sender is None:
+        probe_sender = _send_watch_newline_probe
+    if not key_reader():
+        return
+    ok, message = probe_sender(serial_port, baudrate)
+    prefix = "[DONE]" if ok else "[ERROR]"
+    print(f"{prefix} {message}", flush=True)
+
+
+def _watch_shell_read_chars() -> list[str]:
+    if os.name != "nt":
+        return []
+    try:
+        import msvcrt  # type: ignore
+    except ImportError:
+        return []
+    chars: list[str] = []
+    while msvcrt.kbhit():
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            # The second scan-code byte can arrive a fraction later than the
+            # prefix. Read it directly so PgUp/PgDn/Home/End don't leak as I/Q/G/O.
+            extended = msvcrt.getwch()
+            if extended == "I":
+                chars.append("__PAGE_UP__")
+            elif extended == "Q":
+                chars.append("__PAGE_DOWN__")
+            elif extended == "G":
+                chars.append("__SCROLL_TOP__")
+            elif extended == "O":
+                chars.append("__SCROLL_BOTTOM__")
+            continue
+        if char == "\x0c":
+            chars.append("__AUTO_LOGIN__")
+            continue
+        chars.append(char)
+    return chars
+
+
+def _watch_shell_login_action(
+    args: argparse.Namespace,
+    state: _WatchStdinShellState,
+    *,
+    serial_port: str,
+    baudrate: int,
+    writer=None,
+) -> tuple[bool, str]:
+    return _run_watch_auto_login(
+        args,
+        serial_port=serial_port,
+        state=state,
+        writer=writer,
+        status_writer=lambda message: _set_watch_stdin_shell_status(
+            state,
+            serial_port=serial_port,
+            baudrate=baudrate,
+            message=message,
+            transient_seconds=None,
+            writer=writer,
+        ),
+    )
+
+
+def _consume_watch_stdin_shell(
+    *,
+    serial_port: str,
+    baudrate: int,
+    enabled: bool,
+    state: _WatchStdinShellState,
+    char_reader=None,
+    text_sender=None,
+    login_action=None,
+    writer=None,
+    printer=None,
+) -> None:
+    if not enabled:
+        return
+    if char_reader is None:
+        char_reader = _watch_shell_read_chars
+    if text_sender is None:
+        text_sender = _send_watch_serial_text
+    if login_action is None:
+        login_action = lambda: (False, "Auto login is unavailable in this watch session.")
+    if writer is None:
+        writer = sys.stdout
+    if printer is None:
+        printer = print
+    if not state.prompt_visible:
+        _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+        state.prompt_visible = True
+    chars = char_reader()
+    if not chars:
+        return
+    _handle, _left_col, _top_row, _width, viewport_height = _watch_tui_geometry(writer)
+    page_height = viewport_height if viewport_height is not None else _watch_terminal_lines()
+    for char in chars:
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char in {"__PAGE_UP__", "__PAGE_DOWN__", "__SCROLL_TOP__", "__SCROLL_BOTTOM__"}:
+            direction_map = {
+                "__PAGE_UP__": "page_up",
+                "__PAGE_DOWN__": "page_down",
+                "__SCROLL_TOP__": "home",
+                "__SCROLL_BOTTOM__": "end",
+            }
+            if _page_watch_history(state, height=page_height, direction=direction_map[char]):
+                _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+                state.prompt_visible = True
+            continue
+        if char == "__AUTO_LOGIN__":
+            _set_watch_status_message(state, f"Logging in on {serial_port}...")
+            _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+            ok, message = login_action()
+            _set_watch_status_message(
+                state,
+                message,
+                transient_seconds=_WATCH_TUI_TRANSIENT_STATUS_SECONDS,
+            )
+            _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+            state.prompt_visible = True
+            continue
+        if char in ("\r", "\n"):
+            payload = state.buffer + "\n"
+            state.buffer = ""
+            ok, message = text_sender(serial_port, baudrate, payload)
+            _set_watch_status_message(
+                state,
+                message,
+                transient_seconds=_WATCH_TUI_TRANSIENT_STATUS_SECONDS,
+            )
+            _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+            state.prompt_visible = True
+            continue
+        if char in ("\b", "\x7f"):
+            if state.buffer:
+                state.buffer = state.buffer[:-1]
+                state.screen_dirty = True
+                _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+            continue
+        if char.isprintable():
+            state.buffer += char
+            state.screen_dirty = True
+            _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+
+
+def _apply_watch_trace_entry_to_tui_state(
+    entry: SerialTraceEntry,
+    *,
+    show_system: bool,
+    state: _WatchStdinShellState,
+) -> None:
+    if entry.direction == "sys":
+        if entry.payload.startswith("SERIAL_CONNECTED"):
+            baudrate = entry.payload.partition("baudrate=")[2] or "unknown"
+            _set_watch_status_message(
+                state,
+                f"{entry.port} connected successfully @ {baudrate}",
+                transient_seconds=_WATCH_TUI_TRANSIENT_STATUS_SECONDS,
+            )
+            return
+        if entry.payload.startswith("SERIAL_UNAVAILABLE"):
+            error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
+            _set_watch_status_message(
+                state,
+                f"{entry.port} unavailable: {error_summary} | Enter=retry | Ctrl+L=login",
+                transient_seconds=_WATCH_TUI_TRANSIENT_STATUS_SECONDS,
+            )
+            return
+        if not show_system:
+            state.screen_dirty = True
+            return
+    _append_watch_recent_line(state, _format_trace_entry(entry))
+    state.screen_dirty = True
+
+
+def _emit_watch_trace_entry(
+    entry: SerialTraceEntry,
+    *,
+    show_system: bool,
+    stdin_shell_state: _WatchStdinShellState | None,
+    serial_port: str,
+    baudrate: int,
+) -> None:
+    if stdin_shell_state is not None:
+        _apply_watch_trace_entry_to_tui_state(entry, show_system=show_system, state=stdin_shell_state)
+        _render_watch_shell_screen(stdin_shell_state, serial_port=serial_port, baudrate=baudrate)
+        stdin_shell_state.prompt_visible = True
+        return
+    printed = _print_watch_trace_entry(entry, show_system=show_system)
+
+
+def _follow_trace_via_broker(
+    args: argparse.Namespace,
+    registry,
+    *,
+    serial_port: str,
+    baudrate: int,
+    show_system: bool,
+    stdin_probe: bool,
+    stdin_shell: bool,
+    initial_entries: list[SerialTraceEntry] | None = None,
+) -> None:
+    stream = SerialTraceStreamClient(
+        broker_registry=registry,
+        serial_port=serial_port,
+        timeout=0.1 if (stdin_probe or stdin_shell) else 0.5,
+    )
+    stdin_shell_state = _WatchStdinShellState() if stdin_shell else None
+    try:
+        if stdin_shell_state is not None:
+            for entry in initial_entries or []:
+                _apply_watch_trace_entry_to_tui_state(entry, show_system=show_system, state=stdin_shell_state)
+            _render_watch_shell_screen(stdin_shell_state, serial_port=serial_port, baudrate=baudrate)
+            stdin_shell_state.prompt_visible = True
+        while True:
+            if stdin_shell_state is not None and _refresh_watch_status_message(stdin_shell_state):
+                _render_watch_shell_screen(stdin_shell_state, serial_port=serial_port, baudrate=baudrate)
+                stdin_shell_state.prompt_visible = True
+            _consume_watch_stdin_shell(
+                serial_port=serial_port,
+                baudrate=baudrate,
+                enabled=stdin_shell,
+                state=stdin_shell_state or _WatchStdinShellState(),
+                login_action=lambda: _watch_shell_login_action(
+                    args,
+                    stdin_shell_state or _WatchStdinShellState(),
+                    serial_port=serial_port,
+                    baudrate=baudrate,
+                ),
+            )
+            _consume_watch_stdin_probe(
+                serial_port=serial_port,
+                baudrate=baudrate,
+                enabled=stdin_probe and not stdin_shell,
+            )
+            entry = stream.read_entry(timeout=0.1 if (stdin_probe or stdin_shell) else 0.5)
+            if entry is None:
+                continue
+            _emit_watch_trace_entry(
+                entry,
+                show_system=show_system,
+                stdin_shell_state=stdin_shell_state,
+                serial_port=serial_port,
+                baudrate=baudrate,
+            )
+    finally:
+        if stdin_shell_state is not None and stdin_shell_state.prompt_visible:
+            _clear_watch_stdin_shell_prompt()
+        stream.close()
+
+
+def _command_watch_serial(args: argparse.Namespace) -> int:
+    serial_port, baudrate = _resolve_serial_connection_from_settings(
+        args,
+        serial_port=getattr(args, "serial_port", None),
+        baudrate=getattr(args, "baudrate", None),
+    )
+    assert serial_port is not None
+    trace_path = serial_trace_log_path(serial_port)
+    initial_entries = _read_trace_entries(trace_path)
+    broker: SerialBroker | None = None
+    existing_broker = load_serial_broker_registry(serial_port)
+    print("[ o.... ] 1/5 steps")
+    print(f"[ACTIVE] Watching shared serial trace for {serial_port}")
+    print(f"[TODO] Trace log: {trace_path}")
+    if args.stdin_shell and not args.follow:
+        print("[ERROR] --stdin-shell requires --follow.")
+        print("[TODO] Retry with watch-serial --follow --raw-live --stdin-shell.")
+        return 1
+    if args.raw_live:
+        if existing_broker is None:
+            broker = SerialBroker(
+                serial_port=serial_port,
+                baudrate=baudrate,
+            )
+            broker.start()
+            print(f"[DONE] Raw serial broker started on {serial_port} @ {baudrate}")
+            print(f"[DONE] {serial_port} connected successfully @ {baudrate}")
+        else:
+            print(
+                f"[DONE] Attached to existing raw serial broker on {serial_port} "
+                f"via {existing_broker.host}:{existing_broker.tcp_port}"
+            )
+        if args.follow:
+            print("[TODO] Raw live follow keeps the physical serial port open until this watcher exits.")
+            print(
+                f"[TODO] Release it from another shell with: "
+                f"autodbg serial-broker stop --serial-port {serial_port}"
+            )
+    if not trace_path.exists():
+        print("[TODO] No shared trace file exists yet. Start a control command first, or keep following.")
+    elif args.follow and args.tail == 0:
+        print("[TODO] Starting from the live edge; existing trace lines are hidden.")
+    elif args.tail > 0 and initial_entries:
+        print(f"[TODO] Replaying the latest {min(args.tail, len(initial_entries))} trace line(s) first.")
+    if args.follow and args.stdin_shell:
+        print(f"[TODO] Interactive serial shell enabled on {serial_port}; TUI keeps status and operation hints inside the screen.")
+    elif args.follow and args.stdin_probe:
+        print(f"[TODO] Press Enter in this window to send a newline probe to {serial_port}.")
+    try:
+        replay_existing = args.tail > 0
+        last_count = len(initial_entries) if args.follow and args.tail == 0 else 0
+        seed_entries: list[SerialTraceEntry] = []
+        if initial_entries:
+            start_index = _resolve_watch_start_index(
+                last_count=last_count,
+                entry_count=len(initial_entries),
+                tail=args.tail,
+                replay_existing=replay_existing,
+            )
+            if args.follow and args.stdin_shell:
+                seed_entries = initial_entries[start_index:]
+            else:
+                _print_trace_entries(initial_entries[start_index:], show_system=args.show_system)
+            last_count = len(initial_entries)
+            replay_existing = False
+        if not args.follow:
+            return 0
+        live_registry = load_serial_broker_registry(serial_port)
+        if args.stdin_shell and live_registry is None:
+            print("[ERROR] --stdin-shell requires a live broker.")
+            print("[TODO] Retry with watch-serial --follow --raw-live --stdin-shell.")
+            return 1
+        if live_registry is not None:
+            print(f"[DONE] Streaming live broker events from {live_registry.host}:{live_registry.tcp_port}")
+            _follow_trace_via_broker(
+                args,
+                live_registry,
+                serial_port=serial_port,
+                baudrate=baudrate,
+                show_system=args.show_system,
+                stdin_probe=args.stdin_probe,
+                stdin_shell=args.stdin_shell,
+                initial_entries=seed_entries,
+            )
+            return 0
+        while True:
+            entries = _read_trace_entries(trace_path)
+            start_index = _resolve_watch_start_index(
+                last_count=last_count,
+                entry_count=len(entries),
+                tail=args.tail,
+                replay_existing=replay_existing,
+            )
+            _print_trace_entries(entries[start_index:], show_system=args.show_system)
+            last_count = len(entries)
+            replay_existing = False
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("[DONE] Shared serial trace stopped by user")
+    finally:
+        if broker is not None:
+            broker.stop()
+    return 0
+
+
+def _command_serial_broker(args: argparse.Namespace) -> int:
+    if args.broker_command == "list":
+        registries = list_serial_broker_registries(serial_port=args.serial_port)
+        print("[ o.... ] 1/5 steps")
+        print("[ACTIVE] Inspecting local raw serial brokers")
+        if args.serial_port:
+            print(f"[TODO] Filter: {args.serial_port}")
+        if not registries:
+            print("[TODO] No active raw serial brokers found.")
+            return 0
+        print("[ oooo. ] 4/5 steps")
+        print(f"[DONE] Active raw serial brokers: {len(registries)}")
+        for registry in registries:
+            print(
+                f"[DONE] {registry.serial_port}: pid={registry.pid} "
+                f"tcp={registry.host}:{registry.tcp_port} baudrate={registry.baudrate}"
+            )
+        return 0
+
+    if args.broker_command == "stop":
+        if args.all:
+            target_ports = [registry.serial_port for registry in list_serial_broker_registries()]
+        else:
+            target_ports = [args.serial_port]
+        target_ports = list(dict.fromkeys(target_ports))
+        print("[ o.... ] 1/5 steps")
+        print("[ACTIVE] Stopping raw serial brokers")
+        if not target_ports:
+            print("[TODO] No active raw serial brokers found.")
+            return 0
+        stopped = 0
+        for port in target_ports:
+            try:
+                registry = stop_serial_broker(port)
+            except Exception as exc:
+                print("[ oxx.. ] 2/5 steps")
+                print(f"[ERROR] Failed to stop raw serial broker on {port}: {exc}")
+                print("[TODO] Retry once or kill the watcher process manually if it is already wedged.")
+                return 1
+            if registry is None:
+                print(f"[TODO] No active raw serial broker found for {port}.")
+                continue
+            stopped += 1
+            print(f"[DONE] Stopped raw serial broker on {port} (pid {registry.pid})")
+        print("[ oooo. ] 4/5 steps")
+        print(f"[DONE] Raw serial brokers stopped: {stopped}/{len(target_ports)}")
+        return 0
+
+    raise ValueError(f"Unsupported serial broker subcommand: {args.broker_command}")
+
+
+def _print_health_report(summary: dict[str, Any]) -> None:
+    checks: list[dict[str, Any]] = summary.get("health_checks", [])
+    evaluation = summary.get("evaluation", {})
+    passed = sum(1 for check in checks if check.get("exit_code") == 0)
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Health checks passed: {passed}/{len(checks)}")
+    if evaluation:
+        print(f"[DONE] Health verdict: {evaluation.get('verdict', 'unknown')}")
+        print(f"[ACTIVE] {evaluation.get('summary', '')}")
+    for check in checks:
+        status = "DONE" if check.get("exit_code") == 0 else "ERROR"
+        excerpt = _format_output_excerpt(check.get("output_lines", []))
+        print(f"[{status}] {check['name']}: exit={check.get('exit_code')} | {excerpt}")
+    findings = evaluation.get("findings", []) if evaluation else []
+    if findings:
+        print("[TODO] Findings:")
+        for finding in findings:
+            print(f"  - {finding['level'].upper()} {finding['check_name']}: {finding['message']}")
+    print("[TODO] Session directory:")
+    print(f"  {summary['session']['session_paths']['root']}")
+
+
+def _command_run(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=profiles.task.task_type,
+    )
+
+    state = StateSnapshot()
+    state.transition_task(TaskState.PRECHECK, "Profiles loaded.")
+    state.transition_device(DeviceState.OFFLINE, "Waiting for first serial sample.")
+
+    observer_plan = SerialObserver(profiles.device.serial, profiles.model).plan()
+    control_plan = DeviceController(profiles.device, profiles.model, profiles.transport).plan()
+    deploy_plan = Deployer(profiles.task, profiles.transport).plan()
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+
+    collector = EvidenceCollector(session)
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=workflow_name,
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "serial": {
+                "port": observer_plan.port,
+                "baudrate": observer_plan.baudrate,
+                "markers": observer_plan.markers,
+            },
+            "control": {
+                "preferred_channels": control_plan.preferred_channels,
+                "login_prompt": control_plan.login_prompt,
+                "shell_prompt": control_plan.shell_prompt,
+                "app_name": control_plan.app_name,
+            },
+            "deploy": {
+                "strategy": deploy_plan.strategy,
+                "channels": deploy_plan.channels,
+            },
+        },
+    )
+    observer = SerialObserver(profiles.device.serial, profiles.model)
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+
+    run_results: dict[str, Any] = {}
+    evidence_results = {"command_results": [], "file_results": []}
+    state.transition_task(TaskState.WAITING_BOOT, f"Observing serial for {args.observe_seconds:.1f}s.")
+    collector.update_summary({"state": state.to_dict()})
+
+    try:
+        observation = observer.capture(
+            seconds=args.observe_seconds,
+            log_path=session.session_paths.logs_dir / "serial.log",
+        )
+        collector.append_event(
+            event_type="serial_observation",
+            source="serial_observer",
+            summary=f"Captured {observation.lines_captured} serial lines.",
+            payload=observation.to_dict(),
+        )
+        run_results["observation"] = observation.to_dict()
+        if observation.last_device_state:
+            state.transition_device(DeviceState(observation.last_device_state), "Observed serial marker.")
+    except Exception as exc:
+        collector.append_event(
+            event_type="serial_observation_failed",
+            source="serial_observer",
+            summary=f"Serial observation failed during run: {exc}",
+            severity="error",
+        )
+        collector.update_summary(
+            {
+                "status": "run_observe_failed",
+                "error": str(exc),
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Serial observe failed during run: {exc}")
+        print("[TODO] Close any program that is already using this COM port, then retry.")
+        return 1
+
+    state.transition_task(TaskState.RUNNING_CHECKS, "Running baseline startup checks.")
+    collector.update_summary({"state": state.to_dict()})
+
+    baseline_checks = [
+        ("appver", "cat /opt/appver.txt"),
+        ("lecam_process", "ps | grep LeCam"),
+        ("mmc_mount", "mount | grep mmc"),
+        ("sdcard_listing", "ls /mnt/sdcard"),
+    ]
+    check_results: list[dict[str, Any]] = []
+    evaluation: dict[str, Any] = {}
+    run_stage = "baseline startup checks"
+    try:
+        with open_serial_port(
+            profiles.device.serial.port,
+            profiles.device.serial.baudrate,
+            timeout=0.2,
+        ) as serial_port:
+            state.transition_device(DeviceState.ROOT_SHELL, "Startup run uses an interactive root shell.")
+            collector.update_summary({"state": state.to_dict()})
+            for name, shell_command in baseline_checks:
+                check_results.append(
+                    _run_baseline_check(
+                        name=name,
+                        shell_command=shell_command,
+                        controller=controller,
+                        collector=collector,
+                        serial_port=serial_port,
+                    )
+                )
+            run_results["baseline_checks"] = check_results
+            evaluation = evaluate_startup_run(
+                check_results,
+                app_name=profiles.model.app_name,
+                observation=run_results.get("observation"),
+            )
+            if evaluation.get("highlights", {}).get("app_process_seen"):
+                state.transition_device(DeviceState.APP_READY, "Baseline checks confirmed the application process is running.")
+            collector.update_summary(
+                {
+                    "run_results": run_results,
+                    "evaluation": evaluation,
+                    "state": state.to_dict(),
+                }
+            )
+            if not args.skip_evidence:
+                run_stage = "default evidence collection"
+                state.transition_task(TaskState.COLLECTING_EVIDENCE, "Collecting the default evidence bundle.")
+                collector.update_summary({"state": state.to_dict()})
+                evidence_command_results, evidence_file_results = _collect_evidence_bundle(
+                    profiles=profiles,
+                    controller=controller,
+                    collector=collector,
+                    timeout=args.evidence_timeout,
+                    serial_port=serial_port,
+                    command_prefix="run-evidence",
+                    file_prefix="run-evidence-file",
+                )
+                evidence_results = {
+                    "command_results": evidence_command_results,
+                    "file_results": evidence_file_results,
+                }
+    except LoginRequiredError as exc:
+        collector.append_event(
+            event_type="baseline_blocked",
+            source="workflow_runner",
+            summary=str(exc),
+            severity="warning",
+        )
+        collector.update_summary(
+            {
+                "status": "run_blocked",
+                "error": str(exc),
+                "run_results": run_results,
+                "baseline_checks": check_results,
+                "evaluation": evaluation,
+                "evidence_results": evidence_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry the run command.")
+        return 1
+    except Exception as exc:
+        collector.append_event(
+            event_type="baseline_failed",
+            source="workflow_runner",
+            summary=f"Run failed during {run_stage}: {exc}",
+            severity="error",
+        )
+        collector.update_summary(
+            {
+                "status": "run_failed",
+                "error": str(exc),
+                "run_results": run_results,
+                "baseline_checks": check_results,
+                "evaluation": evaluation,
+                "evidence_results": evidence_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Run failed during {run_stage}: {exc}")
+        print("[TODO] Check the latest session logs for the failing command.")
+        return 1
+
+    evidence_command_failures = [item for item in evidence_results["command_results"] if item.get("exit_code") != 0]
+    evidence_file_failures = [item for item in evidence_results["file_results"] if item.get("status") != "ok"]
+    has_evidence_failures = bool(evidence_command_failures or evidence_file_failures)
+    state.transition_task(
+        TaskState.FAILED if has_evidence_failures else TaskState.COMPLETED,
+        "Run workflow finished.",
+    )
+    collector.update_summary(
+        {
+            "status": "run_partial" if has_evidence_failures else "run_completed",
+            "run_results": run_results,
+            "evaluation": evaluation,
+            "evidence_results": evidence_results,
+            "state": state.to_dict(),
+        }
+    )
+    summary = json.loads((session.session_paths.root / "summary.json").read_text(encoding="utf-8"))
+    _print_run_report(summary)
+    print(f"[DONE] Run status: {summary.get('status', 'run_completed')}")
+    print(f"[DONE] Baseline checks: {len(check_results)}")
+    return 0 if not has_evidence_failures else 1
+
+
+def _command_stage_sd(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    if profiles.device.storage is None or not profiles.device.storage.sdcard_drive:
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] The selected device profile does not define storage.sdcard_drive.")
+        print("[TODO] Add the host SD card drive path to config/user-settings.toml or the device profile, then retry.")
+        return 1
+
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_stage_sd",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.DEPLOYING, f"Staging {args.source.name} to SD card.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_stage_sd",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "deploy": {
+                "mode": "stage_sd",
+                "source": str(args.source),
+                "target_subdir": args.target_subdir,
+                "dest_name": args.dest_name,
+                "verify": not args.no_verify,
+                "allow_non_removable": args.allow_non_removable,
+                "sdcard_drive": profiles.device.storage.sdcard_drive,
+            }
+        },
+    )
+
+    deployer = Deployer(profiles.task, profiles.transport)
+    try:
+        result = deployer.stage_to_sd(
+            source_path=args.source,
+            sdcard_drive=profiles.device.storage.sdcard_drive,
+            target_subdir=args.target_subdir,
+            destination_name=args.dest_name,
+            verify=not args.no_verify,
+            allow_non_removable=args.allow_non_removable,
+        )
+    except Exception as exc:
+        state.transition_task(TaskState.FAILED, "SD card staging failed.")
+        collector.append_event(
+            event_type="stage_sd_failed",
+            source="deployer",
+            summary=f"Failed to stage file to SD card: {exc}",
+            severity="error",
+        )
+        collector.update_summary(
+            {
+                "status": "stage_sd_failed",
+                "error": str(exc),
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] SD stage failed: {exc}")
+        print("[TODO] Check that the configured SD card drive exists and is writable.")
+        return 1
+
+    state.transition_task(TaskState.COMPLETED, "SD card staging completed.")
+    collector.append_event(
+        event_type="stage_sd_completed",
+        source="deployer",
+        summary=f"Staged file to SD card: {result.target_path}",
+        payload=result.to_dict(),
+    )
+    collector.update_summary(
+        {
+            "status": "stage_sd_completed",
+            "deployment_result": result.to_dict(),
+            "state": state.to_dict(),
+        }
+    )
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Staged file: {args.source.name}")
+    print(f"[DONE] Target: {result.target_path}")
+    print(f"[ACTIVE] SHA256: {result.sha256}")
+    print(f"[TODO] Session directory: {session.session_paths.root}")
+    return 0
+
+
+def _command_storage(args: argparse.Namespace) -> int:
+    configured_root: str | None = None
+    retrieved_root: str | None = None
+    settings = _load_user_settings_from_args(args)
+    if settings.storage.sdcard_drive:
+        configured_root = settings.storage.sdcard_drive
+    if settings.storage.retrieved_root is not None:
+        retrieved_root = str(settings.storage.retrieved_root)
+    if args.device:
+        device_profile = load_device_profile(args.device)
+        if device_profile.storage is not None:
+            configured_root = configured_root or device_profile.storage.sdcard_drive
+            retrieved_root = retrieved_root or device_profile.storage.retrieved_root
+    drives = list_host_drives()
+    print("[ oooo. ] 4/5 steps")
+    if not drives:
+        print("[DONE] No host drives detected")
+        return 0
+    for drive in drives:
+        marker = "DONE"
+        if configured_root and get_drive_info(configured_root).root == drive.root:
+            marker = "ACTIVE"
+        volume = drive.volume_name or "(no label)"
+        filesystem = drive.filesystem or "(no fs)"
+        size = _format_bytes(drive.total_bytes)
+        free = _format_bytes(drive.free_bytes)
+        print(f"[{marker}] {drive.root} type={drive.drive_type} label={volume} fs={filesystem} size={size} free={free}")
+    removable = [drive.root for drive in drives if drive.drive_type == "removable"]
+    print(f"[TODO] Removable candidates: {', '.join(removable) if removable else 'none'}")
+    if configured_root:
+        configured_drive = get_drive_info(configured_root)
+        print(
+            f"[TODO] Configured device storage.sdcard_drive: {configured_drive.root} "
+            f"(type={configured_drive.drive_type})"
+        )
+        if configured_drive.drive_type != "removable":
+            print("[TODO] The configured drive is not removable. Profile update or media insertion is likely needed.")
+    if retrieved_root:
+        print(f"[TODO] Retrieved device files root: {retrieved_root}")
+    return 0
+
+
+def _command_bootstrap_network(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_bootstrap_network",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, f"Bootstrapping network mode={args.mode}.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    wifi_settings = _resolve_wifi_settings(
+        profiles,
+        wifi_ssid=args.wifi_ssid,
+        wifi_password=args.wifi_password,
+        wifi_mode=args.wifi_mode,
+        network_dir=args.network_dir,
+    )
+    bootstrap_commands = _resolve_bootstrap_commands(
+        profiles,
+        args.mode,
+        args.bootstrap_command,
+        **wifi_settings,
+    )
+    check_commands = _resolve_connectivity_checks(
+        profiles,
+        args.check_command,
+        mode=args.mode,
+    )
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_bootstrap_network",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "network": {
+                "mode": args.mode,
+                "bootstrap_commands": bootstrap_commands,
+                "check_commands": check_commands,
+                "wifi_ssid": wifi_settings.get("wifi_ssid"),
+                "wifi_mode": wifi_settings.get("wifi_mode"),
+                "network_dir": wifi_settings.get("network_dir"),
+                "timeout": args.timeout,
+            }
+        },
+    )
+
+    if args.mode == "offline":
+        collector.update_summary(
+            {
+                "status": "bootstrap_network_blocked",
+                "error": "Network mode is offline; bootstrap was intentionally skipped.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] Network mode is offline; bootstrap was intentionally skipped.")
+        print("[TODO] Use SD rescue mode for this device/session.")
+        return 1
+
+    if args.mode == "wlan_script" and not bootstrap_commands:
+        collector.update_summary(
+            {
+                "status": "bootstrap_network_failed",
+                "error": "No bootstrap commands were provided for wlan_script mode.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] No bootstrap commands were provided for wlan_script mode.")
+        print("[TODO] Configure network.bootstrap_commands in the device profile or pass --bootstrap-command.")
+        return 1
+
+    if not check_commands:
+        collector.update_summary(
+            {
+                "status": "bootstrap_network_failed",
+                "error": "No connectivity checks were provided.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] No connectivity checks were provided.")
+        print("[TODO] Configure network.connectivity_checks / expected_ip or pass --check-command.")
+        return 1
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    bootstrap_results: list[dict[str, Any]] = []
+    check_results: list[dict[str, Any]] = []
+    try:
+        state.transition_task(TaskState.RUNNING_CHECKS, "Executing bootstrap commands and connectivity checks.")
+        state.transition_device(DeviceState.ROOT_SHELL, "Network bootstrap uses an interactive root shell.")
+        collector.update_summary({"state": state.to_dict()})
+        with open_serial_port(
+            profiles.device.serial.port,
+            profiles.device.serial.baudrate,
+            timeout=0.2,
+        ) as serial_port:
+            for index, command in enumerate(bootstrap_commands, start=1):
+                result = _execute_structured_command(
+                    controller=controller,
+                    shell_command=command,
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                )
+                _write_command_artifacts(collector=collector, prefix=f"bootstrap-network-{index}", result=result)
+                bootstrap_results.append(result.to_dict())
+                collector.append_event(
+                    event_type="bootstrap_network_command",
+                    source="device_controller",
+                    summary=f"Executed bootstrap command #{index}",
+                    payload=result.to_dict(),
+                )
+            for index, command in enumerate(check_commands, start=1):
+                result = _execute_structured_command(
+                    controller=controller,
+                    shell_command=command,
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                )
+                _write_command_artifacts(collector=collector, prefix=f"bootstrap-network-check-{index}", result=result)
+                check_results.append(result.to_dict())
+                collector.append_event(
+                    event_type="bootstrap_network_check",
+                    source="device_controller",
+                    summary=f"Executed network check #{index}",
+                    payload=result.to_dict(),
+                )
+    except LoginRequiredError as exc:
+        collector.update_summary(
+            {
+                "status": "bootstrap_network_blocked",
+                "error": str(exc),
+                "bootstrap_results": bootstrap_results,
+                "check_results": check_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry bootstrap-network.")
+        return 1
+    except Exception as exc:
+        state.transition_task(TaskState.FAILED, "Network bootstrap failed.")
+        collector.update_summary(
+            {
+                "status": "bootstrap_network_failed",
+                "error": str(exc),
+                "bootstrap_results": bootstrap_results,
+                "check_results": check_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] bootstrap-network failed: {exc}")
+        print("[TODO] Check command transcripts in the session logs.")
+        return 1
+
+    failed_checks = [result for result in check_results if result.get("exit_code") != 0]
+    state.transition_task(TaskState.COMPLETED if not failed_checks else TaskState.FAILED, "Network bootstrap finished.")
+    collector.update_summary(
+        {
+            "status": "bootstrap_network_completed" if not failed_checks else "bootstrap_network_failed",
+            "bootstrap_results": bootstrap_results,
+            "check_results": check_results,
+            "state": state.to_dict(),
+        }
+    )
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Bootstrap commands: {len(bootstrap_results)}")
+    print(f"[DONE] Connectivity checks: {len(check_results)}")
+    if failed_checks:
+        print(f"[ERROR] Failed connectivity checks: {len(failed_checks)}")
+    else:
+        print("[DONE] Network bootstrap passed all connectivity checks")
+    print(f"[TODO] Session directory: {session.session_paths.root}")
+    return 0 if not failed_checks else 1
+
+
+def _command_serve_artifacts(args: argparse.Namespace) -> int:
+    root = args.root.resolve()
+    if not root.is_dir():
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Artifact root does not exist: {root}")
+        print("[TODO] Create or populate the directory before serving it.")
+        return 1
+
+    settings = _load_user_settings_from_args(args)
+    configured_host_ip = settings.network.host_ip
+    base_url = args.base_url or _default_base_url(args.bind, args.port, host_ip=configured_host_ip)
+    manifest_path = write_manifest(
+        root,
+        base_url=base_url,
+        manifest_name=args.manifest_name,
+        exclude_names=(args.pull_script_name,),
+    )
+    pull_script_path = write_pull_script(
+        root,
+        base_url=base_url,
+        workspace=args.workspace,
+        script_name=args.pull_script_name,
+        manifest_name=args.manifest_name,
+    )
+    server, thread = serve_directory(
+        root,
+        bind=args.bind,
+        port=args.port,
+        duration_seconds=args.duration_seconds,
+    )
+    try:
+        print("[ oooo. ] 4/5 steps")
+        print(f"[DONE] Serving root: {root}")
+        print(f"[DONE] Manifest: {manifest_path}")
+        print(f"[DONE] Pull script: {pull_script_path}")
+        print(f"[ACTIVE] Base URL: {base_url}/")
+        print(f"[TODO] Manifest URL: {base_url}/{args.manifest_name}")
+        print(f"[TODO] Pull script URL: {base_url}/{args.pull_script_name}")
+        if args.duration_seconds is None:
+            print("[TODO] Press Ctrl+C to stop the local artifact server")
+            thread.join()
+        else:
+            print(f"[TODO] Auto-stop after {args.duration_seconds:.1f}s")
+            thread.join(timeout=args.duration_seconds + 2.0)
+    except KeyboardInterrupt:
+        print("[DONE] Artifact server stopped by user")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+def _command_device_pull(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_device_pull",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, f"Preparing device pull mode={args.mode}.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    wifi_settings = _resolve_wifi_settings(
+        profiles,
+        wifi_ssid=args.wifi_ssid,
+        wifi_password=args.wifi_password,
+        wifi_mode=args.wifi_mode,
+        network_dir=args.network_dir,
+    )
+    bootstrap_commands = _resolve_bootstrap_commands(
+        profiles,
+        args.mode,
+        args.bootstrap_command,
+        **wifi_settings,
+    )
+    base_url = _resolve_pull_base_url(profiles, args.base_url, bind=args.bind, port=args.port)
+    check_commands = _resolve_connectivity_checks(
+        profiles,
+        args.check_command,
+        mode=args.mode,
+        base_url=base_url,
+    )
+    workspace = _resolve_pull_workspace(profiles, args.workspace)
+    root = args.root.resolve()
+    list_command = args.list_command or f"find {_sh_single_quote(workspace)} -maxdepth 3 -type f | sort"
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_device_pull",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "network": {
+                "mode": args.mode,
+                "bootstrap_commands": bootstrap_commands,
+                "check_commands": check_commands,
+                "wifi_ssid": wifi_settings.get("wifi_ssid"),
+                "wifi_mode": wifi_settings.get("wifi_mode"),
+                "network_dir": wifi_settings.get("network_dir"),
+                "base_url": base_url,
+                "workspace": workspace,
+                "manifest_name": args.manifest_name,
+                "pull_script_name": args.pull_script_name,
+                "requested_transfer_mode": args.transfer_mode,
+                "serial_bundle_chunk_size": args.serial_bundle_chunk_size,
+                "list_command": list_command,
+                "timeout": args.timeout,
+            }
+        },
+    )
+
+    if args.mode == "offline" and args.transfer_mode == "http":
+        collector.update_summary(
+            {
+                "status": "device_pull_blocked",
+                "error": "Network mode is offline, so HTTP transfer is not available.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] Network mode is offline, so HTTP transfer is not available.")
+        print("[TODO] Retry with --transfer-mode serial_bundle or auto when the device supports base64 + tar.")
+        return 1
+
+    if args.mode == "wlan_script" and not bootstrap_commands:
+        collector.update_summary(
+            {
+                "status": "device_pull_failed",
+                "error": "No bootstrap commands were provided for wlan_script mode.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] No bootstrap commands were provided for wlan_script mode.")
+        print("[TODO] Configure network.bootstrap_commands in the device profile or pass --bootstrap-command.")
+        return 1
+
+    if args.mode != "offline" and args.transfer_mode != "serial_bundle" and not check_commands:
+        collector.update_summary(
+            {
+                "status": "device_pull_failed",
+                "error": "No connectivity checks were provided.",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print("[ERROR] No connectivity checks were provided.")
+        print("[TODO] Configure network.connectivity_checks / expected_ip or pass --check-command.")
+        return 1
+
+    if not root.is_dir():
+        collector.update_summary(
+            {
+                "status": "device_pull_failed",
+                "error": f"Artifact root does not exist: {root}",
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Artifact root does not exist: {root}")
+        print("[TODO] Create or populate the directory before retrying device-pull.")
+        return 1
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    bootstrap_results: list[dict[str, Any]] = []
+    check_results: list[dict[str, Any]] = []
+    transfer_probe: dict[str, Any] | None = None
+    selected_transfer_mode: str | None = None
+    transfer_details: dict[str, Any] = {}
+    pull_result: dict[str, Any] | None = None
+    list_result: dict[str, Any] | None = None
+    manifest_path: Path | None = None
+    pull_script_path: Path | None = None
+    server = None
+    thread = None
+
+    try:
+        state.transition_task(TaskState.RUNNING_CHECKS, "Executing bootstrap commands, checks, and device pull.")
+        state.transition_device(DeviceState.ROOT_SHELL, "Device pull uses an interactive root shell.")
+        collector.update_summary({"state": state.to_dict()})
+        with open_serial_port(
+            profiles.device.serial.port,
+            profiles.device.serial.baudrate,
+            timeout=0.2,
+        ) as serial_port:
+            for index, command in enumerate(bootstrap_commands, start=1):
+                result = _execute_structured_command(
+                    controller=controller,
+                    shell_command=command,
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                )
+                _write_command_artifacts(collector=collector, prefix=f"device-pull-bootstrap-{index}", result=result)
+                bootstrap_results.append(result.to_dict())
+                collector.append_event(
+                    event_type="device_pull_bootstrap_command",
+                    source="device_controller",
+                    summary=f"Executed bootstrap command #{index}",
+                    payload=result.to_dict(),
+                )
+            for index, command in enumerate(check_commands, start=1):
+                result = _execute_structured_command(
+                    controller=controller,
+                    shell_command=command,
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                )
+                _write_command_artifacts(collector=collector, prefix=f"device-pull-check-{index}", result=result)
+                check_results.append(result.to_dict())
+                collector.append_event(
+                    event_type="device_pull_check",
+                    source="device_controller",
+                    summary=f"Executed connectivity check #{index}",
+                    payload=result.to_dict(),
+                )
+            transfer_probe_result = controller.execute(
+                _build_transfer_probe_command(),
+                timeout=args.timeout,
+                serial_port=serial_port,
+            )
+            _write_command_artifacts(collector=collector, prefix="device-pull-transfer-probe", result=transfer_probe_result)
+            transfer_probe = {
+                "result": transfer_probe_result.to_dict(),
+                "capabilities": _parse_transfer_capabilities(transfer_probe_result.output_lines),
+            }
+            collector.append_event(
+                event_type="device_pull_transfer_probe",
+                source="device_controller",
+                summary="Probed device-side transfer capabilities",
+                payload=transfer_probe,
+            )
+            selected_transfer_mode = _select_transfer_mode(
+                args.transfer_mode,
+                capabilities=transfer_probe["capabilities"],
+                network_mode=args.mode,
+            )
+
+            if selected_transfer_mode == "http":
+                manifest_path = write_manifest(
+                    root,
+                    base_url=base_url,
+                    manifest_name=args.manifest_name,
+                    exclude_names=(args.pull_script_name,),
+                )
+                pull_script_path = write_pull_script(
+                    root,
+                    base_url=base_url,
+                    workspace=workspace,
+                    script_name=args.pull_script_name,
+                    manifest_name=args.manifest_name,
+                )
+                server, thread = serve_directory(root, bind=args.bind, port=args.port)
+                remote_pull_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
+                pull_exec_result = controller.execute(remote_pull_command, timeout=args.timeout, serial_port=serial_port)
+                _write_command_artifacts(collector=collector, prefix="device-pull-run", result=pull_exec_result)
+                pull_result = pull_exec_result.to_dict()
+                transfer_details = {
+                    "mode": "http",
+                    "server": {
+                        "root": str(root),
+                        "base_url": base_url,
+                        "manifest_path": str(manifest_path),
+                        "pull_script_path": str(pull_script_path),
+                    },
+                }
+                collector.append_event(
+                    event_type="device_pull_run",
+                    source="device_controller",
+                    summary=f"Executed device pull script from {base_url}",
+                    payload=pull_result,
+                )
+            else:
+                bundle = build_serial_bundle(
+                    root,
+                    output_path=session.session_paths.deploy_dir / "autodbg-serial-bundle.tar",
+                    exclude_names=(args.manifest_name, args.pull_script_name),
+                )
+                collector.write_text_artifact(
+                    "deploy/serial-bundle.json",
+                    json.dumps(bundle.to_dict(), indent=2, ensure_ascii=False) + "\n",
+                )
+                prepare_command, upload_commands, finalize_command = _build_serial_bundle_commands(
+                    base64_payload=bundle.read_base64_text(),
+                    workspace=workspace,
+                    chunk_size=args.serial_bundle_chunk_size,
+                    artifact_count=bundle.artifact_count,
+                )
+                prepare_result = controller.execute(prepare_command, timeout=args.timeout, serial_port=serial_port)
+                _write_command_artifacts(collector=collector, prefix="device-pull-serial-prepare", result=prepare_result)
+                if prepare_result.exit_code != 0:
+                    pull_result = prepare_result.to_dict()
+                else:
+                    for index, command in enumerate(upload_commands, start=1):
+                        chunk_result = controller.execute(command, timeout=args.timeout, serial_port=serial_port)
+                        if chunk_result.exit_code != 0:
+                            pull_result = chunk_result.to_dict()
+                            raise RuntimeError(
+                                f"Serial bundle chunk {index}/{len(upload_commands)} failed with exit code {chunk_result.exit_code}."
+                            )
+                        if index == 1 or index == len(upload_commands) or index % 25 == 0:
+                            collector.append_event(
+                                event_type="device_pull_serial_bundle_progress",
+                                source="device_controller",
+                                summary=f"Uploaded serial bundle chunk {index}/{len(upload_commands)}",
+                                payload={"chunk_index": index, "chunk_count": len(upload_commands)},
+                            )
+                    finalize_result = controller.execute(
+                        finalize_command,
+                        timeout=max(args.timeout, 60.0),
+                        serial_port=serial_port,
+                    )
+                    _write_command_artifacts(collector=collector, prefix="device-pull-serial-finalize", result=finalize_result)
+                    pull_result = finalize_result.to_dict()
+                transfer_details = {
+                    "mode": "serial_bundle",
+                    "bundle": {
+                        **bundle.to_dict(),
+                        "chunk_size": args.serial_bundle_chunk_size,
+                        "chunk_count": len(upload_commands),
+                    },
+                }
+                collector.append_event(
+                    event_type="device_pull_serial_bundle",
+                    source="device_controller",
+                    summary=f"Transferred tar bundle over serial into {workspace}",
+                    payload=transfer_details,
+                )
+
+            if pull_result is not None and pull_result.get("exit_code") == 0:
+                list_exec_result = _execute_structured_command(
+                    controller=controller,
+                    shell_command=list_command,
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                )
+                _write_command_artifacts(collector=collector, prefix="device-pull-list", result=list_exec_result)
+                list_result = list_exec_result.to_dict()
+                collector.append_event(
+                    event_type="device_pull_list",
+                    source="device_controller",
+                    summary="Listed pulled files from the device workspace",
+                    payload=list_result,
+                )
+    except LoginRequiredError as exc:
+        collector.update_summary(
+            {
+                "status": "device_pull_blocked",
+                "error": str(exc),
+                "bootstrap_results": bootstrap_results,
+                "check_results": check_results,
+                "transfer_probe": transfer_probe,
+                "selected_transfer_mode": selected_transfer_mode,
+                "transfer_details": transfer_details,
+                "pull_result": pull_result,
+                "list_result": list_result,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry device-pull.")
+        return 1
+    except Exception as exc:
+        state.transition_task(TaskState.FAILED, "Device pull failed.")
+        collector.update_summary(
+            {
+                "status": "device_pull_failed",
+                "error": str(exc),
+                "bootstrap_results": bootstrap_results,
+                "check_results": check_results,
+                "transfer_probe": transfer_probe,
+                "selected_transfer_mode": selected_transfer_mode,
+                "transfer_details": transfer_details,
+                "pull_result": pull_result,
+                "list_result": list_result,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] device-pull failed: {exc}")
+        print("[TODO] Check the latest session logs for bootstrap, pull, and list command transcripts.")
+        return 1
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    failed_checks = [result for result in check_results if result.get("exit_code") != 0]
+    pull_failed = pull_result is None or pull_result.get("exit_code") != 0
+    list_failed = list_result is None or list_result.get("exit_code") != 0
+    state.transition_task(
+        TaskState.COMPLETED if not failed_checks and not pull_failed and not list_failed else TaskState.FAILED,
+        "Device pull finished.",
+    )
+    collector.update_summary(
+        {
+            "status": "device_pull_completed" if not failed_checks and not pull_failed and not list_failed else "device_pull_failed",
+            "bootstrap_results": bootstrap_results,
+            "check_results": check_results,
+            "transfer_probe": transfer_probe,
+            "selected_transfer_mode": selected_transfer_mode,
+            "transfer_details": transfer_details,
+            "pull_result": pull_result,
+            "list_result": list_result,
+            "state": state.to_dict(),
+        }
+    )
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Device workspace: {workspace}")
+    print(f"[DONE] Connectivity checks: {len(check_results)}")
+    print(f"[DONE] Transfer mode: {selected_transfer_mode or 'unknown'}")
+    if failed_checks:
+        print(f"[ERROR] Failed connectivity checks: {len(failed_checks)}")
+    elif pull_failed:
+        print("[ERROR] Artifact transfer returned a non-zero exit code")
+    elif list_failed:
+        print("[ERROR] Post-transfer listing failed")
+    else:
+        print("[DONE] Device pull completed successfully")
+    if selected_transfer_mode == "http":
+        print(f"[ACTIVE] Base URL: {base_url}/")
+    elif transfer_details:
+        bundle_info = transfer_details.get("bundle", {})
+        print(
+            "[ACTIVE] Serial bundle: "
+            f"{bundle_info.get('artifact_count', 'unknown')} files, "
+            f"{_format_bytes(bundle_info.get('size_bytes'))}, "
+            f"{bundle_info.get('chunk_count', 'unknown')} chunks"
+        )
+    print(f"[TODO] Session directory: {session.session_paths.root}")
+    return 0 if not failed_checks and not pull_failed and not list_failed else 1
+
+
+def _command_health(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_health",
+    )
+
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, "Preparing device health probes.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_health",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "control": {
+                "mode": "health",
+                "timeout": args.timeout,
+                "checks": [name for name, _ in _build_health_checks(include_sd_write_probe=not args.skip_sd_write_probe)],
+            }
+        },
+    )
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    checks = _build_health_checks(include_sd_write_probe=not args.skip_sd_write_probe)
+    check_results: list[dict[str, Any]] = []
+    collector.update_summary({"state": state.to_dict()})
+
+    try:
+        state.transition_task(TaskState.RUNNING_CHECKS, "Running device health probes.")
+        state.transition_device(DeviceState.ROOT_SHELL, "Health probes require an interactive root shell.")
+        collector.update_summary({"state": state.to_dict()})
+        with open_serial_port(
+            profiles.device.serial.port,
+            profiles.device.serial.baudrate,
+            timeout=0.2,
+        ) as serial_port:
+            for name, shell_command in checks:
+                check_results.append(
+                    _run_baseline_check(
+                        name=name,
+                        shell_command=shell_command,
+                        controller=controller,
+                        collector=collector,
+                        timeout=args.timeout,
+                        serial_port=serial_port,
+                    )
+                )
+    except LoginRequiredError as exc:
+        collector.append_event(
+            event_type="health_blocked",
+            source="workflow_runner",
+            summary=str(exc),
+            severity="warning",
+        )
+        collector.update_summary(
+            {
+                "status": "health_blocked",
+                "error": str(exc),
+                "health_checks": check_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry the health command.")
+        return 1
+    except Exception as exc:
+        state.transition_task(TaskState.FAILED, "Health probes failed.")
+        collector.append_event(
+            event_type="health_failed",
+            source="workflow_runner",
+            summary=f"Health probes failed: {exc}",
+            severity="error",
+        )
+        collector.update_summary(
+            {
+                "status": "health_failed",
+                "error": str(exc),
+                "health_checks": check_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Health probes failed: {exc}")
+        print("[TODO] Check the latest session logs for the failing command.")
+        return 1
+
+    state.transition_task(TaskState.COMPLETED, "Device health probes completed.")
+    evaluation = evaluate_health_checks(check_results, app_name=profiles.model.app_name)
+    collector.update_summary(
+        {
+            "status": "health_completed",
+            "health_checks": check_results,
+            "evaluation": evaluation,
+            "state": state.to_dict(),
+        }
+    )
+    summary = json.loads((session.session_paths.root / "summary.json").read_text(encoding="utf-8"))
+    _print_health_report(summary)
+    print("[DONE] Health status: health_completed")
+    return 0
+
+
+def _command_observe(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_observe",
+    )
+
+    state = StateSnapshot()
+    state.transition_task(TaskState.WAITING_BOOT, f"Observing serial for {args.seconds:.1f}s.")
+    observer = SerialObserver(profiles.device.serial, profiles.model)
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=workflow_name,
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={"serial": {"mode": "observe", "seconds": args.seconds}},
+    )
+
+    try:
+        observe_seconds = 0.0 if args.follow else args.seconds
+        line_callback = (
+            _build_live_serial_printer(markers_only=args.markers_only, focus_terms=args.focus)
+            if args.live
+            else None
+        )
+        if args.live:
+            live_mode = "until Ctrl+C" if args.follow else f"for {observe_seconds:.1f}s"
+            print("[ o.... ] 1/5 steps")
+            print(f"[ACTIVE] Live serial view started on {profiles.device.serial.port} {live_mode}")
+            print(f"[TODO] Session log: {session.session_paths.logs_dir / 'serial.log'}")
+            print("[TODO] Live view only shows new serial output after this connection opens")
+            if args.markers_only:
+                print("[TODO] Only marker lines will be printed")
+            elif args.focus:
+                print(f"[TODO] Focus filters: {', '.join(args.focus)}")
+            if args.poke_newline:
+                print("[TODO] One newline will be sent after connect to wake the prompt")
+        result = observer.capture(
+            seconds=observe_seconds,
+            log_path=session.session_paths.logs_dir / "serial.log",
+            line_callback=line_callback,
+            startup_lines=[""] if args.poke_newline else None,
+        )
+    except Exception as exc:
+        collector.append_event(
+            event_type="serial_observation_failed",
+            source="serial_observer",
+            summary=f"Serial observation failed: {exc}",
+            severity="error",
+        )
+        collector.update_summary({"status": "observe_failed", "error": str(exc)})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Serial observe failed: {exc}")
+        print("[TODO] Close any program that is already using this COM port, then retry.")
+        return 1
+    collector.append_event(
+        event_type="serial_observation",
+        source="serial_observer",
+        summary=f"Captured {result.lines_captured} serial lines.",
+        payload=result.to_dict(),
+    )
+    collector.update_summary(
+        {
+            "status": "observed_interrupted" if result.interrupted else "observed",
+            "observation": result.to_dict(),
+        }
+    )
+
+    print("[ oooo. ] 4/5 steps")
+    observed_label = "until interrupted" if args.follow else f"for {args.seconds:.1f}s"
+    print(f"[DONE] Observed serial {observed_label}")
+    print(f"[DONE] Lines captured: {result.lines_captured}")
+    print(f"[ACTIVE] Last device state: {result.last_device_state or 'unknown'}")
+    if result.interrupted:
+        print("[DONE] Live view stopped by user")
+    if args.live and result.lines_captured == 0:
+        print("[TODO] No new serial lines arrived in this window. The device may simply be quiet.")
+        if not args.poke_newline:
+            print("[TODO] If you want immediate feedback, retry with --poke-newline or trigger device activity.")
+    print(f"[TODO] Serial log: {session.session_paths.logs_dir / 'serial.log'}")
+    return 0
+
+
+def _command_exec(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_exec",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, f"Executing serial command: {args.shell_command}")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=workflow_name,
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={"control": {"mode": "exec", "command": args.shell_command, "timeout": args.timeout}},
+    )
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    try:
+        result = controller.execute(args.shell_command, timeout=args.timeout)
+    except LoginRequiredError as exc:
+        collector.append_event(
+            event_type="serial_exec_blocked",
+            source="device_controller",
+            summary=str(exc),
+            severity="warning",
+        )
+        collector.update_summary({"status": "exec_blocked", "error": str(exc)})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry the exec command.")
+        return 1
+    except Exception as exc:
+        collector.append_event(
+            event_type="serial_exec_failed",
+            source="device_controller",
+            summary=f"Serial exec failed: {exc}",
+            severity="error",
+        )
+        collector.update_summary({"status": "exec_failed", "error": str(exc)})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Serial exec failed: {exc}")
+        print("[TODO] Check whether the COM port is occupied or the device is not ready.")
+        return 1
+    transcript = "\n".join(result.transcript) + ("\n" if result.transcript else "")
+    output = "\n".join(result.output_lines) + ("\n" if result.output_lines else "")
+    collector.write_text_artifact("logs/exec-transcript.log", transcript)
+    collector.write_text_artifact("logs/exec-output.log", output)
+    collector.append_event(
+        event_type="serial_exec",
+        source="device_controller",
+        summary=f"Executed command: {args.shell_command}",
+        payload=result.to_dict(),
+    )
+    collector.update_summary(
+        {
+            "status": "executed",
+            "command_result": result.to_dict(),
+        }
+    )
+
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Command executed: {args.shell_command}")
+    print(f"[DONE] Exit code: {result.exit_code}")
+    print(f"[ACTIVE] Output lines: {len(result.output_lines)}")
+    print(f"[TODO] Transcript: {session.session_paths.logs_dir / 'exec-transcript.log'}")
+    return 0
+
+
+def _command_fetch_file(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_fetch_file",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, f"Fetching device file: {args.remote_path}")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_fetch_file",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "control": {
+                "mode": "fetch_file",
+                "remote_path": args.remote_path,
+                "output": str(args.output) if args.output else None,
+                "timeout": args.timeout,
+            }
+        },
+    )
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    fetch_command = _build_fetch_file_command(args.remote_path)
+    try:
+        result = controller.execute(fetch_command, timeout=args.timeout)
+    except LoginRequiredError as exc:
+        collector.append_event(
+            event_type="fetch_file_blocked",
+            source="device_controller",
+            summary=str(exc),
+            severity="warning",
+        )
+        collector.update_summary({"status": "fetch_file_blocked", "error": str(exc), "state": state.to_dict()})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry fetch-file.")
+        return 1
+    except Exception as exc:
+        collector.append_event(
+            event_type="fetch_file_failed",
+            source="device_controller",
+            summary=f"Fetch file failed: {exc}",
+            severity="error",
+        )
+        collector.update_summary({"status": "fetch_file_failed", "error": str(exc), "state": state.to_dict()})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Fetch file failed: {exc}")
+        print("[TODO] Check whether the COM port is occupied or the device is not ready.")
+        return 1
+
+    fetch_result = _fetch_remote_file_artifact(
+        controller=controller,
+        collector=collector,
+        remote_path=args.remote_path,
+        timeout=args.timeout,
+        prefix="fetch-file",
+        output_path=args.output,
+    )
+    collector.append_event(
+        event_type="fetch_file_command",
+        source="device_controller",
+        summary=f"Fetched file from {args.remote_path}",
+        payload=fetch_result,
+    )
+
+    if fetch_result["status"] != "ok":
+        state.transition_task(TaskState.FAILED, "fetch-file command returned an invalid result.")
+        collector.update_summary(
+            {
+                "status": "fetch_file_failed",
+                "error": fetch_result.get("error", "Unknown fetch-file error"),
+                "command_result": fetch_result.get("command_result"),
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {fetch_result.get('error', 'Unknown fetch-file error')}")
+        print("[TODO] Inspect the fetch-file output/transcript to see whether the file exists and base64 is available.")
+        return 1
+
+    state.transition_task(TaskState.COMPLETED, "Device file fetched successfully.")
+    collector.update_summary(
+        {
+            "status": "fetch_file_completed",
+            "command_result": fetch_result.get("command_result"),
+            "fetch_result": fetch_result,
+            "state": state.to_dict(),
+        }
+    )
+
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Remote file: {args.remote_path}")
+    print(f"[DONE] Local file: {fetch_result['local_path']}")
+    print(f"[DONE] Size: {_format_bytes(fetch_result.get('size_bytes'))}")
+    print(f"[ACTIVE] SHA256: {fetch_result['sha256']}")
+    print(f"[TODO] Transcript: {session.session_paths.logs_dir / 'fetch-file-transcript.log'}")
+    return 0
+
+
+def _command_fetch_path(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_fetch_path",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, f"Fetching device path: {args.remote_path}")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_fetch_path",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "control": {
+                "mode": "fetch_path",
+                "remote_path": args.remote_path,
+                "output": str(args.output) if args.output else None,
+                "timeout": args.timeout,
+            }
+        },
+    )
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    try:
+        fetch_result = _fetch_remote_path_artifact(
+            controller=controller,
+            collector=collector,
+            remote_path=args.remote_path,
+            timeout=args.timeout,
+            prefix="fetch-path",
+            output_path=args.output,
+        )
+    except LoginRequiredError as exc:
+        collector.append_event(
+            event_type="fetch_path_blocked",
+            source="device_controller",
+            summary=str(exc),
+            severity="warning",
+        )
+        collector.update_summary({"status": "fetch_path_blocked", "error": str(exc), "state": state.to_dict()})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry fetch-path.")
+        return 1
+    except Exception as exc:
+        collector.append_event(
+            event_type="fetch_path_failed",
+            source="device_controller",
+            summary=f"Fetch path failed: {exc}",
+            severity="error",
+        )
+        collector.update_summary({"status": "fetch_path_failed", "error": str(exc), "state": state.to_dict()})
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Fetch path failed: {exc}")
+        print("[TODO] Check whether the COM port is occupied or the device is not ready.")
+        return 1
+
+    collector.append_event(
+        event_type="fetch_path_command",
+        source="device_controller",
+        summary=f"Fetched path from {args.remote_path}",
+        payload=fetch_result,
+    )
+
+    if fetch_result["status"] != "ok":
+        state.transition_task(TaskState.FAILED, "fetch-path command returned an invalid result.")
+        collector.update_summary(
+            {
+                "status": "fetch_path_failed",
+                "error": fetch_result.get("error", "Unknown fetch-path error"),
+                "command_result": fetch_result.get("command_result"),
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {fetch_result.get('error', 'Unknown fetch-path error')}")
+        print("[TODO] Inspect the fetch-path output/transcript to see whether the path exists and tar/base64 are available.")
+        return 1
+
+    state.transition_task(TaskState.COMPLETED, "Device path fetched successfully.")
+    collector.update_summary(
+        {
+            "status": "fetch_path_completed",
+            "command_result": fetch_result.get("command_result"),
+            "fetch_result": fetch_result,
+            "state": state.to_dict(),
+        }
+    )
+
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Remote path: {args.remote_path}")
+    print(f"[DONE] Local artifact: {fetch_result['local_path']}")
+    print(f"[DONE] Mode: {fetch_result.get('mode', 'unknown')}")
+    print(f"[DONE] Size: {_format_bytes(fetch_result.get('size_bytes'))}")
+    print(f"[ACTIVE] SHA256: {fetch_result['sha256']}")
+    print(f"[TODO] Transcript: {session.session_paths.logs_dir / 'fetch-path-transcript.log'}")
+    return 0
+
+
+def _command_collect_evidence(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=f"{profiles.task.task_type}_collect_evidence",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.ESTABLISHING_CONTROL, "Collecting device evidence bundle.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+
+    default_commands = [] if args.skip_defaults else _build_collect_evidence_commands(profiles)
+    extra_commands = [(f"user_command_{index}", command) for index, command in enumerate(args.shell_command, start=1)]
+    command_items = default_commands + extra_commands
+
+    default_files = [] if args.skip_defaults else _default_collect_evidence_files(profiles)
+    remote_files = list(dict.fromkeys([*default_files, *args.remote_file]))
+
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_collect_evidence",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        plan_details={
+            "control": {
+                "mode": "collect_evidence",
+                "shell_commands": [{"name": name, "command": command} for name, command in command_items],
+                "remote_files": remote_files,
+                "timeout": args.timeout,
+            }
+        },
+    )
+
+    controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    command_results: list[dict[str, Any]] = []
+    file_results: list[dict[str, Any]] = []
+
+    try:
+        state.transition_task(TaskState.RUNNING_CHECKS, "Running evidence commands and file fetches.")
+        state.transition_device(DeviceState.ROOT_SHELL, "Evidence collection requires an interactive root shell.")
+        collector.update_summary({"state": state.to_dict()})
+        with open_serial_port(
+            profiles.device.serial.port,
+            profiles.device.serial.baudrate,
+            timeout=0.2,
+        ) as serial_port:
+            command_results, file_results = _collect_evidence_bundle(
+                profiles=profiles,
+                controller=controller,
+                collector=collector,
+                timeout=args.timeout,
+                serial_port=serial_port,
+                command_items=command_items,
+                remote_files=remote_files,
+                command_prefix="collect-evidence",
+                file_prefix="collect-evidence-file",
+            )
+    except LoginRequiredError as exc:
+        collector.update_summary(
+            {
+                "status": "collect_evidence_blocked",
+                "error": str(exc),
+                "command_results": command_results,
+                "file_results": file_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry collect-evidence.")
+        return 1
+    except Exception as exc:
+        state.transition_task(TaskState.FAILED, "Evidence collection failed.")
+        collector.update_summary(
+            {
+                "status": "collect_evidence_failed",
+                "error": str(exc),
+                "command_results": command_results,
+                "file_results": file_results,
+                "state": state.to_dict(),
+            }
+        )
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] collect-evidence failed: {exc}")
+        print("[TODO] Inspect the latest session logs for the failing command or file fetch.")
+        return 1
+
+    command_failures = [item for item in command_results if item.get("exit_code") != 0]
+    file_failures = [item for item in file_results if item.get("status") != "ok"]
+    state.transition_task(
+        TaskState.COMPLETED if not command_failures and not file_failures else TaskState.FAILED,
+        "Evidence collection finished.",
+    )
+    collector.update_summary(
+        {
+            "status": "collect_evidence_completed" if not command_failures and not file_failures else "collect_evidence_partial",
+            "command_results": command_results,
+            "file_results": file_results,
+            "state": state.to_dict(),
+        }
+    )
+
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Evidence commands: {len(command_results)}")
+    print(f"[DONE] Remote files fetched: {sum(1 for item in file_results if item.get('status') == 'ok')}/{len(file_results)}")
+    if command_failures:
+        print(f"[ERROR] Command failures: {len(command_failures)}")
+    if file_failures:
+        print(f"[ERROR] File fetch failures: {len(file_failures)}")
+    print(f"[ACTIVE] Session directory: {session.session_paths.root}")
+    return 0 if not command_failures and not file_failures else 1
+
+
+def _command_summary(args: argparse.Namespace) -> int:
+    summary_path = args.session_dir / "summary.json"
+    data = json.loads(summary_path.read_text(encoding="utf-8"))
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _command_report(args: argparse.Namespace) -> int:
+    session_dir = args.session_dir
+    if getattr(args, "latest", False):
+        session_dir = SessionManager(args.artifacts_root).latest_session_dir()
+    report_path = session_dir / "report.md"
+    print(report_path.read_text(encoding="utf-8"))
+    return 0
+
+
+def _command_agent_call(args: argparse.Namespace) -> int:
+    try:
+        request = load_agent_request(args.request)
+        response = execute_agent_request(
+            request,
+            project_root=_project_root(),
+            parser_builder=_build_parser,
+            dispatcher=_dispatch_command,
+        )
+    except (AgentCallError, ProfileResolutionError, json.JSONDecodeError) as exc:
+        response = build_agent_error_response(project_root=_project_root(), error=exc)
+
+    if args.pretty:
+        print(json.dumps(response, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(response, ensure_ascii=False))
+    return 0
+
+
+def _command_describe_agent_tool(args: argparse.Namespace) -> int:
+    project_root = _project_root()
+    if args.format == "markdown":
+        print(render_agent_tool_markdown(project_root=project_root))
+        return 0
+    manifest = build_agent_tool_manifest(project_root=project_root)
+    if args.pretty:
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(manifest, ensure_ascii=False))
+    return 0
+
+
+def _command_install_home_plugin(args: argparse.Namespace) -> int:
+    result = install_home_plugin(
+        project_root=args.project_root,
+        home_root=args.home_root,
+        plugin_name=args.plugin_name,
+    )
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Home plugin installed: {result['plugin_dir']}")
+    print(f"[DONE] Plugin manifest: {result['plugin_manifest']}")
+    print(f"[DONE] MCP config: {result['mcp_config']}")
+    print(f"[DONE] Marketplace: {result['marketplace']}")
+    print(f"[ACTIVE] Default AUTO_DBG_PROJECT_ROOT: {Path(args.project_root).absolute()}")
+    return 0
+
+
+def _command_show_mvp() -> int:
+    doc_path = _project_root() / "docs" / "mvp-workflow.md"
+    print("[ oo... ] 2/5 steps")
+    print(f"[DONE] MVP doc: {doc_path}")
+    print("[DONE] Primary entry: python -m autodbg run --serial-port COM19")
+    return 0
+
+
+def _command_ports() -> int:
+    try:
+        ports = list_serial_ports()
+    except SerialSupportError as exc:
+        print("[ o.... ] 1/5 steps")
+        print(f"[ERROR] {exc}")
+        return 1
+
+    print("[ oo... ] 2/5 steps")
+    if not ports:
+        print("[DONE] No serial ports detected")
+        return 0
+
+    for port in ports:
+        print(f"[DONE] {port['device']} - {port['description']}")
+        print(f"       {port['hwid']}")
+    return 0
+
+
+def _dispatch_command(args: argparse.Namespace) -> int:
+    if args.command == "run":
+        return _command_run(args)
+    if args.command == "stage-sd":
+        return _command_stage_sd(args)
+    if args.command == "storage":
+        return _command_storage(args)
+    if args.command == "bootstrap-network":
+        return _command_bootstrap_network(args)
+    if args.command == "serve-artifacts":
+        return _command_serve_artifacts(args)
+    if args.command == "device-pull":
+        return _command_device_pull(args)
+    if args.command == "observe":
+        return _command_observe(args)
+    if args.command == "exec":
+        return _command_exec(args)
+    if args.command == "fetch-file":
+        return _command_fetch_file(args)
+    if args.command == "fetch-path":
+        return _command_fetch_path(args)
+    if args.command == "collect-evidence":
+        return _command_collect_evidence(args)
+    if args.command == "health":
+        return _command_health(args)
+    if args.command == "resume":
+        return _command_summary(args)
+    if args.command == "summary":
+        return _command_summary(args)
+    if args.command == "report":
+        return _command_report(args)
+    if args.command == "watch-serial":
+        return _command_watch_serial(args)
+    if args.command == "serial-broker":
+        return _command_serial_broker(args)
+    if args.command == "agent-call":
+        return _command_agent_call(args)
+    if args.command == "describe-agent-tool":
+        return _command_describe_agent_tool(args)
+    if args.command == "install-home-plugin":
+        return _command_install_home_plugin(args)
+    if args.command == "show-mvp":
+        return _command_show_mvp()
+    if args.command == "ports":
+        return _command_ports()
+    raise ValueError(f"Unsupported command: {args.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return _dispatch_command(args)
+    except ProfileResolutionError as exc:
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        defaults_path = getattr(args, "profiles_defaults", None)
+        if defaults_path is not None:
+            print(
+                "[TODO] Provide --device/--model/--task/--transport explicitly, "
+                f"or fix the defaults manifest: {Path(defaults_path).resolve()}"
+            )
+        return 1
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
