@@ -24,7 +24,7 @@
 
 要把工具跑起来，原则上只需要这些现场信息：
 
-- 项目路径：`X:\Auto-Debug`
+- 工具根目录：本地部署后默认是 `%LOCALAPPDATA%\Programs\auto-debug`
 - 串口：例如 `COM19`
 - 设备密码：如果串口登录需要密码
 - Wi-Fi 信息：只有在要跑 `bootstrap-network --mode wlan_script` 或 `device-pull --mode wlan_script` 时才需要
@@ -109,11 +109,25 @@ $env:AUTO_DBG_PREFERRED_INTERFACES = "eth0,wlan0,usb0"
 
 ## 快速开始
 
-### 1. 进入项目
+### 1. 先做一次本地部署
+
+如果你手上是源码仓，先执行：
 
 ```powershell
 cd X:\Auto-Debug
+.\install-local-tool.ps1
 ```
+
+它会自动：
+
+- 复制独立运行所需内容到 `%LOCALAPPDATA%\Programs\auto-debug`
+- 写入用户环境变量：
+  - `AUTO_DBG_HOME`
+  - `AUTO_DBG_PROJECT_ROOT`
+- 把 `%LOCALAPPDATA%\Programs\auto-debug\bin` 加到用户 `Path`
+- 刷新 home-local MCP plugin，让 Codex 和别的 Agent 直接接到本地安装版
+
+执行完后，打开一个新的 PowerShell 窗口。
 
 ### 2. 提供最小现场参数
 
@@ -125,12 +139,22 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 如果你更习惯改文件，也可以编辑：
 
 ```powershell
-X:\Auto-Debug\config\user-settings.toml
+$env:AUTO_DBG_HOME\config\user-settings.toml
 ```
 
-### 3. 开始使用
+### 3. 直接调用
 
 ```powershell
+autodbg show-mvp
+autodbg ports
+autodbg run
+observe-serial
+```
+
+如果你暂时还在源码模式里运行，也可以继续用：
+
+```powershell
+cd X:\Auto-Debug
 .\.venv\Scripts\python -m autodbg show-mvp
 .\.venv\Scripts\python -m autodbg ports
 .\.venv\Scripts\python -m autodbg run
@@ -197,17 +221,24 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - [C:\Users\xcz5290\plugins\embedded-device-auto-debug-mcp](</C:/Users/xcz5290/plugins/embedded-device-auto-debug-mcp/README.md>)
 - [C:\Users\xcz5290\.agents\plugins\marketplace.json](</C:/Users/xcz5290/.agents/plugins/marketplace.json>)
 
-现在也补了自动安装/升级入口，新机器上直接执行：
+现在也补了自动安装/升级入口。最推荐的入口已经不是直接刷 home plugin，而是先做本地部署：
 
 ```powershell
 cd X:\Auto-Debug
-.\install-home-plugin.ps1
+.\install-local-tool.ps1
 ```
 
-如果要装到别的 home 目录，或者独立项目根不是 `X:\Auto-Debug`，可以显式传：
+如果你只想刷新 home plugin，也可以：
 
 ```powershell
-.\install-home-plugin.ps1 -ProjectRoot D:\Auto-Debug -HomeRoot C:\Users\YourName
+install-home-plugin
+```
+
+如果独立安装目录或 home 目录需要显式指定：
+
+```powershell
+.\install-local-tool.ps1 -ProjectRoot D:\Auto-Debug -InstallRoot C:\Tools\auto-debug
+.\install-home-plugin.ps1 -ProjectRoot C:\Tools\auto-debug -HomeRoot C:\Users\YourName
 ```
 
 ## 常用命令
