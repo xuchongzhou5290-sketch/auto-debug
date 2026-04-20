@@ -31,6 +31,7 @@ from autodbg.agent import (
 from autodbg.config import apply_user_settings, default_user_settings_path, load_user_settings
 from autodbg.control.controller import CommandResult, DeviceController, LoginRequiredError
 from autodbg.deploy.deployer import Deployer
+from autodbg.deploy import LOCAL_TOOL_NAME, install_local_tool
 from autodbg.evidence.collector import EvidenceCollector
 from autodbg.host.bundle import build_serial_bundle, split_base64_payload
 from autodbg.host.artifact_server import serve_directory, write_manifest, write_pull_script
@@ -594,6 +595,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--plugin-name",
         default=HOME_PLUGIN_NAME,
         help=f"Plugin folder name; defaults to {HOME_PLUGIN_NAME}",
+    )
+
+    install_local_tool_parser = subparsers.add_parser(
+        "install-local-tool",
+        help="Deploy the tool into a local install root and generate direct-call wrappers",
+    )
+    install_local_tool_parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=_project_root(),
+        help="Path to the source project root; defaults to the current project",
+    )
+    install_local_tool_parser.add_argument(
+        "--install-root",
+        type=Path,
+        default=Path.home() / "AppData" / "Local" / "Programs" / LOCAL_TOOL_NAME,
+        help="Target install root for the local tool deployment",
+    )
+    install_local_tool_parser.add_argument(
+        "--skip-venv",
+        action="store_true",
+        help="Do not copy .venv into the local install root",
+    )
+    install_local_tool_parser.add_argument(
+        "--skip-local-settings",
+        action="store_true",
+        help="Do not copy config/user-settings.toml even if it exists locally",
     )
 
     subparsers.add_parser("show-mvp", help="Print the MVP workflow document path and command entry")
@@ -4028,6 +4056,21 @@ def _command_install_home_plugin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_install_local_tool(args: argparse.Namespace) -> int:
+    result = install_local_tool(
+        project_root=args.project_root,
+        install_root=args.install_root,
+        include_venv=not args.skip_venv,
+        include_local_settings=not args.skip_local_settings,
+    )
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Local tool installed: {result['install_root']}")
+    print(f"[DONE] Command bin: {result['bin_dir']}")
+    print(f"[DONE] Wrapper: {result['autodbg_cmd']}")
+    print(f"[DONE] Observe wrapper: {result['observe_cmd']}")
+    return 0
+
+
 def _command_show_mvp() -> int:
     doc_path = _project_root() / "docs" / "mvp-workflow.md"
     print("[ oo... ] 2/5 steps")
@@ -4096,6 +4139,8 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_describe_agent_tool(args)
     if args.command == "install-home-plugin":
         return _command_install_home_plugin(args)
+    if args.command == "install-local-tool":
+        return _command_install_local_tool(args)
     if args.command == "show-mvp":
         return _command_show_mvp()
     if args.command == "ports":

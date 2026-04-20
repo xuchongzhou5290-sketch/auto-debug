@@ -14,6 +14,14 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "Python runtime not found: $python"
 }
 
+$existingPythonPath = $env:PYTHONPATH
+$projectPythonPath = "$projectRoot;$projectRoot\src"
+if ([string]::IsNullOrWhiteSpace($existingPythonPath)) {
+    $env:PYTHONPATH = $projectPythonPath
+} else {
+    $env:PYTHONPATH = "$projectPythonPath;$existingPythonPath"
+}
+
 function Get-ObserveSerialDefaults {
     $settingsPath = Join-Path $projectRoot "config\user-settings.toml"
     $defaults = [ordered]@{

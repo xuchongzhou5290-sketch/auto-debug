@@ -13,6 +13,7 @@ from autodbg.cli.main import (
     _build_parser,
     _command_describe_agent_tool,
     _command_install_home_plugin,
+    _command_install_local_tool,
     _build_watch_tui_rows,
     _build_existing_network_check,
     _build_health_checks,
@@ -112,6 +113,30 @@ class CliMainTest(unittest.TestCase):
         output = buffer.getvalue()
         self.assertIn("Home plugin installed", output)
         self.assertIn("Marketplace", output)
+
+    def test_command_install_local_tool_prints_summary(self) -> None:
+        args = argparse.Namespace(
+            project_root=Path("X:/Auto-Debug"),
+            install_root=Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug"),
+            skip_venv=False,
+            skip_local_settings=False,
+        )
+        fake_result = {
+            "install_root": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug"),
+            "bin_dir": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin"),
+            "autodbg_cmd": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin/autodbg.cmd"),
+            "observe_cmd": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin/observe-serial.cmd"),
+        }
+
+        with patch("autodbg.cli.main.install_local_tool", return_value=fake_result):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = _command_install_local_tool(args)
+
+        self.assertEqual(exit_code, 0)
+        output = buffer.getvalue()
+        self.assertIn("Local tool installed", output)
+        self.assertIn("Observe wrapper", output)
 
     def test_format_output_excerpt_truncates_and_counts_extra_lines(self) -> None:
         excerpt = _format_output_excerpt(
