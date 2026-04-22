@@ -38,6 +38,7 @@ from autodbg.host.artifact_server import serve_directory, write_manifest, write_
 from autodbg.host.network import detect_host_ipv4
 from autodbg.host.storage import get_drive_info, list_host_drives
 from autodbg.mcp.install import HOME_PLUGIN_NAME, install_home_plugin
+from autodbg.models.session import SessionContext, SessionPaths
 from autodbg.profiles.loader import (
     ProfileResolutionError,
     default_profile_defaults_path,
@@ -58,6 +59,7 @@ from autodbg.serial.runtime import (
     serial_trace_log_path,
     stop_serial_broker,
 )
+from autodbg.session.contract import build_excerpt, build_result_contract
 from autodbg.session.manager import SessionManager
 from autodbg.state.machine import DeviceState, StateSnapshot, TaskState
 from autodbg.workflows.evaluation import evaluate_health_checks, evaluate_startup_run
@@ -180,6 +182,15 @@ def _add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--baudrate", type=int, help="Override the serial baudrate from the device profile")
 
 
+def _add_loop_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--goal-id", help="Stable identifier for the upper-level debug objective")
+    parser.add_argument("--goal", help="Plain-text target for the current debug loop")
+    parser.add_argument("--prev-session", type=Path, help="Previous session directory in the same multi-round debug loop")
+    parser.add_argument("--iteration", type=int, help="Current debug iteration index; defaults to previous iteration + 1")
+    parser.add_argument("--max-iterations", type=int, help="Optional loop budget recorded in the session summary")
+    parser.add_argument("--attempt-note", help="Short note about what changed before this iteration")
+
+
 def _add_watch_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--device",
@@ -215,6 +226,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Create a session and render the MVP workflow plan")
     _add_profile_arguments(run_parser)
+    _add_loop_arguments(run_parser)
     run_parser.add_argument("--observe-seconds", type=float, default=3.0, help="Initial serial observation window")
     run_parser.add_argument(
         "--skip-evidence",
@@ -230,6 +242,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     stage_sd_parser = subparsers.add_parser("stage-sd", help="Copy a local file into the configured SD card drive")
     _add_profile_arguments(stage_sd_parser)
+    _add_loop_arguments(stage_sd_parser)
     stage_sd_parser.add_argument("--source", type=Path, required=True, help="Local file to stage onto the SD card")
     stage_sd_parser.add_argument(
         "--target-subdir",
@@ -255,6 +268,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bootstrap_parser = subparsers.add_parser("bootstrap-network", help="Bring up device networking over serial shell")
     _add_profile_arguments(bootstrap_parser)
+    _add_loop_arguments(bootstrap_parser)
     bootstrap_parser.add_argument(
         "--mode",
         choices=["lan_ready", "wlan_script", "offline"],
@@ -332,6 +346,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Serve local artifacts and trigger a device-side pull over the serial shell",
     )
     _add_profile_arguments(device_pull_parser)
+    _add_loop_arguments(device_pull_parser)
     device_pull_parser.add_argument(
         "--root",
         type=Path,
@@ -408,6 +423,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     observe_parser = subparsers.add_parser("observe", help="Capture serial output into a new session")
     _add_profile_arguments(observe_parser)
+    _add_loop_arguments(observe_parser)
     observe_parser.add_argument("--seconds", type=float, default=10.0, help="How long to observe the serial port")
     observe_parser.add_argument("--live", action="store_true", help="Print serial lines in real time while capturing")
     observe_parser.add_argument("--follow", action="store_true", help="Keep watching until Ctrl+C")
@@ -431,11 +447,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     exec_parser = subparsers.add_parser("exec", help="Login over serial and execute a shell command")
     _add_profile_arguments(exec_parser)
+    _add_loop_arguments(exec_parser)
     exec_parser.add_argument("--shell-command", required=True, help="Command to execute once a shell prompt is reached")
     exec_parser.add_argument("--timeout", type=float, default=20.0, help="Command timeout in seconds")
 
     fetch_parser = subparsers.add_parser("fetch-file", help="Fetch a device-side file over the serial shell using base64")
     _add_profile_arguments(fetch_parser)
+    _add_loop_arguments(fetch_parser)
     fetch_parser.add_argument("--remote-path", required=True, help="Absolute device-side file path to fetch")
     fetch_parser.add_argument("--output", type=Path, help="Optional local output path")
     fetch_parser.add_argument("--timeout", type=float, default=60.0, help="Fetch timeout in seconds")
@@ -445,6 +463,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fetch a device-side file or directory; directories are returned as tar streams",
     )
     _add_profile_arguments(fetch_path_parser)
+    _add_loop_arguments(fetch_path_parser)
     fetch_path_parser.add_argument("--remote-path", required=True, help="Absolute device-side file or directory path to fetch")
     fetch_path_parser.add_argument("--output", type=Path, help="Optional local output path")
     fetch_path_parser.add_argument("--timeout", type=float, default=90.0, help="Fetch timeout in seconds")
@@ -454,6 +473,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run a default evidence command bundle and fetch selected small device files",
     )
     _add_profile_arguments(collect_parser)
+    _add_loop_arguments(collect_parser)
     collect_parser.add_argument(
         "--shell-command",
         action="append",
@@ -477,12 +497,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
     health_parser = subparsers.add_parser("health", help="Run the serial health probe bundle against the device")
     _add_profile_arguments(health_parser)
+    _add_loop_arguments(health_parser)
     health_parser.add_argument("--timeout", type=float, default=20.0, help="Timeout in seconds for each health probe")
     health_parser.add_argument(
         "--skip-sd-write-probe",
         action="store_true",
         help="Skip the temporary write/read/delete probe on /mnt/sdcard",
     )
+
+    intervention_parser = subparsers.add_parser(
+        "record-intervention",
+        help="Append a structured intervention record to an existing session",
+    )
+    intervention_parser.add_argument("--session-dir", type=Path, required=True, help="Target session directory")
+    intervention_parser.add_argument("--kind", required=True, help="Intervention type such as ai_patch, human_action, or config_change")
+    intervention_parser.add_argument("--summary", required=True, help="One-line summary of the intervention")
+    intervention_parser.add_argument("--details", default="", help="Optional detailed description")
+    intervention_parser.add_argument("--file", action="append", default=[], help="Affected file path; may be repeated")
+    intervention_parser.add_argument("--git-commit", help="Optional git commit hash associated with the intervention")
+    intervention_parser.add_argument("--expected-effect", help="Expected effect before the next debug iteration")
+    intervention_parser.add_argument("--related-session", help="Optional related session id or path")
+    intervention_parser.add_argument("--metadata-json", help="Optional JSON object with extra machine-readable metadata")
 
     resume_parser = subparsers.add_parser("resume", help="Show the stored session summary")
     resume_parser.add_argument("--session-dir", type=Path, required=True, help="Path to the session directory")
@@ -1433,6 +1468,197 @@ def _session_manager(args: argparse.Namespace, profiles=None) -> SessionManager:
     if profiles is not None and profiles.device.storage is not None and profiles.device.storage.retrieved_root:
         retrieved_root = Path(profiles.device.storage.retrieved_root)
     return SessionManager(args.artifacts_root, retrieved_root=retrieved_root)
+
+
+def _load_session_summary(session_dir: Path) -> dict[str, Any]:
+    summary_path = Path(session_dir).absolute() / "summary.json"
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+def _restore_session_context(session_dir: Path, summary: dict[str, Any]) -> SessionContext:
+    session_data = summary.get("session")
+    if not isinstance(session_data, dict):
+        raise ValueError("Session summary is missing the session block.")
+
+    paths_data = session_data.get("session_paths")
+    if not isinstance(paths_data, dict):
+        raise ValueError("Session summary is missing session.session_paths.")
+
+    root = Path(paths_data.get("root") or session_dir).absolute()
+    session_paths = SessionPaths(
+        root=root,
+        core_dir=Path(paths_data.get("core_dir") or root / "core").absolute(),
+        deploy_dir=Path(paths_data.get("deploy_dir") or root / "deploy").absolute(),
+        logs_dir=Path(paths_data.get("logs_dir") or root / "logs").absolute(),
+        retrieved_dir=Path(paths_data.get("retrieved_dir") or root / "retrieved").absolute(),
+    )
+    return SessionContext(
+        session_id=str(session_data.get("session_id") or root.name),
+        created_at=str(session_data.get("created_at") or ""),
+        device_id=str(session_data.get("device_id") or "unknown"),
+        task_type=str(session_data.get("task_type") or "unknown"),
+        session_paths=session_paths,
+        metadata=dict(session_data.get("metadata") or {}),
+    )
+
+
+def _resolve_loop_context(args: argparse.Namespace, *, session_dir: Path, session_id: str) -> dict[str, Any]:
+    parent_summary: dict[str, Any] | None = None
+    parent_session_dir = getattr(args, "prev_session", None)
+    if parent_session_dir is not None:
+        parent_summary = _load_session_summary(parent_session_dir)
+
+    parent_loop = parent_summary.get("loop", {}) if parent_summary else {}
+    parent_session = parent_summary.get("session", {}) if parent_summary else {}
+    parent_session_id = parent_session.get("session_id")
+    iteration = getattr(args, "iteration", None)
+    if iteration is None:
+        if parent_loop.get("iteration") is not None:
+            iteration = int(parent_loop["iteration"]) + 1
+        else:
+            iteration = 1
+
+    max_iterations = getattr(args, "max_iterations", None)
+    if max_iterations is None and parent_loop.get("max_iterations") is not None:
+        max_iterations = int(parent_loop["max_iterations"])
+
+    goal_id = getattr(args, "goal_id", None) or parent_loop.get("goal_id")
+    goal = getattr(args, "goal", None) or parent_loop.get("goal")
+    root_session_id = parent_loop.get("root_session_id") or parent_session_id or session_id
+
+    return {
+        "goal_id": goal_id,
+        "goal": goal,
+        "root_session_id": root_session_id,
+        "parent_session_id": parent_session_id,
+        "parent_session_dir": str(Path(parent_session_dir).absolute()) if parent_session_dir is not None else None,
+        "iteration": iteration,
+        "max_iterations": max_iterations,
+        "attempt_note": getattr(args, "attempt_note", None),
+        "current_session_dir": str(Path(session_dir).absolute()),
+    }
+
+
+def _create_session_with_loop(args: argparse.Namespace, *, profiles, task_type: str):
+    session = _session_manager(args, profiles).create(
+        device_id=profiles.device.device_id,
+        task_type=task_type,
+    )
+    loop_context = _resolve_loop_context(args, session_dir=session.session_paths.root, session_id=session.session_id)
+    session.metadata["loop"] = loop_context
+    return session, loop_context
+
+
+def _collect_option_patch(args: argparse.Namespace, option_names: list[str]) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for option_name in option_names:
+        if not hasattr(args, option_name):
+            continue
+        value = getattr(args, option_name)
+        if value is None or value == "":
+            continue
+        if isinstance(value, Path):
+            patch[option_name] = str(value)
+        elif isinstance(value, list):
+            if value:
+                patch[option_name] = list(value)
+        else:
+            patch[option_name] = value
+    return patch
+
+
+def _dedupe_next_actions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    result: list[dict[str, Any]] = []
+    for item in items:
+        key = (str(item.get("action", "")), str(item.get("reason", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _build_stage_sd_next_actions(*, failed: bool) -> list[dict[str, str]]:
+    if failed:
+        return [{"action": "stage-sd", "reason": "Retry SD staging after fixing the host drive path or media permissions."}]
+    return []
+
+
+def _build_run_next_actions(
+    *,
+    failure_stage: str | None,
+    evaluation: dict[str, Any],
+    has_evidence_failures: bool,
+) -> list[dict[str, str]]:
+    finding_names = {str(item.get("check_name", "")) for item in evaluation.get("findings", [])}
+    actions: list[dict[str, str]] = []
+    if failure_stage == "observe_serial" or "serial_observation" in finding_names:
+        actions.append({"action": "observe", "reason": "Capture more serial context around the failing startup window."})
+    if failure_stage == "establish_control":
+        actions.append({"action": "run", "reason": "Retry after restoring serial login credentials or shell access."})
+    if {"appver", "lecam_process"} & finding_names:
+        actions.append({"action": "exec", "reason": "Inspect the application process or version directly on the device shell."})
+    if any(name.startswith("mmc") or name.startswith("sdcard") for name in finding_names):
+        actions.append({"action": "health", "reason": "Validate storage and mount health before the next startup attempt."})
+    if has_evidence_failures or failure_stage == "collect_evidence":
+        actions.append({"action": "collect-evidence", "reason": "Collect more diagnostics before the next startup iteration."})
+    if not actions:
+        actions.append({"action": "run", "reason": "Retry the startup workflow after the next code or configuration change."})
+    return _dedupe_next_actions(actions)
+
+
+def _build_health_next_actions(*, evaluation: dict[str, Any]) -> list[dict[str, str]]:
+    finding_names = {str(item.get("check_name", "")) for item in evaluation.get("findings", [])}
+    actions: list[dict[str, str]] = []
+    if any(name.startswith("mmc") or name.startswith("sdcard") for name in finding_names):
+        actions.append({"action": "collect-evidence", "reason": "Capture extra storage diagnostics for the warning or failure."})
+    if "lecam_process" in finding_names or "appver" in finding_names:
+        actions.append({"action": "run", "reason": "Re-run the startup workflow after addressing the reported app issue."})
+    if not actions:
+        actions.append({"action": "health", "reason": "Re-run health after the next intervention to verify the fix."})
+    return _dedupe_next_actions(actions)
+
+
+def _build_bootstrap_network_next_actions(
+    *,
+    blocked: bool = False,
+    failed_checks: list[dict[str, Any]] | None = None,
+    mode: str | None = None,
+) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    if blocked and mode == "offline":
+        actions.append({"action": "stage-sd", "reason": "Use SD staging or another offline path when LAN bootstrap is intentionally unavailable."})
+    if blocked:
+        actions.append({"action": "bootstrap-network", "reason": "Retry after restoring device login access or changing the bootstrap mode."})
+    if failed_checks:
+        actions.append({"action": "bootstrap-network", "reason": "Retry after fixing the connectivity checks or WLAN bootstrap commands."})
+        actions.append({"action": "observe", "reason": "Capture serial output while the device brings networking up."})
+    if not actions:
+        actions.append({"action": "bootstrap-network", "reason": "Retry network bootstrap after the next intervention."})
+    return _dedupe_next_actions(actions)
+
+
+def _build_device_pull_next_actions(
+    *,
+    blocked: bool = False,
+    failed_checks: list[dict[str, Any]] | None = None,
+    pull_failed: bool = False,
+    list_failed: bool = False,
+    mode: str | None = None,
+) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    if blocked and mode == "offline":
+        actions.append({"action": "stage-sd", "reason": "Use SD staging when HTTP pull is unavailable in offline mode."})
+    if failed_checks:
+        actions.append({"action": "bootstrap-network", "reason": "Stabilize networking before retrying the device pull."})
+    if pull_failed or list_failed or blocked:
+        actions.append({"action": "device-pull", "reason": "Retry the artifact pull after fixing the transfer prerequisites."})
+    if pull_failed:
+        actions.append({"action": "serve-artifacts", "reason": "Validate the local artifact server or payload root before the next pull attempt."})
+    if not actions:
+        actions.append({"action": "device-pull", "reason": "Retry device pull after the next intervention."})
+    return _dedupe_next_actions(actions)
 
 
 def _read_trace_entries(trace_path: Path) -> list[SerialTraceEntry]:
@@ -2465,10 +2691,7 @@ def _print_health_report(summary: dict[str, Any]) -> None:
 
 def _command_run(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
-        task_type=profiles.task.task_type,
-    )
+    session, loop_context = _create_session_with_loop(args, profiles=profiles, task_type=profiles.task.task_type)
 
     state = StateSnapshot()
     state.transition_task(TaskState.PRECHECK, "Profiles loaded.")
@@ -2485,6 +2708,8 @@ def _command_run(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=workflow_name,
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="run",
+        loop_context=loop_context,
         plan_details={
             "serial": {
                 "port": observer_plan.port,
@@ -2537,6 +2762,25 @@ def _command_run(args: argparse.Namespace) -> int:
                 "status": "run_observe_failed",
                 "error": str(exc),
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="run",
+                    decision="continue",
+                    failure_stage="observe_serial",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="serial_observer", label="observe_error", text=str(exc), severity="error")],
+                    next_actions=_build_run_next_actions(
+                        failure_stage="observe_serial",
+                        evaluation={},
+                        has_evidence_failures=False,
+                    ),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2622,6 +2866,25 @@ def _command_run(args: argparse.Namespace) -> int:
                 "evaluation": evaluation,
                 "evidence_results": evidence_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="run",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    next_actions=_build_run_next_actions(
+                        failure_stage="establish_control",
+                        evaluation=evaluation,
+                        has_evidence_failures=False,
+                    ),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2644,6 +2907,25 @@ def _command_run(args: argparse.Namespace) -> int:
                 "evaluation": evaluation,
                 "evidence_results": evidence_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="run",
+                    decision="continue",
+                    failure_stage="collect_evidence" if run_stage == "default evidence collection" else "baseline_checks",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label=run_stage.replace(" ", "_"), text=str(exc), severity="error")],
+                    next_actions=_build_run_next_actions(
+                        failure_stage="collect_evidence" if run_stage == "default evidence collection" else "baseline_checks",
+                        evaluation=evaluation,
+                        has_evidence_failures=False,
+                    ),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2654,17 +2936,69 @@ def _command_run(args: argparse.Namespace) -> int:
     evidence_command_failures = [item for item in evidence_results["command_results"] if item.get("exit_code") != 0]
     evidence_file_failures = [item for item in evidence_results["file_results"] if item.get("status") != "ok"]
     has_evidence_failures = bool(evidence_command_failures or evidence_file_failures)
+    evaluation_verdict = str(evaluation.get("verdict", ""))
+    result_key_excerpts: list[dict[str, str]] = []
+    for finding in evaluation.get("findings", [])[:3]:
+        result_key_excerpts.append(
+            build_excerpt(
+                source="evaluation",
+                label=str(finding.get("check_name", "finding")),
+                text=str(finding.get("message", "")),
+                severity=str(finding.get("level", "info")),
+            )
+        )
+    if evidence_command_failures:
+        first_failure = evidence_command_failures[0]
+        result_key_excerpts.append(
+            build_excerpt(
+                source="evidence_command",
+                label=str(first_failure.get("name", "command_failure")),
+                text=_format_output_excerpt(first_failure.get("output_lines", [])),
+                severity="error",
+            )
+        )
+    if evidence_file_failures:
+        first_file_failure = evidence_file_failures[0]
+        result_key_excerpts.append(
+            build_excerpt(
+                source="evidence_file",
+                label=str(first_file_failure.get("remote_path", "file_failure")),
+                text=str(first_file_failure.get("error") or first_file_failure.get("status") or "file fetch failed"),
+                severity="error",
+            )
+        )
+    result_decision = "success" if evaluation_verdict == "pass" and not has_evidence_failures else "continue"
+    result_failure_stage = None if result_decision == "success" else ("collect_evidence" if has_evidence_failures else "validation")
     state.transition_task(
-        TaskState.FAILED if has_evidence_failures else TaskState.COMPLETED,
+        TaskState.FAILED if has_evidence_failures or evaluation_verdict == "fail" else TaskState.COMPLETED,
         "Run workflow finished.",
     )
     collector.update_summary(
         {
-            "status": "run_partial" if has_evidence_failures else "run_completed",
+            "status": "run_partial" if has_evidence_failures or evaluation_verdict != "pass" else "run_completed",
             "run_results": run_results,
             "evaluation": evaluation,
             "evidence_results": evidence_results,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="run",
+                decision=result_decision,
+                failure_stage=result_failure_stage,
+                retryable=False if result_decision == "success" else True,
+                stop_reason=None if result_decision == "success" else (evaluation.get("summary") or "Run completed without satisfying the target verdict."),
+                key_excerpts=result_key_excerpts,
+                next_actions=[] if result_decision == "success" else _build_run_next_actions(
+                    failure_stage=result_failure_stage,
+                    evaluation=evaluation,
+                    has_evidence_failures=has_evidence_failures,
+                ),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(
+                    args,
+                    ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                ),
+            ),
         }
     )
     summary = json.loads((session.session_paths.root / "summary.json").read_text(encoding="utf-8"))
@@ -2682,8 +3016,9 @@ def _command_stage_sd(args: argparse.Namespace) -> int:
         print("[TODO] Add the host SD card drive path to config/user-settings.toml or the device profile, then retry.")
         return 1
 
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_stage_sd",
     )
     state = StateSnapshot()
@@ -2695,6 +3030,8 @@ def _command_stage_sd(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_stage_sd",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="stage-sd",
+        loop_context=loop_context,
         plan_details={
             "deploy": {
                 "mode": "stage_sd",
@@ -2731,6 +3068,21 @@ def _command_stage_sd(args: argparse.Namespace) -> int:
                 "status": "stage_sd_failed",
                 "error": str(exc),
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="stage-sd",
+                    decision="continue",
+                    failure_stage="deploy_artifacts",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="deployer", label="stage_sd_error", text=str(exc), severity="error")],
+                    next_actions=_build_stage_sd_next_actions(failed=True),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["source", "target_subdir", "dest_name", "no_verify", "allow_non_removable"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2750,6 +3102,23 @@ def _command_stage_sd(args: argparse.Namespace) -> int:
             "status": "stage_sd_completed",
             "deployment_result": result.to_dict(),
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="stage-sd",
+                decision="success",
+                failure_stage=None,
+                retryable=False,
+                key_excerpts=[
+                    build_excerpt(source="deployer", label="target_path", text=str(result.target_path)),
+                    build_excerpt(source="deployer", label="sha256", text=result.sha256),
+                ],
+                next_actions=_build_stage_sd_next_actions(failed=False),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(
+                    args,
+                    ["source", "target_subdir", "dest_name", "no_verify", "allow_non_removable"],
+                ),
+            ),
         }
     )
     print("[ oooo. ] 4/5 steps")
@@ -2804,8 +3173,9 @@ def _command_storage(args: argparse.Namespace) -> int:
 
 def _command_bootstrap_network(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_bootstrap_network",
     )
     state = StateSnapshot()
@@ -2835,6 +3205,8 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_bootstrap_network",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="bootstrap-network",
+        loop_context=loop_context,
         plan_details={
             "network": {
                 "mode": args.mode,
@@ -2854,6 +3226,28 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
                 "status": "bootstrap_network_blocked",
                 "error": "Network mode is offline; bootstrap was intentionally skipped.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="bootstrap-network",
+                    decision="blocked",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="Network mode is offline; bootstrap was intentionally skipped.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="offline_mode",
+                            text="Network mode is offline; bootstrap was intentionally skipped.",
+                            severity="warning",
+                        )
+                    ],
+                    next_actions=_build_bootstrap_network_next_actions(blocked=True, mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2867,6 +3261,28 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
                 "status": "bootstrap_network_failed",
                 "error": "No bootstrap commands were provided for wlan_script mode.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="bootstrap-network",
+                    decision="continue",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="No bootstrap commands were provided for wlan_script mode.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="missing_bootstrap_commands",
+                            text="No bootstrap commands were provided for wlan_script mode.",
+                            severity="error",
+                        )
+                    ],
+                    next_actions=_build_bootstrap_network_next_actions(mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2880,6 +3296,28 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
                 "status": "bootstrap_network_failed",
                 "error": "No connectivity checks were provided.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="bootstrap-network",
+                    decision="continue",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="No connectivity checks were provided.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="missing_connectivity_checks",
+                            text="No connectivity checks were provided.",
+                            severity="error",
+                        )
+                    ],
+                    next_actions=_build_bootstrap_network_next_actions(mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2937,6 +3375,21 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
                 "bootstrap_results": bootstrap_results,
                 "check_results": check_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="bootstrap-network",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    next_actions=_build_bootstrap_network_next_actions(blocked=True, mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2952,6 +3405,21 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
                 "bootstrap_results": bootstrap_results,
                 "check_results": check_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="bootstrap-network",
+                    decision="continue",
+                    failure_stage="run_bootstrap_commands",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label="bootstrap_network_failed", text=str(exc), severity="error")],
+                    next_actions=_build_bootstrap_network_next_actions(failed_checks=check_results, mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                    ),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -2967,6 +3435,29 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
             "bootstrap_results": bootstrap_results,
             "check_results": check_results,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="bootstrap-network",
+                decision="success" if not failed_checks else "continue",
+                failure_stage=None if not failed_checks else "validate_connectivity",
+                retryable=False if not failed_checks else True,
+                stop_reason=None if not failed_checks else f"{len(failed_checks)} connectivity check(s) failed.",
+                key_excerpts=[
+                    build_excerpt(
+                        source="network_check",
+                        label=str(result.get("name", "check")),
+                        text=_format_output_excerpt(result.get("output_lines", [])),
+                        severity="error",
+                    )
+                    for result in failed_checks[:3]
+                ],
+                next_actions=[] if not failed_checks else _build_bootstrap_network_next_actions(failed_checks=failed_checks, mode=args.mode),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(
+                    args,
+                    ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+                ),
+            ),
         }
     )
     print("[ oooo. ] 4/5 steps")
@@ -3034,8 +3525,9 @@ def _command_serve_artifacts(args: argparse.Namespace) -> int:
 
 def _command_device_pull(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_device_pull",
     )
     state = StateSnapshot()
@@ -3065,11 +3557,36 @@ def _command_device_pull(args: argparse.Namespace) -> int:
     workspace = _resolve_pull_workspace(profiles, args.workspace)
     root = args.root.resolve()
     list_command = args.list_command or f"find {_sh_single_quote(workspace)} -maxdepth 3 -type f | sort"
+    carry_forward_options = _collect_option_patch(
+        args,
+        [
+            "mode",
+            "transfer_mode",
+            "workspace",
+            "root",
+            "bind",
+            "port",
+            "base_url",
+            "bootstrap_command",
+            "check_command",
+            "list_command",
+            "manifest_name",
+            "pull_script_name",
+            "serial_bundle_chunk_size",
+            "timeout",
+            "wifi_ssid",
+            "wifi_password",
+            "wifi_mode",
+            "network_dir",
+        ],
+    )
     collector.bootstrap(
         profiles=profiles,
         state_snapshot=state,
         workflow_name=f"{workflow_name}_device_pull",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="device-pull",
+        loop_context=loop_context,
         plan_details={
             "network": {
                 "mode": args.mode,
@@ -3096,6 +3613,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "status": "device_pull_blocked",
                 "error": "Network mode is offline, so HTTP transfer is not available.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="blocked",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="Network mode is offline, so HTTP transfer is not available.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="offline_http_unavailable",
+                            text="Network mode is offline, so HTTP transfer is not available.",
+                            severity="warning",
+                        )
+                    ],
+                    next_actions=_build_device_pull_next_actions(blocked=True, mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3109,6 +3645,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "status": "device_pull_failed",
                 "error": "No bootstrap commands were provided for wlan_script mode.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="continue",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="No bootstrap commands were provided for wlan_script mode.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="missing_bootstrap_commands",
+                            text="No bootstrap commands were provided for wlan_script mode.",
+                            severity="error",
+                        )
+                    ],
+                    next_actions=_build_device_pull_next_actions(mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3122,6 +3677,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "status": "device_pull_failed",
                 "error": "No connectivity checks were provided.",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="continue",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason="No connectivity checks were provided.",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="missing_connectivity_checks",
+                            text="No connectivity checks were provided.",
+                            severity="error",
+                        )
+                    ],
+                    next_actions=_build_device_pull_next_actions(mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3135,6 +3709,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "status": "device_pull_failed",
                 "error": f"Artifact root does not exist: {root}",
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="continue",
+                    failure_stage="prepare_transport",
+                    retryable=True,
+                    stop_reason=f"Artifact root does not exist: {root}",
+                    key_excerpts=[
+                        build_excerpt(
+                            source="workflow_runner",
+                            label="missing_artifact_root",
+                            text=f"Artifact root does not exist: {root}",
+                            severity="error",
+                        )
+                    ],
+                    next_actions=_build_device_pull_next_actions(mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3335,6 +3928,18 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "pull_result": pull_result,
                 "list_result": list_result,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    next_actions=_build_device_pull_next_actions(blocked=True, mode=args.mode),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3355,6 +3960,22 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "pull_result": pull_result,
                 "list_result": list_result,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="device-pull",
+                    decision="continue",
+                    failure_stage="transfer_artifacts",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label="device_pull_failed", text=str(exc), severity="error")],
+                    next_actions=_build_device_pull_next_actions(
+                        failed_checks=check_results,
+                        pull_failed=True,
+                        mode=args.mode,
+                    ),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3371,6 +3992,40 @@ def _command_device_pull(args: argparse.Namespace) -> int:
     failed_checks = [result for result in check_results if result.get("exit_code") != 0]
     pull_failed = pull_result is None or pull_result.get("exit_code") != 0
     list_failed = list_result is None or list_result.get("exit_code") != 0
+    result_key_excerpts: list[dict[str, str]] = [
+        build_excerpt(
+            source="network_check",
+            label=str(result.get("name", "check")),
+            text=_format_output_excerpt(result.get("output_lines", [])),
+            severity="error",
+        )
+        for result in failed_checks[:2]
+    ]
+    if pull_failed and pull_result is not None:
+        result_key_excerpts.append(
+            build_excerpt(
+                source="device_pull",
+                label="pull_result",
+                text=_format_output_excerpt(pull_result.get("output_lines", [])),
+                severity="error",
+            )
+        )
+    if list_failed and list_result is not None:
+        result_key_excerpts.append(
+            build_excerpt(
+                source="device_pull",
+                label="list_result",
+                text=_format_output_excerpt(list_result.get("output_lines", [])),
+                severity="error",
+            )
+        )
+    result_failure_stage = None
+    if failed_checks:
+        result_failure_stage = "validate_connectivity"
+    elif pull_failed:
+        result_failure_stage = "transfer_artifacts"
+    elif list_failed:
+        result_failure_stage = "validate_transfer"
     state.transition_task(
         TaskState.COMPLETED if not failed_checks and not pull_failed and not list_failed else TaskState.FAILED,
         "Device pull finished.",
@@ -3386,6 +4041,33 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "pull_result": pull_result,
             "list_result": list_result,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="device-pull",
+                decision="success" if not failed_checks and not pull_failed and not list_failed else "continue",
+                failure_stage=result_failure_stage,
+                retryable=False if not failed_checks and not pull_failed and not list_failed else True,
+                stop_reason=None
+                if not failed_checks and not pull_failed and not list_failed
+                else (
+                    f"{len(failed_checks)} connectivity check(s) failed."
+                    if failed_checks
+                    else "Artifact transfer returned a non-zero exit code."
+                    if pull_failed
+                    else "Post-transfer listing failed."
+                ),
+                key_excerpts=result_key_excerpts,
+                next_actions=[]
+                if not failed_checks and not pull_failed and not list_failed
+                else _build_device_pull_next_actions(
+                    failed_checks=failed_checks,
+                    pull_failed=pull_failed,
+                    list_failed=list_failed,
+                    mode=args.mode,
+                ),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=carry_forward_options,
+            ),
         }
     )
     print("[ oooo. ] 4/5 steps")
@@ -3416,8 +4098,9 @@ def _command_device_pull(args: argparse.Namespace) -> int:
 
 def _command_health(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_health",
     )
 
@@ -3430,6 +4113,8 @@ def _command_health(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_health",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="health",
+        loop_context=loop_context,
         plan_details={
             "control": {
                 "mode": "health",
@@ -3477,6 +4162,18 @@ def _command_health(args: argparse.Namespace) -> int:
                 "error": str(exc),
                 "health_checks": check_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="health",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    next_actions=_build_health_next_actions(evaluation={}),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["timeout", "skip_sd_write_probe"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3497,6 +4194,18 @@ def _command_health(args: argparse.Namespace) -> int:
                 "error": str(exc),
                 "health_checks": check_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="health",
+                    decision="continue",
+                    failure_stage="running_checks",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label="health_failed", text=str(exc), severity="error")],
+                    next_actions=_build_health_next_actions(evaluation={}),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["timeout", "skip_sd_write_probe"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3504,14 +4213,35 @@ def _command_health(args: argparse.Namespace) -> int:
         print("[TODO] Check the latest session logs for the failing command.")
         return 1
 
-    state.transition_task(TaskState.COMPLETED, "Device health probes completed.")
     evaluation = evaluate_health_checks(check_results, app_name=profiles.model.app_name)
+    health_verdict = str(evaluation.get("verdict", ""))
+    state.transition_task(TaskState.FAILED if health_verdict == "fail" else TaskState.COMPLETED, "Device health probes completed.")
     collector.update_summary(
         {
             "status": "health_completed",
             "health_checks": check_results,
             "evaluation": evaluation,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="health",
+                decision="success" if evaluation.get("verdict") == "pass" else "continue",
+                failure_stage=None if evaluation.get("verdict") == "pass" else "validation",
+                retryable=False if evaluation.get("verdict") == "pass" else True,
+                stop_reason=None if evaluation.get("verdict") == "pass" else evaluation.get("summary"),
+                key_excerpts=[
+                    build_excerpt(
+                        source="evaluation",
+                        label=str(finding.get("check_name", "finding")),
+                        text=str(finding.get("message", "")),
+                        severity=str(finding.get("level", "info")),
+                    )
+                    for finding in evaluation.get("findings", [])[:3]
+                ],
+                next_actions=[] if evaluation.get("verdict") == "pass" else _build_health_next_actions(evaluation=evaluation),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(args, ["timeout", "skip_sd_write_probe"]),
+            ),
         }
     )
     summary = json.loads((session.session_paths.root / "summary.json").read_text(encoding="utf-8"))
@@ -3522,8 +4252,9 @@ def _command_health(args: argparse.Namespace) -> int:
 
 def _command_observe(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_observe",
     )
 
@@ -3537,6 +4268,8 @@ def _command_observe(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=workflow_name,
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="observe",
+        loop_context=loop_context,
         plan_details={"serial": {"mode": "observe", "seconds": args.seconds}},
     )
 
@@ -3572,7 +4305,27 @@ def _command_observe(args: argparse.Namespace) -> int:
             summary=f"Serial observation failed: {exc}",
             severity="error",
         )
-        collector.update_summary({"status": "observe_failed", "error": str(exc)})
+        collector.update_summary(
+            {
+                "status": "observe_failed",
+                "error": str(exc),
+                "result": build_result_contract(
+                    action="observe",
+                    decision="continue",
+                    failure_stage="observe_serial",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="serial_observer", label="observe_error", text=str(exc), severity="error")],
+                    next_actions=[{"action": "observe", "reason": "Retry after restoring serial connectivity or releasing the COM port."}],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(
+                        args,
+                        ["seconds", "live", "follow", "markers_only", "focus", "poke_newline"],
+                    ),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] Serial observe failed: {exc}")
         print("[TODO] Close any program that is already using this COM port, then retry.")
@@ -3587,6 +4340,24 @@ def _command_observe(args: argparse.Namespace) -> int:
         {
             "status": "observed_interrupted" if result.interrupted else "observed",
             "observation": result.to_dict(),
+            "result": build_result_contract(
+                action="observe",
+                decision="success" if result.lines_captured > 0 or result.interrupted else "continue",
+                failure_stage=None if result.lines_captured > 0 or result.interrupted else "observe_serial",
+                retryable=False if result.lines_captured > 0 or result.interrupted else True,
+                stop_reason=None if result.lines_captured > 0 or result.interrupted else "No serial lines were captured during the observation window.",
+                key_excerpts=[
+                    build_excerpt(source="serial_observer", label="last_line", text=line)
+                    for line in result.last_lines[:3]
+                ],
+                next_actions=[] if result.lines_captured > 0 or result.interrupted else [{"action": "observe", "reason": "Extend the observation window or trigger device activity, then retry."}],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(
+                    args,
+                    ["seconds", "live", "follow", "markers_only", "focus", "poke_newline"],
+                ),
+            ),
         }
     )
 
@@ -3607,8 +4378,9 @@ def _command_observe(args: argparse.Namespace) -> int:
 
 def _command_exec(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_exec",
     )
     state = StateSnapshot()
@@ -3620,6 +4392,8 @@ def _command_exec(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=workflow_name,
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="exec",
+        loop_context=loop_context,
         plan_details={"control": {"mode": "exec", "command": args.shell_command, "timeout": args.timeout}},
     )
 
@@ -3633,7 +4407,23 @@ def _command_exec(args: argparse.Namespace) -> int:
             summary=str(exc),
             severity="warning",
         )
-        collector.update_summary({"status": "exec_blocked", "error": str(exc)})
+        collector.update_summary(
+            {
+                "status": "exec_blocked",
+                "error": str(exc),
+                "result": build_result_contract(
+                    action="exec",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["shell_command", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] {exc}")
         print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry the exec command.")
@@ -3645,7 +4435,23 @@ def _command_exec(args: argparse.Namespace) -> int:
             summary=f"Serial exec failed: {exc}",
             severity="error",
         )
-        collector.update_summary({"status": "exec_failed", "error": str(exc)})
+        collector.update_summary(
+            {
+                "status": "exec_failed",
+                "error": str(exc),
+                "result": build_result_contract(
+                    action="exec",
+                    decision="continue",
+                    failure_stage="execute_command",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="exec_error", text=str(exc), severity="error")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["shell_command", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] Serial exec failed: {exc}")
         print("[TODO] Check whether the COM port is occupied or the device is not ready.")
@@ -3664,6 +4470,25 @@ def _command_exec(args: argparse.Namespace) -> int:
         {
             "status": "executed",
             "command_result": result.to_dict(),
+            "result": build_result_contract(
+                action="exec",
+                decision="success" if result.exit_code == 0 else "continue",
+                failure_stage=None if result.exit_code == 0 else "execute_command",
+                retryable=False if result.exit_code == 0 else True,
+                stop_reason=None if result.exit_code == 0 else f"Command exited with {result.exit_code}.",
+                key_excerpts=[
+                    build_excerpt(
+                        source="command_output",
+                        label="output_excerpt",
+                        text=_format_output_excerpt(result.output_lines),
+                        severity="error" if result.exit_code != 0 else "info",
+                    )
+                ],
+                next_actions=[] if result.exit_code == 0 else [{"action": "exec", "reason": "Retry after adjusting the shell command or device state."}],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(args, ["shell_command", "timeout"]),
+            ),
         }
     )
 
@@ -3677,8 +4502,9 @@ def _command_exec(args: argparse.Namespace) -> int:
 
 def _command_fetch_file(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_fetch_file",
     )
     state = StateSnapshot()
@@ -3690,6 +4516,8 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_fetch_file",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="fetch-file",
+        loop_context=loop_context,
         plan_details={
             "control": {
                 "mode": "fetch_file",
@@ -3711,7 +4539,24 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
             summary=str(exc),
             severity="warning",
         )
-        collector.update_summary({"status": "fetch_file_blocked", "error": str(exc), "state": state.to_dict()})
+        collector.update_summary(
+            {
+                "status": "fetch_file_blocked",
+                "error": str(exc),
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-file",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] {exc}")
         print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry fetch-file.")
@@ -3723,7 +4568,24 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
             summary=f"Fetch file failed: {exc}",
             severity="error",
         )
-        collector.update_summary({"status": "fetch_file_failed", "error": str(exc), "state": state.to_dict()})
+        collector.update_summary(
+            {
+                "status": "fetch_file_failed",
+                "error": str(exc),
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-file",
+                    decision="continue",
+                    failure_stage="fetch_file",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="fetch_file_error", text=str(exc), severity="error")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] Fetch file failed: {exc}")
         print("[TODO] Check whether the COM port is occupied or the device is not ready.")
@@ -3752,6 +4614,24 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
                 "error": fetch_result.get("error", "Unknown fetch-file error"),
                 "command_result": fetch_result.get("command_result"),
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-file",
+                    decision="continue",
+                    failure_stage="fetch_file",
+                    retryable=True,
+                    stop_reason=fetch_result.get("error", "Unknown fetch-file error"),
+                    key_excerpts=[
+                        build_excerpt(
+                            source="fetch_file",
+                            label=str(args.remote_path),
+                            text=str(fetch_result.get("error", "Unknown fetch-file error")),
+                            severity="error",
+                        )
+                    ],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3766,6 +4646,20 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
             "command_result": fetch_result.get("command_result"),
             "fetch_result": fetch_result,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="fetch-file",
+                decision="success",
+                key_excerpts=[
+                    build_excerpt(
+                        source="fetch_file",
+                        label=str(args.remote_path),
+                        text=str(fetch_result.get("local_path", "")),
+                    )
+                ],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+            ),
         }
     )
 
@@ -3780,8 +4674,9 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
 
 def _command_fetch_path(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_fetch_path",
     )
     state = StateSnapshot()
@@ -3793,6 +4688,8 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_fetch_path",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="fetch-path",
+        loop_context=loop_context,
         plan_details={
             "control": {
                 "mode": "fetch_path",
@@ -3820,7 +4717,24 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
             summary=str(exc),
             severity="warning",
         )
-        collector.update_summary({"status": "fetch_path_blocked", "error": str(exc), "state": state.to_dict()})
+        collector.update_summary(
+            {
+                "status": "fetch_path_blocked",
+                "error": str(exc),
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-path",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] {exc}")
         print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry fetch-path.")
@@ -3832,7 +4746,24 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
             summary=f"Fetch path failed: {exc}",
             severity="error",
         )
-        collector.update_summary({"status": "fetch_path_failed", "error": str(exc), "state": state.to_dict()})
+        collector.update_summary(
+            {
+                "status": "fetch_path_failed",
+                "error": str(exc),
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-path",
+                    decision="continue",
+                    failure_stage="fetch_path",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="fetch_path_error", text=str(exc), severity="error")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
+            }
+        )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] Fetch path failed: {exc}")
         print("[TODO] Check whether the COM port is occupied or the device is not ready.")
@@ -3853,6 +4784,24 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
                 "error": fetch_result.get("error", "Unknown fetch-path error"),
                 "command_result": fetch_result.get("command_result"),
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="fetch-path",
+                    decision="continue",
+                    failure_stage="fetch_path",
+                    retryable=True,
+                    stop_reason=fetch_result.get("error", "Unknown fetch-path error"),
+                    key_excerpts=[
+                        build_excerpt(
+                            source="fetch_path",
+                            label=str(args.remote_path),
+                            text=str(fetch_result.get("error", "Unknown fetch-path error")),
+                            severity="error",
+                        )
+                    ],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3867,6 +4816,20 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
             "command_result": fetch_result.get("command_result"),
             "fetch_result": fetch_result,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="fetch-path",
+                decision="success",
+                key_excerpts=[
+                    build_excerpt(
+                        source="fetch_path",
+                        label=str(args.remote_path),
+                        text=str(fetch_result.get("local_path", "")),
+                    )
+                ],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(args, ["remote_path", "output", "timeout"]),
+            ),
         }
     )
 
@@ -3882,8 +4845,9 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
 
 def _command_collect_evidence(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
-    session = _session_manager(args, profiles).create(
-        device_id=profiles.device.device_id,
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
         task_type=f"{profiles.task.task_type}_collect_evidence",
     )
     state = StateSnapshot()
@@ -3903,6 +4867,8 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
         state_snapshot=state,
         workflow_name=f"{workflow_name}_collect_evidence",
         workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="collect-evidence",
+        loop_context=loop_context,
         plan_details={
             "control": {
                 "mode": "collect_evidence",
@@ -3945,6 +4911,17 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
                 "command_results": command_results,
                 "file_results": file_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="collect-evidence",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["shell_command", "remote_file", "skip_defaults", "timeout"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3960,6 +4937,17 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
                 "command_results": command_results,
                 "file_results": file_results,
                 "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="collect-evidence",
+                    decision="continue",
+                    failure_stage="collect_evidence",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label="collect_evidence_failed", text=str(exc), severity="error")],
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=_collect_option_patch(args, ["shell_command", "remote_file", "skip_defaults", "timeout"]),
+                ),
             }
         )
         print("[ oxx.. ] 2/5 steps")
@@ -3979,6 +4967,41 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
             "command_results": command_results,
             "file_results": file_results,
             "state": state.to_dict(),
+            "result": build_result_contract(
+                action="collect-evidence",
+                decision="success" if not command_failures and not file_failures else "continue",
+                failure_stage=None if not command_failures and not file_failures else "collect_evidence",
+                retryable=False if not command_failures and not file_failures else True,
+                stop_reason=None
+                if not command_failures and not file_failures
+                else f"{len(command_failures)} command failure(s), {len(file_failures)} file failure(s).",
+                key_excerpts=[
+                    *[
+                        build_excerpt(
+                            source="evidence_command",
+                            label=str(item.get("name", "command_failure")),
+                            text=_format_output_excerpt(item.get("output_lines", [])),
+                            severity="error",
+                        )
+                        for item in command_failures[:2]
+                    ],
+                    *[
+                        build_excerpt(
+                            source="evidence_file",
+                            label=str(item.get("remote_path", "file_failure")),
+                            text=str(item.get("error") or item.get("status") or "file fetch failed"),
+                            severity="error",
+                        )
+                        for item in file_failures[:2]
+                    ],
+                ],
+                next_actions=[]
+                if not command_failures and not file_failures
+                else [{"action": "collect-evidence", "reason": "Retry after addressing the failed command or file fetch."}],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=_collect_option_patch(args, ["shell_command", "remote_file", "skip_defaults", "timeout"]),
+            ),
         }
     )
 
@@ -3991,6 +5014,59 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
         print(f"[ERROR] File fetch failures: {len(file_failures)}")
     print(f"[ACTIVE] Session directory: {session.session_paths.root}")
     return 0 if not command_failures and not file_failures else 1
+
+
+def _command_record_intervention(args: argparse.Namespace) -> int:
+    session_dir = Path(args.session_dir).absolute()
+    metadata: dict[str, Any] = {}
+    if args.metadata_json:
+        try:
+            raw_metadata = json.loads(args.metadata_json)
+        except json.JSONDecodeError as exc:
+            print("[ oxx.. ] 2/5 steps")
+            print(f"[ERROR] metadata-json is not valid JSON: {exc}")
+            print("[TODO] Pass a JSON object string such as {\"change\": \"retry with new wifi config\"}.")
+            return 1
+        if not isinstance(raw_metadata, dict):
+            print("[ oxx.. ] 2/5 steps")
+            print("[ERROR] metadata-json must decode to a JSON object.")
+            print("[TODO] Wrap structured metadata in {...} before retrying.")
+            return 1
+        metadata = raw_metadata
+
+    try:
+        summary = _load_session_summary(session_dir)
+        session = _restore_session_context(session_dir, summary)
+        collector = EvidenceCollector(session)
+        related_session = args.related_session
+        if related_session:
+            related_path = Path(related_session)
+            if related_path.is_absolute() or len(related_path.parts) > 1:
+                related_session = str(related_path.absolute())
+        record = collector.append_intervention(
+            kind=args.kind,
+            summary=args.summary,
+            details=args.details,
+            files=[str(Path(item).absolute()) for item in args.file],
+            git_commit=args.git_commit,
+            expected_effect=args.expected_effect,
+            related_session=related_session,
+            metadata=metadata,
+        )
+        refreshed_summary = _load_session_summary(session_dir)
+        interventions = refreshed_summary.get("interventions", {})
+    except Exception as exc:
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Failed to record intervention: {exc}")
+        print("[TODO] Confirm the session directory contains a valid summary.json, then retry.")
+        return 1
+
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Intervention recorded: {record['kind']}")
+    print(f"[DONE] Summary: {record['summary']}")
+    print(f"[DONE] Total interventions: {interventions.get('count', 0)}")
+    print(f"[ACTIVE] Session directory: {session_dir}")
+    return 0
 
 
 def _command_summary(args: argparse.Namespace) -> int:
@@ -4123,6 +5199,8 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_collect_evidence(args)
     if args.command == "health":
         return _command_health(args)
+    if args.command == "record-intervention":
+        return _command_record_intervention(args)
     if args.command == "resume":
         return _command_summary(args)
     if args.command == "summary":

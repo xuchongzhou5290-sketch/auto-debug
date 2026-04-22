@@ -40,6 +40,8 @@ AI 想先拿自描述清单时，可以直接调用：
   - 现场连接参数
 - `profiles`
   - profile 与路径覆盖项
+- `loop`
+  - 可选的跨轮调试上下文
 - `options`
   - 动作本身的参数
 - `response`
@@ -67,6 +69,7 @@ AI 想先拿自描述清单时，可以直接调用：
 - `report`
 - `summary`
 - `resume`
+- `record-intervention`
 - `show-mvp`
 - `ports`
 
@@ -120,6 +123,32 @@ AI 想先拿自描述清单时，可以直接调用：
 X:\Auto-Debug\profiles\defaults.toml
 ```
 
+路径规则：
+
+- `profiles` 里的路径字段如果传相对路径，会按 `project_root` 解析
+- 直接 CLI 调用时，这个 `project_root` 就是仓库根目录 `X:\Auto-Debug`
+- 通过 MCP / 已安装插件调用时，这个 `project_root` 来自 `AUTO_DBG_PROJECT_ROOT`
+- 也就是说，像 `profiles/devices/av130n-lab.toml` 这类值不会再按调用方当前工作目录解析
+
+### `loop` 字段
+
+用于多轮自动调试时，把上一轮 session 和本轮目标稳定传给工具。
+
+支持字段：
+
+- `goal_id`
+- `goal`
+- `prev_session`
+- `iteration`
+- `max_iterations`
+- `attempt_note`
+
+说明：
+
+- `prev_session` 是上一轮 session 目录；可用相对路径，仍按 `project_root` 解析
+- 创建新 session 的动作会把 `loop` 写入 `summary.json`
+- 失败或未完成时，`summary.result.carry_forward_request` 会给出下一轮可复用的结构化请求骨架
+
 ## 4. `options` 字段
 
 字段名直接对应 CLI 参数的 `dest` 名称，使用 snake_case。
@@ -146,6 +175,11 @@ X:\Auto-Debug\profiles\defaults.toml
 ```
 
 会被翻译成重复的 `--shell-command`。
+
+路径规则：
+
+- 常见路径型参数如 `source`、`root`、`output`、`session_dir`、`file`、`prev_session`，如果传相对路径，也会按 `project_root` 解析
+- 对 `record-intervention` 来说，`session_dir` 与 `file` 同样遵守这条规则
 
 ## 5. `response` 字段
 
@@ -210,6 +244,47 @@ X:\Auto-Debug\profiles\defaults.toml
 }
 ```
 
+### 6.4 多轮继续跑 `run`
+
+```json
+{
+  "schema_version": 1,
+  "action": "run",
+  "connection": {
+    "serial_port": "COM19",
+    "device_password": "your-root-password"
+  },
+  "loop": {
+    "goal_id": "startup-fix-001",
+    "goal": "Reach app_ready without panic",
+    "prev_session": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "iteration": 2,
+    "max_iterations": 8,
+    "attempt_note": "retry after login timing fix"
+  }
+}
+```
+
+### 6.5 记录本轮干预
+
+```json
+{
+  "schema_version": 1,
+  "action": "record-intervention",
+  "options": {
+    "session_dir": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "kind": "ai_patch",
+    "summary": "Adjust serial login timing",
+    "details": "Increase the observe window and retry after the login helper patch.",
+    "file": [
+      "src/autodbg/cli/main.py"
+    ],
+    "git_commit": "abc1234",
+    "expected_effect": "The next iteration should reach the root shell and complete run."
+  }
+}
+```
+
 ## 7. 响应格式
 
 响应体总是 JSON。
@@ -238,6 +313,8 @@ X:\Auto-Debug\profiles\defaults.toml
 - `exit_code` 是目标动作自己的退出码
 - `agent-call` 本身在能成功返回 JSON 时固定返回 shell exit code `0`
 - 也就是说，Agent 应该看 `ok` 和 `exit_code`，不是看 `agent-call` 的进程退出码
+- 对会创建 session 的动作，`summary` 里还会带上稳定的 `loop`、`result`、`interventions` 三块
+- 上层 AI 做多轮编排时，应优先读取 `summary.result.decision / failure_stage / next_actions / carry_forward_request`
 
 ### 失败响应示例
 

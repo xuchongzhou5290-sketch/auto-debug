@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "action": "run",
+  "connection": {
+    "serial_port": "COM19",
+    "device_password": "your-root-password"
+  },
+  "loop": {
+    "goal_id": "startup-fix-001",
+    "goal": "Reach app_ready without panic",
+    "prev_session": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "iteration": 2,
+    "max_iterations": 8,
+    "attempt_note": "retry after login timing fix"
+  }
+}

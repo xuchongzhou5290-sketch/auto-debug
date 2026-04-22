@@ -44,6 +44,73 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(invocation.env_updates["AUTO_DBG_WIFI_SSID"], "demo-ssid")
         self.assertEqual(invocation.env_updates["AUTO_DBG_WIFI_PASSWORD"], "demo-pass")
 
+    def test_build_agent_invocation_resolves_loop_and_relative_paths(self) -> None:
+        project_root = Path("X:/Auto-Debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "run",
+                "profiles": {
+                    "device": "profiles/devices/av130n-lab.toml",
+                    "artifacts_root": "artifacts-custom",
+                },
+                "loop": {
+                    "goal_id": "startup-fix-001",
+                    "goal": "Reach app_ready without panic",
+                    "prev_session": "artifacts/20260420/demo-prev",
+                    "iteration": 2,
+                    "max_iterations": 6,
+                    "attempt_note": "retry after patch",
+                },
+                "options": {
+                    "observe_seconds": 1.5,
+                },
+            },
+            project_root=project_root,
+        )
+
+        self.assertIn("--device", invocation.argv)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--device") + 1],
+            "X:\\Auto-Debug\\profiles\\devices\\av130n-lab.toml",
+        )
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--prev-session") + 1],
+            "X:\\Auto-Debug\\artifacts\\20260420\\demo-prev",
+        )
+        self.assertEqual(invocation.argv[invocation.argv.index("--iteration") + 1], "2")
+        self.assertEqual(invocation.argv[invocation.argv.index("--max-iterations") + 1], "6")
+        self.assertEqual(invocation.argv[invocation.argv.index("--attempt-note") + 1], "retry after patch")
+        self.assertEqual(invocation.artifacts_root, Path("X:/Auto-Debug/artifacts-custom"))
+
+    def test_build_agent_invocation_supports_record_intervention(self) -> None:
+        project_root = Path("X:/Auto-Debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "record-intervention",
+                "options": {
+                    "session_dir": "artifacts/20260420/demo-session",
+                    "kind": "ai_patch",
+                    "summary": "Adjust retry window",
+                    "details": "Increase observe timeout before the next run.",
+                    "file": ["src/autodbg/cli/main.py"],
+                    "git_commit": "abc1234",
+                    "expected_effect": "Next iteration should capture enough boot logs.",
+                },
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv[0], "record-intervention")
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--session-dir") + 1],
+            "X:\\Auto-Debug\\artifacts\\20260420\\demo-session",
+        )
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--file") + 1],
+            "X:\\Auto-Debug\\src\\autodbg\\cli\\main.py",
+        )
+        self.assertIsNone(invocation.artifacts_root)
+
     def test_command_agent_call_returns_structured_json_and_detects_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)

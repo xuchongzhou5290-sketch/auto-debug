@@ -25,6 +25,67 @@ flowchart TD
     J --> D
 ```
 
+## Current Multi-Iteration Loop
+
+The current loop contract is session-driven. Each iteration writes a new `summary.json`,
+then the upper-layer AI decides whether to stop, intervene, or continue based on
+`summary.result`.
+
+```mermaid
+flowchart TD
+    A["Iteration N: upper-layer AI sends action request"] --> B["Include loop(goal, prev_session, iteration)"]
+    B --> C["Create fresh session"]
+    C --> D["Bootstrap summary.json\nwrite loop\nresult.decision = pending"]
+    D --> E["Execute action\nrun / health / observe / exec / fetch-* / deploy-*"]
+    E --> F["Write summary.result\n decision\n failure_stage\n next_actions\n carry_forward_request"]
+
+    F --> G{"decision"}
+    G -->|success| H["Stop loop"]
+    G -->|continue| I["Prepare next iteration"]
+    G -->|blocked| J["Wait for prerequisite fix"]
+    G -->|manual_required| K["Reserved state\nnot emitted yet"]
+    G -->|stalled| L["Reserved state\nnot emitted yet"]
+    G -->|pending| M["Abnormal state\niteration did not close cleanly"]
+
+    I --> N["Read next_actions"]
+    N --> O["Patch code / config / field conditions"]
+    O --> P["Optional: record-intervention"]
+    P --> Q["Reuse carry_forward_request"]
+    Q --> A
+
+    J --> R["Restore password / serial / network / media prerequisites"]
+    R --> P
+
+    K --> P
+    L --> P
+```
+
+Current stop / pause semantics:
+
+- `success`: stop the multi-iteration loop
+- `continue`: soft break; upper-layer AI should inspect `failure_stage`, apply changes, then use `carry_forward_request`
+- `blocked`: hard break; fix prerequisites first, then continue
+- `manual_required` / `stalled`: reserved by the contract but not emitted by the current code yet
+- `pending`: bootstrap default only; if it remains at the end, treat the iteration as abnormal
+
+Common `failure_stage` breakpoints in the current implementation:
+
+- `observe_serial`
+- `establish_control`
+- `baseline_checks`
+- `collect_evidence`
+- `validation`
+- `prepare_transport`
+- `run_bootstrap_commands`
+- `validate_connectivity`
+- `transfer_artifacts`
+- `validate_transfer`
+- `execute_command`
+- `fetch_file`
+- `fetch_path`
+- `deploy_artifacts`
+- `running_checks`
+
 ## First CLI Entry
 
 ### `run`

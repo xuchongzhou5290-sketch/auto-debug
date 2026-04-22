@@ -118,6 +118,13 @@ cd X:\Auto-Debug
 .\install-local-tool.ps1
 ```
 
+如果安装目录下已有正在运行的 `auto-debug` / MCP 进程，脚本现在会先提示是否强制关闭后再继续。
+如果你要在自动化场景里直接强制处理占用，可以显式加：
+
+```powershell
+.\install-local-tool.ps1 -ForceCloseInUseProcesses
+```
+
 它会自动：
 
 - 复制独立运行所需内容到 `%LOCALAPPDATA%\Programs\auto-debug`
@@ -198,11 +205,19 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - 注入必要连接参数
 - 返回结构化 JSON 响应
 
+补充规则：
+
+- 请求里的相对路径会按 `project_root` 解析；走 MCP / 已安装插件时，这个根目录就是 `AUTO_DBG_PROJECT_ROOT`
+- 如果要做自动多轮调试，使用顶层 `loop` 字段传 `prev_session / iteration / goal`
+- 每轮代码或配置修改后，可以用 `record-intervention` 追加结构化干预记录
+
 详细约定见：
 
 - [agent-tool-contract.md](/X:/Auto-Debug/docs/agent-tool-contract.md)
 - [embedded-device-auto-debug-ai-tool.md](/X:/Auto-Debug/docs/embedded-device-auto-debug-ai-tool.md)
 - [agent-call-run.json](/X:/Auto-Debug/docs/examples/agent-call-run.json)
+- [agent-call-run-loop.json](/X:/Auto-Debug/docs/examples/agent-call-run-loop.json)
+- [agent-call-record-intervention.json](/X:/Auto-Debug/docs/examples/agent-call-record-intervention.json)
 
 如果要让新的 AI 会话先快速理解这个工具，再决定怎么调用，推荐先执行：
 

@@ -14,6 +14,7 @@ from autodbg.cli.main import (
     _command_describe_agent_tool,
     _command_install_home_plugin,
     _command_install_local_tool,
+    _command_record_intervention,
     _build_watch_tui_rows,
     _build_existing_network_check,
     _build_health_checks,
@@ -63,9 +64,11 @@ from autodbg.cli.main import (
 from autodbg.agent import build_agent_tool_manifest
 from autodbg.profiles.loader import load_run_profiles
 from autodbg.control.controller import LoginResult
+from autodbg.evidence.collector import EvidenceCollector
 from autodbg.serial.observer import MarkerHit, ObservationResult
 from autodbg.serial.runtime import SerialBrokerRegistry, SerialTraceEntry
 from autodbg.session.manager import SessionManager
+from autodbg.state.machine import StateSnapshot
 
 
 class CliMainTest(unittest.TestCase):
@@ -137,6 +140,43 @@ class CliMainTest(unittest.TestCase):
         output = buffer.getvalue()
         self.assertIn("Local tool installed", output)
         self.assertIn("Observe wrapper", output)
+
+    def test_command_record_intervention_updates_session_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifacts_root = Path(temp_dir) / "artifacts"
+            session = SessionManager(artifacts_root).create("av130n-lab", "startup_check")
+            collector = EvidenceCollector(session)
+            collector.bootstrap(
+                profiles=self.profiles,
+                state_snapshot=StateSnapshot(),
+                workflow_name="startup_check",
+                workflow_steps=[],
+                action_name="run",
+                loop_context={"goal": "Reach app_ready", "iteration": 1},
+                plan_details={"control": {"mode": "demo"}},
+            )
+            args = argparse.Namespace(
+                session_dir=session.session_paths.root,
+                kind="ai_patch",
+                summary="Adjust startup timeout",
+                details="Increase the observation window before the next run.",
+                file=["src/autodbg/cli/main.py"],
+                git_commit="abc1234",
+                expected_effect="Next run should capture more startup logs.",
+                related_session=None,
+                metadata_json='{"author":"codex"}',
+            )
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = _command_record_intervention(args)
+
+            summary = json.loads((session.session_paths.root / "summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["interventions"]["count"], 1)
+        self.assertEqual(summary["interventions"]["latest"]["metadata"]["author"], "codex")
+        self.assertIn("Intervention recorded", buffer.getvalue())
 
     def test_format_output_excerpt_truncates_and_counts_extra_lines(self) -> None:
         excerpt = _format_output_excerpt(

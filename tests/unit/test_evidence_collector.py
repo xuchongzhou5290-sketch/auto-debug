@@ -167,6 +167,153 @@ class EvidenceCollectorTest(unittest.TestCase):
         self.assertIn("Command failures", report_text)
         self.assertTrue(any(item["type"] == "report" for item in manifest["artifacts"]))
 
+    def test_bootstrap_writes_loop_result_and_interventions_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "session"
+            root.mkdir(parents=True, exist_ok=True)
+            session = SessionContext.create(
+                session_id="demo-session",
+                device_id="av130n-lab",
+                task_type="startup_check",
+                session_paths=SessionPaths(
+                    root=root,
+                    core_dir=root / "core",
+                    deploy_dir=root / "deploy",
+                    logs_dir=root / "logs",
+                    retrieved_dir=Path(temp_dir) / "retrieved" / "demo-session",
+                ),
+            )
+            for path in (
+                session.session_paths.core_dir,
+                session.session_paths.deploy_dir,
+                session.session_paths.logs_dir,
+                session.session_paths.retrieved_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            collector = EvidenceCollector(session)
+            collector.bootstrap(
+                profiles=RunProfiles(
+                    device=DeviceProfile(
+                        device_id="av130n-lab",
+                        model_id="ak-av130n-ucm55me2",
+                        serial=SerialSettings(port="COM19"),
+                    ),
+                    model=ModelProfile(
+                        model_id="ak-av130n-ucm55me2",
+                        platform="AK_AV130N",
+                        app_name="LeCam",
+                    ),
+                    task=TaskProfile(
+                        task_type="startup_check",
+                        description="demo",
+                        deploy_strategy="manual",
+                        success_template="default",
+                        evidence_template="default",
+                        manual_check_items=[],
+                    ),
+                    transport=TransportProfile(
+                        transport_id="network_serial_fallback",
+                        control_channels=["serial"],
+                    ),
+                ),
+                state_snapshot=StateSnapshot(),
+                workflow_name="startup_check",
+                workflow_steps=[],
+                action_name="run",
+                loop_context={
+                    "goal_id": "startup-fix-001",
+                    "goal": "Reach app_ready",
+                    "root_session_id": "root-session",
+                    "parent_session_id": "parent-session",
+                    "iteration": 2,
+                },
+                plan_details={"control": {"mode": "demo"}},
+            )
+            summary = json.loads(collector.summary_path.read_text(encoding="utf-8"))
+            interventions_exists = collector.interventions_path.exists()
+
+        self.assertEqual(summary["loop"]["goal_id"], "startup-fix-001")
+        self.assertEqual(summary["loop"]["iteration"], 2)
+        self.assertEqual(summary["result"]["action"], "run")
+        self.assertEqual(summary["result"]["decision"], "pending")
+        self.assertEqual(summary["interventions"]["count"], 0)
+        self.assertTrue(interventions_exists)
+
+    def test_append_intervention_updates_summary_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "session"
+            root.mkdir(parents=True, exist_ok=True)
+            session = SessionContext.create(
+                session_id="demo-session",
+                device_id="av130n-lab",
+                task_type="startup_check",
+                session_paths=SessionPaths(
+                    root=root,
+                    core_dir=root / "core",
+                    deploy_dir=root / "deploy",
+                    logs_dir=root / "logs",
+                    retrieved_dir=Path(temp_dir) / "retrieved" / "demo-session",
+                ),
+            )
+            for path in (
+                session.session_paths.core_dir,
+                session.session_paths.deploy_dir,
+                session.session_paths.logs_dir,
+                session.session_paths.retrieved_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            collector = EvidenceCollector(session)
+            collector.bootstrap(
+                profiles=RunProfiles(
+                    device=DeviceProfile(
+                        device_id="av130n-lab",
+                        model_id="ak-av130n-ucm55me2",
+                        serial=SerialSettings(port="COM19"),
+                    ),
+                    model=ModelProfile(
+                        model_id="ak-av130n-ucm55me2",
+                        platform="AK_AV130N",
+                        app_name="LeCam",
+                    ),
+                    task=TaskProfile(
+                        task_type="startup_check",
+                        description="demo",
+                        deploy_strategy="manual",
+                        success_template="default",
+                        evidence_template="default",
+                        manual_check_items=[],
+                    ),
+                    transport=TransportProfile(
+                        transport_id="network_serial_fallback",
+                        control_channels=["serial"],
+                    ),
+                ),
+                state_snapshot=StateSnapshot(),
+                workflow_name="startup_check",
+                workflow_steps=[],
+                action_name="run",
+                loop_context={"goal": "Reach app_ready", "iteration": 1},
+                plan_details={"control": {"mode": "demo"}},
+            )
+            record = collector.append_intervention(
+                kind="ai_patch",
+                summary="Adjust observe timeout",
+                details="Increase observe window before the next run.",
+                files=["X:/Auto-Debug/src/autodbg/cli/main.py"],
+                git_commit="abc1234",
+                expected_effect="More boot logs in the next iteration.",
+            )
+            summary = json.loads(collector.summary_path.read_text(encoding="utf-8"))
+            report_text = collector.report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary["interventions"]["count"], 1)
+        self.assertEqual(summary["interventions"]["latest"]["kind"], "ai_patch")
+        self.assertEqual(record["git_commit"], "abc1234")
+        self.assertIn("## Interventions", report_text)
+        self.assertIn("Adjust observe timeout", report_text)
+
 
 if __name__ == "__main__":
     unittest.main()

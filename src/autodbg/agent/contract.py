@@ -192,6 +192,24 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "common_options": ["session_dir"],
         "creates_session": False,
     },
+    "record-intervention": {
+        "category": "session",
+        "summary": "Append a structured intervention record onto an existing session for the next debug iteration.",
+        "required_connection": [],
+        "recommended_connection": [],
+        "common_options": [
+            "session_dir",
+            "kind",
+            "summary",
+            "details",
+            "file",
+            "git_commit",
+            "expected_effect",
+            "related_session",
+            "metadata_json",
+        ],
+        "creates_session": False,
+    },
     "show-mvp": {
         "category": "meta",
         "summary": "Print the MVP workflow entry point and reference document.",
@@ -254,26 +272,33 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
     profiles = _ensure_mapping(request.get("profiles"), label="profiles")
     connection = _ensure_mapping(request.get("connection"), label="connection")
     options = _ensure_mapping(request.get("options"), label="options")
+    loop = _ensure_mapping(request.get("loop"), label="loop")
     response = _ensure_mapping(request.get("response"), label="response")
 
     argv = list(action_tokens)
     command_name = action_tokens[0]
 
     if command_name in _PROFILE_ACTIONS:
-        _append_path_option(argv, "--device", profiles.get("device"))
-        _append_path_option(argv, "--model", profiles.get("model"))
-        _append_path_option(argv, "--task", profiles.get("task"))
-        _append_path_option(argv, "--transport", profiles.get("transport"))
-        _append_path_option(argv, "--profiles-defaults", profiles.get("profiles_defaults"))
-        _append_path_option(argv, "--artifacts-root", profiles.get("artifacts_root"))
-        _append_path_option(argv, "--settings", profiles.get("settings"))
+        _append_path_option(argv, "--device", profiles.get("device"), project_root=project_root)
+        _append_path_option(argv, "--model", profiles.get("model"), project_root=project_root)
+        _append_path_option(argv, "--task", profiles.get("task"), project_root=project_root)
+        _append_path_option(argv, "--transport", profiles.get("transport"), project_root=project_root)
+        _append_path_option(argv, "--profiles-defaults", profiles.get("profiles_defaults"), project_root=project_root)
+        _append_path_option(argv, "--artifacts-root", profiles.get("artifacts_root"), project_root=project_root)
+        _append_path_option(argv, "--settings", profiles.get("settings"), project_root=project_root)
         _append_option(argv, "--serial-port", connection.get("serial_port"))
         _append_option(argv, "--baudrate", connection.get("baudrate"))
+        _append_option(argv, "--goal-id", loop.get("goal_id"))
+        _append_option(argv, "--goal", loop.get("goal"))
+        _append_path_option(argv, "--prev-session", loop.get("prev_session"), project_root=project_root)
+        _append_option(argv, "--iteration", loop.get("iteration"))
+        _append_option(argv, "--max-iterations", loop.get("max_iterations"))
+        _append_option(argv, "--attempt-note", loop.get("attempt_note"))
     elif command_name == "storage":
-        _append_path_option(argv, "--device", profiles.get("device"))
-        _append_path_option(argv, "--settings", profiles.get("settings"))
+        _append_path_option(argv, "--device", profiles.get("device"), project_root=project_root)
+        _append_path_option(argv, "--settings", profiles.get("settings"), project_root=project_root)
     elif command_name == "report":
-        _append_path_option(argv, "--artifacts-root", profiles.get("artifacts_root"))
+        _append_path_option(argv, "--artifacts-root", profiles.get("artifacts_root"), project_root=project_root)
     elif command_name == "watch-serial":
         _append_option(argv, "--serial-port", options.get("serial_port", connection.get("serial_port")))
         _append_option(argv, "--baudrate", options.get("baudrate", connection.get("baudrate")))
@@ -292,6 +317,12 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
         if command_name == "serial-broker" and key == "serial_port":
             continue
         flag = "--" + key.replace("_", "-")
+        if key in {"source", "root", "output", "session_dir", "prev_session"}:
+            _append_path_option(argv, flag, value, project_root=project_root)
+            continue
+        if key == "file":
+            _append_path_option(argv, flag, value, project_root=project_root)
+            continue
         _append_option(argv, flag, value)
 
     env_updates = _build_agent_environment(connection)
@@ -315,7 +346,7 @@ def build_agent_response(
     project_root: Path,
     session_dir: Path | None = None,
 ) -> dict[str, Any]:
-    if session_dir is None and invocation.action in {"report", "summary", "resume"}:
+    if session_dir is None and invocation.action in {"report", "summary", "resume", "record-intervention"}:
         session_dir = _resolve_session_dir(
             action=invocation.action,
             argv=invocation.argv,
@@ -472,13 +503,17 @@ def _agent_artifacts_root(command_name: str, profiles: dict[str, Any], project_r
     raw = profiles.get("artifacts_root")
     if raw is None:
         return project_root / "artifacts"
-    return Path(str(raw)).absolute()
+    return _resolve_local_path(raw, project_root=project_root)
 
 
-def _append_path_option(argv: list[str], flag: str, value: Any) -> None:
+def _append_path_option(argv: list[str], flag: str, value: Any, *, project_root: Path) -> None:
     if value is None:
         return
-    argv.extend([flag, str(Path(str(value)).absolute())])
+    if isinstance(value, list):
+        for item in value:
+            _append_path_option(argv, flag, item, project_root=project_root)
+        return
+    argv.extend([flag, str(_resolve_local_path(value, project_root=project_root))])
 
 
 def _append_option(argv: list[str], flag: str, value: Any) -> None:
@@ -496,7 +531,7 @@ def _append_option(argv: list[str], flag: str, value: Any) -> None:
 
 
 def _resolve_session_dir(action: str, argv: list[str], artifacts_root: Path | None) -> Path | None:
-    if action in {"summary", "resume"}:
+    if action in {"summary", "resume", "record-intervention"}:
         session_dir = _extract_flag_value(argv, "--session-dir")
         return Path(session_dir).absolute() if session_dir else None
     if action == "report":
@@ -553,6 +588,13 @@ def _ensure_mapping(raw: Any, *, label: str) -> dict[str, Any]:
     return raw
 
 
+def _resolve_local_path(value: Any, *, project_root: Path) -> Path:
+    candidate = Path(str(value))
+    if candidate.is_absolute():
+        return candidate
+    return project_root / candidate
+
+
 def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
     defaults_path = project_root / "profiles" / "defaults.toml"
     settings_path = project_root / "config" / "user-settings.toml"
@@ -579,6 +621,10 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
                 "wifi_ssid,wifi_password,wifi_mode": ["bootstrap-network", "device-pull when mode is wlan_script"],
                 "sdcard_drive": ["stage-sd"],
             },
+        },
+        "request_contract": {
+            "top_level_fields": ["schema_version", "action", "connection", "profiles", "options", "loop", "response"],
+            "loop_fields": ["goal_id", "goal", "prev_session", "iteration", "max_iterations", "attempt_note"],
         },
         "connection_fields": [
             {

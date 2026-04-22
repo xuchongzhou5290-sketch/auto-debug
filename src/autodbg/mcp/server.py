@@ -102,6 +102,19 @@ def build_mcp_tools(*, project_root: Path) -> list[dict[str, Any]]:
                         "description": "CLI 参数的 snake_case 形式；不同 action 的字段不同。",
                         "additionalProperties": True,
                     },
+                    "loop": {
+                        "type": "object",
+                        "description": "跨轮调试上下文；用于把上一轮 session 和当前轮次稳定传入。",
+                        "properties": {
+                            "goal_id": {"type": "string"},
+                            "goal": {"type": "string"},
+                            "prev_session": {"type": "string"},
+                            "iteration": {"type": "integer"},
+                            "max_iterations": {"type": "integer"},
+                            "attempt_note": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
                     "response": {
                         "type": "object",
                         "description": "返回内容控制项。",
@@ -246,25 +259,52 @@ def _jsonrpc_error(request_id: Any, *, code: int, text: str) -> dict[str, Any]:
 
 
 def _read_mcp_message(stream: BinaryIO) -> dict[str, Any] | None:
-    headers: dict[str, str] = {}
+    """读取 MCP stdio transport 的一帧消息。
+
+    MCP 规范（stdio transport）采用 **newline-delimited JSON (NDJSON)**：
+    每条 JSON-RPC 消息占一行，以 ``\\n`` 终止，不允许消息体内嵌换行。
+
+    历史上这里曾使用 LSP 风格的 ``Content-Length`` 头 + 裸字节体作为框架，
+    这和 MCP 规范不兼容 —— Claude Code 等严格按规范发送 NDJSON 的客户端
+    会因为服务端读不到 ``Content-Length`` 头而无限等待直至 30 秒超时。
+
+    为了兼容少数会发送 LSP 头的调用方（比如历史的 Codex 入口），此处保留了
+    自动探测：第一条非空输入如果以 ``Content-Length`` 开头就走旧的 header
+    路径，否则按 NDJSON 解析。
+    """
     while True:
         line = stream.readline()
         if not line:
-            return None if not headers else {}
-        if line in {b"\r\n", b"\n"}:
-            break
-        key, _, value = line.decode("utf-8").partition(":")
-        headers[key.strip().lower()] = value.strip()
-    length_text = headers.get("content-length")
-    if not length_text:
-        raise json.JSONDecodeError("Missing Content-Length header.", "", 0)
-    payload = stream.read(int(length_text))
-    return json.loads(payload.decode("utf-8"))
+            return None  # EOF
+        text = line.decode("utf-8", errors="replace")
+        stripped = text.strip()
+        if not stripped:
+            continue  # 跳过心跳/空行
+
+        # 兼容旧的 LSP 风格 framing：Content-Length 头 + 空行 + 裸 body。
+        if stripped.lower().startswith("content-length"):
+            headers = {}
+            _, _, first_value = stripped.partition(":")
+            headers["content-length"] = first_value.strip()
+            while True:
+                nxt = stream.readline()
+                if not nxt or nxt in {b"\r\n", b"\n"}:
+                    break
+                k, _, v = nxt.decode("utf-8").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            length_text = headers.get("content-length")
+            if not length_text:
+                raise json.JSONDecodeError("Missing Content-Length header.", "", 0)
+            payload = stream.read(int(length_text))
+            return json.loads(payload.decode("utf-8"))
+
+        # 默认：newline-delimited JSON。
+        return json.loads(stripped)
 
 
 def _write_mcp_message(stream: BinaryIO, message: dict[str, Any]) -> None:
+    """按 MCP 规范以 newline-delimited JSON 输出一条消息。"""
     data = json.dumps(message, ensure_ascii=False).encode("utf-8")
-    header = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
-    stream.write(header)
     stream.write(data)
+    stream.write(b"\n")
     stream.flush()
