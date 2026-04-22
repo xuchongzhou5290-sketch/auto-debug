@@ -16,6 +16,8 @@ class McpServerTest(unittest.TestCase):
         action_schema = tools[1]["inputSchema"]
         self.assertIn("run", action_schema["properties"]["action"]["enum"])
         self.assertIn("watch-serial", action_schema["properties"]["action"]["enum"])
+        self.assertIn("record-intervention", action_schema["properties"]["action"]["enum"])
+        self.assertIn("loop", action_schema["properties"])
 
     def test_call_mcp_tool_describe_returns_manifest(self) -> None:
         result = call_mcp_tool("autodbg_describe", {}, project_root=Path("X:/Auto-Debug"))

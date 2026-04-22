@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "action": "record-intervention",
+  "options": {
+    "session_dir": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "kind": "ai_patch",
+    "summary": "Adjust serial login timing",
+    "details": "Increase the observation window and retry after the login helper patch.",
+    "file": [
+      "src/autodbg/cli/main.py"
+    ],
+    "git_commit": "abc1234",
+    "expected_effect": "The next iteration should reach the root shell and complete run."
+  }
+}

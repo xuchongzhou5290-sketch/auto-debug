@@ -7,6 +7,11 @@ from typing import Any
 
 from autodbg.models.profile import RunProfiles
 from autodbg.models.session import SessionContext
+from autodbg.session.contract import (
+    build_intervention_record,
+    default_interventions_summary,
+    default_result_contract,
+)
 from autodbg.state.machine import StateSnapshot
 
 
@@ -25,6 +30,7 @@ class EvidenceCollector:
         self.events_path = session.session_paths.root / "events.jsonl"
         self.manifest_path = session.session_paths.root / "artifacts_manifest.json"
         self.manual_actions_path = session.session_paths.root / "manual_actions.jsonl"
+        self.interventions_path = session.session_paths.root / "interventions.jsonl"
         self.report_path = session.session_paths.root / "report.md"
 
     def bootstrap(
@@ -34,6 +40,9 @@ class EvidenceCollector:
         workflow_name: str,
         workflow_steps: list[dict[str, Any]],
         plan_details: dict[str, Any],
+        *,
+        action_name: str | None = None,
+        loop_context: dict[str, Any] | None = None,
     ) -> None:
         summary = {
             "session": self.session.to_dict(),
@@ -42,6 +51,9 @@ class EvidenceCollector:
             "workflow_steps": workflow_steps,
             "state": state_snapshot.to_dict(),
             "plan_details": plan_details,
+            "loop": dict(loop_context or self.session.metadata.get("loop", {})),
+            "result": default_result_contract(action=action_name or workflow_name),
+            "interventions": default_interventions_summary(self.interventions_path),
             "status": "planned",
         }
         self.summary_path.write_text(
@@ -58,6 +70,7 @@ class EvidenceCollector:
                 {"type": "report", "path": str(self.report_path)},
                 {"type": "events", "path": str(self.events_path)},
                 {"type": "manual_actions", "path": str(self.manual_actions_path)},
+                {"type": "interventions", "path": str(self.interventions_path)},
             ],
         }
         self.manifest_path.write_text(
@@ -66,6 +79,7 @@ class EvidenceCollector:
             newline="\n",
         )
         self.manual_actions_path.write_text("", encoding="utf-8", newline="\n")
+        self.interventions_path.write_text("", encoding="utf-8", newline="\n")
 
     def append_event(
         self,
@@ -93,6 +107,44 @@ class EvidenceCollector:
         }
         with self.manual_actions_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def append_intervention(
+        self,
+        *,
+        kind: str,
+        summary: str,
+        details: str = "",
+        files: list[str] | None = None,
+        git_commit: str | None = None,
+        expected_effect: str | None = None,
+        related_session: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = build_intervention_record(
+            kind=kind,
+            summary=summary,
+            details=details,
+            files=files,
+            git_commit=git_commit,
+            expected_effect=expected_effect,
+            related_session=related_session,
+            metadata=metadata,
+        )
+        with self.interventions_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
+
+        summary_data = json.loads(self.summary_path.read_text(encoding="utf-8"))
+        interventions = summary_data.get("interventions") or default_interventions_summary(self.interventions_path)
+        interventions["count"] = int(interventions.get("count", 0) or 0) + 1
+        interventions["latest"] = record
+        summary_data["interventions"] = interventions
+        self.summary_path.write_text(
+            json.dumps(summary_data, indent=2, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        self.report_path.write_text(self._render_report(summary_data), encoding="utf-8", newline="\n")
+        return record
 
     def write_text_artifact(self, relative_path: str, content: str) -> Path:
         target = self.session.session_paths.root / relative_path
@@ -150,8 +202,11 @@ class EvidenceCollector:
     def _render_report(self, summary: dict[str, Any]) -> str:
         session = summary.get("session", {})
         profiles = summary.get("profiles", {})
+        loop = summary.get("loop", {})
+        result = summary.get("result", {})
         evaluation = summary.get("evaluation", {})
         evidence = summary.get("evidence_results", {})
+        interventions = summary.get("interventions", {})
         lines = [
             "# Session Report",
             "",
@@ -168,11 +223,44 @@ class EvidenceCollector:
         if model:
             lines.append(f"- App: `{model.get('app_name', 'unknown')}`")
 
+        if loop:
+            lines.extend(
+                [
+                    "",
+                    "## Loop",
+                    f"- Goal ID: `{loop.get('goal_id') or 'none'}`",
+                    f"- Goal: {loop.get('goal') or '(unspecified)'}",
+                    f"- Iteration: `{loop.get('iteration', 'unknown')}`",
+                    f"- Parent Session: `{loop.get('parent_session_id') or 'none'}`",
+                    f"- Root Session: `{loop.get('root_session_id') or 'none'}`",
+                ]
+            )
+            if loop.get("attempt_note"):
+                lines.append(f"- Attempt Note: {loop['attempt_note']}")
+
         manual_checks = profiles.get("task", {}).get("manual_check_items", [])
         if manual_checks:
             lines.extend(["", "## Manual Checks"])
             for item in manual_checks:
                 lines.append(f"- {item}")
+
+        if result:
+            lines.extend(
+                [
+                    "",
+                    "## Result",
+                    f"- Decision: `{result.get('decision', 'unknown')}`",
+                    f"- Failure Stage: `{result.get('failure_stage') or 'none'}`",
+                    f"- Retryable: `{result.get('retryable')}`",
+                ]
+            )
+            if result.get("stop_reason"):
+                lines.append(f"- Stop Reason: {result['stop_reason']}")
+            next_actions = result.get("next_actions", [])
+            if next_actions:
+                lines.extend(["", "## Next Actions"])
+                for item in next_actions:
+                    lines.append(f"- `{item.get('action', 'unknown')}`: {item.get('reason', '')}")
 
         if evaluation:
             lines.extend(
@@ -217,5 +305,12 @@ class EvidenceCollector:
             lines.extend(["", "## Paths"])
             for key, value in session_paths.items():
                 lines.append(f"- {key}: `{value}`")
+
+        if interventions:
+            lines.extend(["", "## Interventions"])
+            lines.append(f"- Count: `{interventions.get('count', 0)}`")
+            latest = interventions.get("latest")
+            if isinstance(latest, dict):
+                lines.append(f"- Latest: `{latest.get('kind', 'unknown')}` {latest.get('summary', '')}")
 
         return "\n".join(lines) + "\n"

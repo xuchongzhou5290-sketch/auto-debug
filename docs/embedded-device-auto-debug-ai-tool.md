@@ -16,6 +16,7 @@
 - Stable entrypoint: `python -m autodbg agent-call --request -`
 - Self-description entrypoint: `python -m autodbg describe-agent-tool --format json`
 - MCP tools: `autodbg_describe`, `autodbg_action`
+- Relative request paths are resolved from `project_root` / `AUTO_DBG_PROJECT_ROOT`, not the caller cwd
 
 ## 2. What This Tool Is For
 
@@ -141,6 +142,13 @@
 4. 组织 `agent-call` JSON 请求
 5. 只根据 JSON 响应里的 `ok / exit_code / summary / error` 判断结果
 
+如果目标是自动多轮调试，再额外遵守：
+
+1. 每轮结束后优先读取 `summary.result`
+2. 如果 `decision != success`，优先复用 `summary.result.carry_forward_request`
+3. 本轮改了代码、配置或现场条件后，用 `record-intervention` 写回结构化干预
+4. 下一轮请求在顶层 `loop` 里显式带上 `prev_session / iteration / goal`
+
 ## 8. Safe Defaults
 
 - 默认 profile 入口：`X:\Auto-Debug\profiles\defaults.toml`
@@ -193,6 +201,45 @@
   },
   "options": {
     "remote_path": "/etc/wlanname"
+  }
+}
+```
+
+### 9.4 Continue Next Iteration
+
+```json
+{
+  "schema_version": 1,
+  "action": "run",
+  "connection": {
+    "serial_port": "COM19",
+    "device_password": "your-root-password"
+  },
+  "loop": {
+    "goal_id": "startup-fix-001",
+    "goal": "Reach app_ready without panic",
+    "prev_session": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "iteration": 2,
+    "max_iterations": 8,
+    "attempt_note": "retry after login timing fix"
+  }
+}
+```
+
+### 9.5 Record Intervention
+
+```json
+{
+  "schema_version": 1,
+  "action": "record-intervention",
+  "options": {
+    "session_dir": "artifacts/20260420/091530123-av130n-lab-startup_check-abcd",
+    "kind": "ai_patch",
+    "summary": "Adjust serial login timing",
+    "file": [
+      "src/autodbg/cli/main.py"
+    ],
+    "expected_effect": "The next run should establish shell access."
   }
 }
 ```
