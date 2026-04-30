@@ -3,10 +3,62 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
 from pathlib import Path
+import signal
+import socket
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Any
+
+DEFAULT_HEALTH_NAME = "__autodbg_health.json"
+
+
+@dataclass(slots=True)
+class ArtifactServerRegistry:
+    root: str
+    bind: str
+    port: int
+    base_url: str
+    health_url: str
+    pid: int
+    manifest_path: str
+    pull_script_path: str
+    log_path: str | None = None
+    started_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.root,
+            "bind": self.bind,
+            "port": self.port,
+            "base_url": self.base_url,
+            "health_url": self.health_url,
+            "pid": self.pid,
+            "manifest_path": self.manifest_path,
+            "pull_script_path": self.pull_script_path,
+            "log_path": self.log_path,
+            "started_at": self.started_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "ArtifactServerRegistry":
+        return cls(
+            root=str(raw["root"]),
+            bind=str(raw["bind"]),
+            port=int(raw["port"]),
+            base_url=str(raw["base_url"]),
+            health_url=str(raw["health_url"]),
+            pid=int(raw["pid"]),
+            manifest_path=str(raw["manifest_path"]),
+            pull_script_path=str(raw["pull_script_path"]),
+            log_path=str(raw["log_path"]) if raw.get("log_path") else None,
+            started_at=str(raw.get("started_at", "")),
+        )
 
 
 @dataclass(slots=True)
@@ -177,9 +229,33 @@ def serve_directory(
     bind: str = "0.0.0.0",
     port: int = 8765,
     duration_seconds: float | None = None,
+    health_name: str = DEFAULT_HEALTH_NAME,
 ) -> tuple[ThreadingHTTPServer, threading.Thread]:
     root = root.resolve()
-    handler = lambda *args, **kwargs: SimpleHTTPRequestHandler(*args, directory=str(root), **kwargs)
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    class ArtifactRequestHandler(SimpleHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib hook
+            request_path = self.path.split("?", 1)[0].lstrip("/")
+            if request_path == health_name.lstrip("/"):
+                payload = {
+                    "status": "ok",
+                    "root": str(root),
+                    "pid": os.getpid(),
+                    "bind": bind,
+                    "port": int(self.server.server_address[1]),
+                    "started_at": started_at,
+                }
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            super().do_GET()
+
+    handler = lambda *args, **kwargs: ArtifactRequestHandler(*args, directory=str(root), **kwargs)
     server = ThreadingHTTPServer((bind, port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -188,6 +264,140 @@ def serve_directory(
         timer.daemon = True
         timer.start()
     return server, thread
+
+
+def artifact_server_registry_root() -> Path:
+    override = os.environ.get("AUTODBG_ARTIFACT_SERVER_REGISTRY_DIR")
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "autodbg-artifact-servers"
+
+
+def artifact_server_registry_path(port: int) -> Path:
+    return artifact_server_registry_root() / f"artifact-server-{int(port)}.json"
+
+
+def artifact_server_log_path(port: int) -> Path:
+    return artifact_server_registry_root() / f"artifact-server-{int(port)}.log"
+
+
+def write_artifact_server_registry(registry: ArtifactServerRegistry) -> Path:
+    path = artifact_server_registry_path(registry.port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(registry.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def load_artifact_server_registry(port: int) -> ArtifactServerRegistry | None:
+    path = artifact_server_registry_path(port)
+    if not path.is_file():
+        return None
+    try:
+        return ArtifactServerRegistry.from_dict(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def list_artifact_server_registries() -> list[ArtifactServerRegistry]:
+    root = artifact_server_registry_root()
+    if not root.is_dir():
+        return []
+    registries: list[ArtifactServerRegistry] = []
+    for path in sorted(root.glob("artifact-server-*.json")):
+        try:
+            registries.append(ArtifactServerRegistry.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    return registries
+
+
+def remove_artifact_server_registry(port: int) -> None:
+    try:
+        artifact_server_registry_path(port).unlink()
+    except FileNotFoundError:
+        return
+
+
+def is_tcp_port_available(bind: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind, int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def find_available_port(bind: str, preferred_port: int, *, attempts: int = 50) -> int:
+    preferred_port = int(preferred_port)
+    if preferred_port == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((bind, 0))
+            return int(sock.getsockname()[1])
+    if preferred_port < 0 or preferred_port > 65535:
+        raise ValueError(f"invalid TCP port: {preferred_port}")
+
+    for offset in range(max(attempts, 1)):
+        candidate = preferred_port + offset
+        if candidate > 65535:
+            break
+        if is_tcp_port_available(bind, candidate):
+            return candidate
+    raise OSError(f"no free TCP port found near {preferred_port}")
+
+
+def probe_http_url(url: str, *, timeout: float = 0.5) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - local tool health probe
+            return 200 <= int(response.status) < 300
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
+def artifact_server_pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def stop_artifact_server(port: int, *, timeout_seconds: float = 3.0) -> dict[str, Any]:
+    registry = load_artifact_server_registry(port)
+    if registry is None:
+        return {"status": "missing", "port": int(port)}
+
+    if artifact_server_pid_is_running(registry.pid):
+        try:
+            os.kill(registry.pid, signal.SIGTERM)
+        except OSError as exc:
+            return {"status": "error", "port": int(port), "pid": registry.pid, "error": str(exc)}
+
+        deadline = time.monotonic() + max(timeout_seconds, 0.1)
+        while time.monotonic() < deadline:
+            if not artifact_server_pid_is_running(registry.pid):
+                break
+            time.sleep(0.1)
+
+    remove_artifact_server_registry(port)
+    return {"status": "stopped", "port": int(port), "pid": registry.pid}
 
 
 def _sha256_file(path: Path) -> str:

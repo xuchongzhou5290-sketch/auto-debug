@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from autodbg.agent.contract import build_agent_invocation, execute_agent_request
+from autodbg.agent.contract import build_agent_intake_plan, build_agent_invocation, build_agent_tool_manifest, execute_agent_request
 from autodbg.cli.main import _build_parser, _command_agent_call
 from autodbg.session.manager import SessionManager
 
@@ -110,6 +110,42 @@ class AgentContractTest(unittest.TestCase):
             "X:\\Auto-Debug\\src\\autodbg\\cli\\main.py",
         )
         self.assertIsNone(invocation.artifacts_root)
+
+    def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
+        manifest = build_agent_tool_manifest(project_root=Path("X:/Auto-Debug"))
+
+        self.assertEqual(manifest["intake_protocol"]["mcp_tool"], "autodbg_prepare")
+        self.assertTrue(any("missing_required" in rule for rule in manifest["intake_protocol"]["question_policy"]))
+        collaboration = manifest["serial_collaboration"]
+        self.assertEqual(collaboration["ai_entrypoint"], "watch-serial")
+        self.assertIn("observe-serial", collaboration["human_entrypoints"])
+        self.assertEqual(collaboration["shared_owner"], "raw-live broker")
+        self.assertTrue(
+            any("live serial visibility" in rule for rule in collaboration["rules"])
+        )
+        self.assertTrue(
+            any("operator still needs the shared serial view" in rule for rule in manifest["operating_rules"])
+        )
+
+    def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
+        with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
+            plan = build_agent_intake_plan({"action": "exec"}, project_root=Path("X:/Auto-Debug"))
+
+        self.assertFalse(plan["ready"])
+        missing_fields = [item["field"] for item in plan["missing_required"]]
+        self.assertEqual(missing_fields, ["serial_port", "device_password", "shell_command"])
+        self.assertTrue(plan["should_ask_user"])
+        self.assertLessEqual(len(plan["user_questions"]), 3)
+        self.assertEqual(plan["suggested_request"]["action"], "exec")
+
+    def test_build_agent_intake_plan_infers_action_from_goal(self) -> None:
+        with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": ""}):
+            plan = build_agent_intake_plan({"goal": "我想观察串口日志"}, project_root=Path("X:/Auto-Debug"))
+
+        self.assertEqual(plan["action"], "watch-serial")
+        self.assertEqual(plan["inferred_action"], "watch-serial")
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["missing_required"][0]["field"], "serial_port")
 
     def test_command_agent_call_returns_structured_json_and_detects_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

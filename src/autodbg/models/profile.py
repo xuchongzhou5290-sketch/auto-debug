@@ -116,6 +116,9 @@ class ModelProfile:
     app_start_markers: list[str] = field(default_factory=list)
     app_ready_markers: list[str] = field(default_factory=list)
     panic_markers: list[str] = field(default_factory=list)
+    success_markers: list[str] = field(default_factory=list)
+    fatal_markers: list[str] = field(default_factory=list)
+    marker_context_lines: int = 5
     artifact_paths: list[str] = field(default_factory=list)
     debug_workspace: str = "/tmp/debug"
     supported_actions: list[str] = field(default_factory=list)
@@ -124,6 +127,7 @@ class ModelProfile:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], source_path: Path) -> "ModelProfile":
+        marker_rules = raw.get("markers") if isinstance(raw.get("markers"), dict) else {}
         return cls(
             model_id=str(raw["model_id"]),
             platform=str(raw["platform"]),
@@ -131,6 +135,9 @@ class ModelProfile:
             app_start_markers=[str(item) for item in raw.get("app_start_markers", [])],
             app_ready_markers=[str(item) for item in raw.get("app_ready_markers", [])],
             panic_markers=[str(item) for item in raw.get("panic_markers", [])],
+            success_markers=[str(item) for item in raw.get("success_markers", marker_rules.get("success", []))],
+            fatal_markers=[str(item) for item in raw.get("fatal_markers", marker_rules.get("fatal", []))],
+            marker_context_lines=int(raw.get("marker_context_lines", marker_rules.get("context_lines", 5))),
             artifact_paths=[str(item) for item in raw.get("artifact_paths", [])],
             debug_workspace=str(raw.get("debug_workspace", "/tmp/debug")),
             supported_actions=[str(item) for item in raw.get("supported_actions", [])],

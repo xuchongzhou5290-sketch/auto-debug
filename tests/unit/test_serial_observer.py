@@ -103,6 +103,43 @@ class SerialObserverTest(unittest.TestCase):
         self.assertEqual(seen[0], ("boot line", None))
         self.assertEqual(seen[1], ("LeCamCoreStart", "app_ready"))
 
+    def test_capture_builds_marker_windows_and_verdict(self) -> None:
+        observer = SerialObserver(
+            serial_settings=SerialSettings(
+                port="COM16",
+                baudrate=115200,
+                login_prompt="closeli login:",
+                shell_prompt="[root@closeli:~]#",
+            ),
+            model_profile=ModelProfile(
+                model_id="ak-av130n-ucm55me2",
+                platform="AK_AV130N",
+                app_name="LeCam",
+                success_markers=["fw verify ok"],
+                fatal_markers=["hard fault"],
+                marker_context_lines=1,
+            ),
+        )
+        fake_port = FakeSerialPort(["boot line", "fw verify ok", "ready line", "HARD FAULT at pc", "after fault"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = observer.capture(
+                seconds=0.1,
+                log_path=Path(temp_dir) / "serial.log",
+                serial_port=fake_port,
+                max_lines=5,
+            )
+
+        self.assertEqual(result.marker_verdict, "fatal")
+        self.assertEqual([window.kind for window in result.marker_windows], ["success", "fatal"])
+        self.assertEqual(result.marker_windows[0].before, ["boot line"])
+        self.assertEqual(result.marker_windows[0].after, ["ready line"])
+        self.assertEqual(result.marker_windows[1].before, ["ready line"])
+        self.assertEqual(result.marker_windows[1].after, ["after fault"])
+        self.assertEqual(result.marker_hits[0].tag, "success")
+        self.assertEqual(result.marker_hits[-1].tag, "fatal")
+        self.assertEqual(result.to_dict()["marker_verdict"], "fatal")
+
     def test_capture_marks_interrupted_when_callback_stops(self) -> None:
         observer = SerialObserver(
             serial_settings=SerialSettings(

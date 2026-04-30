@@ -27,10 +27,22 @@ class MarkerHit:
 
 
 @dataclass(slots=True)
+class MarkerWindow:
+    kind: str
+    marker: str
+    line: str
+    line_index: int
+    before: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ObservationResult:
     lines_captured: int
     last_lines: list[str]
     marker_hits: list[MarkerHit] = field(default_factory=list)
+    marker_windows: list[MarkerWindow] = field(default_factory=list)
+    marker_verdict: str | None = None
     last_device_state: str | None = None
     interrupted: bool = False
 
@@ -47,6 +59,18 @@ class ObservationResult:
                 }
                 for hit in self.marker_hits
             ],
+            "marker_windows": [
+                {
+                    "kind": window.kind,
+                    "marker": window.marker,
+                    "line": window.line,
+                    "line_index": window.line_index,
+                    "before": window.before,
+                    "after": window.after,
+                }
+                for window in self.marker_windows
+            ],
+            "marker_verdict": self.marker_verdict,
             "last_device_state": self.last_device_state,
             "interrupted": self.interrupted,
         }
@@ -63,6 +87,8 @@ class SerialObserver:
                 self.model_profile.app_start_markers
                 + self.model_profile.app_ready_markers
                 + self.model_profile.panic_markers
+                + self._success_markers()
+                + self._fatal_markers()
             )
         )
         return SerialObserverPlan(
@@ -119,6 +145,7 @@ class SerialObserver:
         end_time = None if seconds <= 0 else time.monotonic() + max(seconds, 0.1)
         lines_captured = 0
         last_lines: list[str] = []
+        captured_lines: list[str] = []
         marker_hits: list[MarkerHit] = []
         last_device_state: str | None = None
         interrupted = False
@@ -139,6 +166,7 @@ class SerialObserver:
                     log_handle.flush()
                     lines_captured += 1
                     clean_line = strip_ansi(line)
+                    captured_lines.append(clean_line)
                     last_lines.append(clean_line)
                     if len(last_lines) > 20:
                         last_lines.pop(0)
@@ -157,13 +185,58 @@ class SerialObserver:
             except KeyboardInterrupt:
                 interrupted = True
 
+        marker_windows = self._build_marker_windows(captured_lines)
         return ObservationResult(
             lines_captured=lines_captured,
             last_lines=last_lines,
             marker_hits=marker_hits,
+            marker_windows=marker_windows,
+            marker_verdict=self._marker_verdict(marker_windows),
             last_device_state=last_device_state,
             interrupted=interrupted,
         )
+
+    def _success_markers(self) -> list[str]:
+        return self.model_profile.success_markers or self.model_profile.app_ready_markers
+
+    def _fatal_markers(self) -> list[str]:
+        return self.model_profile.fatal_markers or self.model_profile.panic_markers
+
+    def _marker_context_lines(self) -> int:
+        return max(int(self.model_profile.marker_context_lines), 0)
+
+    def _build_marker_windows(self, lines: list[str]) -> list[MarkerWindow]:
+        context = self._marker_context_lines()
+        windows: list[MarkerWindow] = []
+        rules = (
+            ("fatal", self._fatal_markers()),
+            ("success", self._success_markers()),
+        )
+        for line_index, line in enumerate(lines):
+            for kind, markers in rules:
+                marker = next((item for item in markers if item and item.lower() in line.lower()), None)
+                if marker is None:
+                    continue
+                windows.append(
+                    MarkerWindow(
+                        kind=kind,
+                        marker=marker,
+                        line=line,
+                        line_index=line_index,
+                        before=lines[max(0, line_index - context) : line_index],
+                        after=lines[line_index + 1 : line_index + 1 + context],
+                    )
+                )
+                break
+        return windows
+
+    @staticmethod
+    def _marker_verdict(marker_windows: list[MarkerWindow]) -> str | None:
+        if any(window.kind == "fatal" for window in marker_windows):
+            return "fatal"
+        if any(window.kind == "success" for window in marker_windows):
+            return "success"
+        return None
 
     def classify_line(self, line: str) -> MarkerHit | None:
         if contains_shell_prompt(line, self.serial_settings.shell_prompt):
@@ -181,9 +254,17 @@ class SerialObserver:
                 device_state=DeviceState.LOGIN_PROMPT.value,
             )
 
+        for marker in self.model_profile.fatal_markers:
+            if marker.lower() in line.lower():
+                return MarkerHit(marker=marker, line=line, tag="fatal", device_state=DeviceState.PANIC_OR_HANG.value)
+
         for marker in self.model_profile.app_ready_markers:
             if marker in line:
                 return MarkerHit(marker=marker, line=line, tag="app_ready", device_state=DeviceState.APP_READY.value)
+
+        for marker in self.model_profile.success_markers:
+            if marker.lower() in line.lower():
+                return MarkerHit(marker=marker, line=line, tag="success", device_state=DeviceState.APP_READY.value)
 
         for marker in self.model_profile.app_start_markers:
             if marker in line:

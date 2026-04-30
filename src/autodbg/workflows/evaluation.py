@@ -131,6 +131,8 @@ def evaluate_startup_run(
     findings: list[dict[str, str]] = []
     observation = observation or {}
     marker_hits = observation.get("marker_hits", [])
+    marker_windows = observation.get("marker_windows", [])
+    marker_verdict = str(observation.get("marker_verdict") or "")
 
     appver = checks_by_name.get("appver")
     appver_line = _first_output_line(appver)
@@ -143,8 +145,10 @@ def evaluate_startup_run(
     if not app_process_seen:
         findings.append(_build_finding("error", "lecam_process", f"Startup run did not confirm a running {app_name} process."))
 
-    if any(str(hit.get("tag", "")) == "panic" for hit in marker_hits):
-        findings.append(_build_finding("error", "serial_observation", "Serial observation captured a panic marker during startup."))
+    if any(str(hit.get("tag", "")) in {"panic", "fatal"} for hit in marker_hits) or any(
+        str(window.get("kind", "")) == "fatal" for window in marker_windows
+    ):
+        findings.append(_build_finding("error", "serial_observation", "Serial observation captured a fatal marker during startup."))
 
     mmc_mount = checks_by_name.get("mmc_mount")
     if not _check_ok(mmc_mount):
@@ -154,7 +158,11 @@ def evaluate_startup_run(
     if not _check_ok(sdcard_listing):
         findings.append(_build_finding("warning", "sdcard_listing", "Startup run could not list /mnt/sdcard contents."))
 
-    app_ready_seen = any(str(hit.get("tag", "")) == "app_ready" for hit in marker_hits)
+    app_ready_seen = (
+        marker_verdict == "success"
+        or any(str(hit.get("tag", "")) in {"app_ready", "success"} for hit in marker_hits)
+        or any(str(window.get("kind", "")) == "success" for window in marker_windows)
+    )
     if not app_ready_seen and not app_process_seen and int(observation.get("lines_captured", 0) or 0) > 0:
         findings.append(_build_finding("warning", "serial_observation", "No app_ready marker was observed in the serial window."))
 
@@ -166,6 +174,7 @@ def evaluate_startup_run(
         "app_process_seen": app_process_seen,
         "app_ready_seen": app_ready_seen,
         "serial_lines_captured": int(observation.get("lines_captured", 0) or 0),
+        "marker_verdict": marker_verdict or None,
         "last_device_state": observation.get("last_device_state"),
         "sd_mount": _first_output_line(mmc_mount),
     }

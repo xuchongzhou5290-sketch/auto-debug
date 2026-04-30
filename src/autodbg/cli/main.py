@@ -8,6 +8,7 @@ import io
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
@@ -34,7 +35,23 @@ from autodbg.deploy.deployer import Deployer
 from autodbg.deploy import LOCAL_TOOL_NAME, install_local_tool
 from autodbg.evidence.collector import EvidenceCollector
 from autodbg.host.bundle import build_serial_bundle, split_base64_payload
-from autodbg.host.artifact_server import serve_directory, write_manifest, write_pull_script
+from autodbg.host.artifact_server import (
+    DEFAULT_HEALTH_NAME,
+    ArtifactServerRegistry,
+    artifact_server_log_path,
+    artifact_server_pid_is_running,
+    find_available_port,
+    is_tcp_port_available,
+    list_artifact_server_registries,
+    load_artifact_server_registry,
+    probe_http_url,
+    remove_artifact_server_registry,
+    serve_directory,
+    stop_artifact_server,
+    write_artifact_server_registry,
+    write_manifest,
+    write_pull_script,
+)
 from autodbg.host.network import detect_host_ipv4
 from autodbg.host.storage import get_drive_info, list_host_drives
 from autodbg.mcp.install import HOME_PLUGIN_NAME, install_home_plugin
@@ -331,6 +348,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional auto-stop duration for the local HTTP server",
     )
     serve_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run the HTTP server in the foreground; default starts a background server and returns.",
+    )
+    serve_parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=3.0,
+        help="Seconds to wait for the background server health endpoint.",
+    )
+    serve_parser.add_argument(
+        "--health-name",
+        default=DEFAULT_HEALTH_NAME,
+        help="Filename used for the local artifact server health endpoint.",
+    )
+    serve_parser.add_argument(
+        "--no-auto-port",
+        dest="auto_port",
+        action="store_false",
+        default=True,
+        help="Fail instead of selecting the next free port when --port is occupied.",
+    )
+    serve_parser.add_argument(
         "--workspace",
         default="/mnt/sdcard/autodbg",
         help="Default device-side workspace embedded into the generated pull script",
@@ -340,6 +380,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default="autodbg-pull.sh",
         help="Filename used for the generated device pull script",
     )
+
+    artifact_server_parser = subparsers.add_parser("artifact-server", help="Manage background artifact servers")
+    artifact_server_subparsers = artifact_server_parser.add_subparsers(dest="artifact_server_command", required=True)
+    artifact_server_list_parser = artifact_server_subparsers.add_parser("list", help="List registered artifact servers")
+    artifact_server_list_parser.add_argument("--port", type=int, help="Filter by TCP port")
+    artifact_server_stop_parser = artifact_server_subparsers.add_parser("stop", help="Stop a background artifact server")
+    artifact_server_stop_parser.add_argument("--port", type=int, required=True, help="TCP port of the server to stop")
 
     device_pull_parser = subparsers.add_parser(
         "device-pull",
@@ -881,6 +928,31 @@ def _format_output_excerpt(output_lines: list[str], *, max_length: int = 88) -> 
     return first_line
 
 
+def _build_marker_window_excerpts(observation: dict[str, Any], *, limit: int = 3) -> list[dict[str, str]]:
+    windows = observation.get("marker_windows", [])
+    if not isinstance(windows, list):
+        return []
+    ordered = sorted(
+        [window for window in windows if isinstance(window, dict)],
+        key=lambda window: (0 if window.get("kind") == "fatal" else 1, int(window.get("line_index", 0) or 0)),
+    )
+    excerpts: list[dict[str, str]] = []
+    for window in ordered[:limit]:
+        context_lines = [str(item) for item in window.get("before", [])]
+        context_lines.append(str(window.get("line", "")))
+        context_lines.extend(str(item) for item in window.get("after", []))
+        kind = str(window.get("kind", "marker"))
+        excerpts.append(
+            build_excerpt(
+                source="serial_marker",
+                label=str(window.get("marker", kind)),
+                text="\n".join(line for line in context_lines if line),
+                severity="error" if kind == "fatal" else "info",
+            )
+        )
+    return excerpts
+
+
 def _format_bytes(value: int | None) -> str:
     if value is None:
         return "unknown"
@@ -1053,6 +1125,19 @@ def _default_base_url(bind: str, port: int, *, host_ip: str | None = None) -> st
     if bind == "0.0.0.0":
         host = host_ip or detect_host_ipv4() or socket.gethostbyname(socket.gethostname())
     return f"http://{host}:{port}"
+
+
+def _artifact_health_url(base_url: str, health_name: str) -> str:
+    return f"{base_url.rstrip('/')}/{health_name.lstrip('/')}"
+
+
+def _local_artifact_health_url(bind: str, port: int, health_name: str) -> str:
+    host = bind
+    if host in {"0.0.0.0", "::", ""}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/{health_name.lstrip('/')}"
 
 
 def _host_from_base_url(base_url: str | None) -> str | None:
@@ -2937,7 +3022,7 @@ def _command_run(args: argparse.Namespace) -> int:
     evidence_file_failures = [item for item in evidence_results["file_results"] if item.get("status") != "ok"]
     has_evidence_failures = bool(evidence_command_failures or evidence_file_failures)
     evaluation_verdict = str(evaluation.get("verdict", ""))
-    result_key_excerpts: list[dict[str, str]] = []
+    result_key_excerpts: list[dict[str, str]] = _build_marker_window_excerpts(run_results.get("observation", {}))
     for finding in evaluation.get("findings", [])[:3]:
         result_key_excerpts.append(
             build_excerpt(
@@ -3471,6 +3556,128 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
     return 0 if not failed_checks else 1
 
 
+def _select_artifact_server_port(args: argparse.Namespace) -> int | None:
+    requested_port = int(args.port)
+    auto_port = bool(getattr(args, "auto_port", True)) and not getattr(args, "base_url", None)
+    if auto_port:
+        try:
+            return find_available_port(args.bind, requested_port)
+        except (OSError, ValueError) as exc:
+            print("[ oxx.. ] 2/5 steps")
+            print(f"[ERROR] Could not select a local artifact server port: {exc}")
+            return None
+    if not is_tcp_port_available(args.bind, requested_port):
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Artifact server port is already in use: {args.bind}:{requested_port}")
+        print("[TODO] Stop the existing server or retry without --no-auto-port.")
+        return None
+    return requested_port
+
+
+def _spawn_background_artifact_server(
+    args: argparse.Namespace,
+    *,
+    root: Path,
+    port: int,
+    base_url: str,
+    manifest_path: Path,
+    pull_script_path: Path,
+) -> int:
+    health_url = _artifact_health_url(base_url, args.health_name)
+    local_health_url = _local_artifact_health_url(args.bind, port, args.health_name)
+    log_path = artifact_server_log_path(port)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "autodbg",
+        "serve-artifacts",
+        "--foreground",
+        "--no-auto-port",
+        "--root",
+        str(root),
+        "--bind",
+        args.bind,
+        "--port",
+        str(port),
+        "--settings",
+        str(args.settings),
+        "--base-url",
+        base_url,
+        "--manifest-name",
+        args.manifest_name,
+        "--workspace",
+        args.workspace,
+        "--pull-script-name",
+        args.pull_script_name,
+        "--health-name",
+        args.health_name,
+    ]
+    if args.duration_seconds is not None:
+        command.extend(["--duration-seconds", str(args.duration_seconds)])
+
+    env = os.environ.copy()
+    project_src = str(_project_root() / "src")
+    env["PYTHONPATH"] = project_src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    with log_path.open("a", encoding="utf-8", newline="\n") as log_handle:
+        process = subprocess.Popen(  # noqa: S603 - argv is constructed from parsed CLI args
+            command,
+            cwd=str(_project_root()),
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+
+    write_artifact_server_registry(
+        ArtifactServerRegistry(
+            root=str(root),
+            bind=args.bind,
+            port=port,
+            base_url=base_url,
+            health_url=health_url,
+            pid=process.pid,
+            manifest_path=str(manifest_path),
+            pull_script_path=str(pull_script_path),
+            log_path=str(log_path),
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+    )
+
+    deadline = time.monotonic() + max(float(args.startup_timeout), 0.1)
+    healthy = False
+    while time.monotonic() < deadline:
+        if probe_http_url(local_health_url, timeout=0.4):
+            healthy = True
+            break
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    if not healthy:
+        if process.poll() is None:
+            process.terminate()
+        remove_artifact_server_registry(port)
+        print("[ oxx.. ] 2/5 steps")
+        print(f"[ERROR] Artifact server did not become healthy: {local_health_url}")
+        print(f"[TODO] Check server log: {log_path}")
+        return 1
+
+    registered_server = load_artifact_server_registry(port)
+    server_pid = registered_server.pid if registered_server is not None else process.pid
+    server_log_path = registered_server.log_path if registered_server is not None and registered_server.log_path else str(log_path)
+    print("[ oooo. ] 4/5 steps")
+    print(f"[DONE] Artifact server started in background pid={server_pid}")
+    print(f"[DONE] Serving root: {root}")
+    print(f"[DONE] Manifest: {manifest_path}")
+    print(f"[DONE] Pull script: {pull_script_path}")
+    print(f"[DONE] Base URL: {base_url}/")
+    print(f"[DONE] Health URL: {health_url}")
+    print(f"[TODO] Stop with: autodbg artifact-server stop --port {port}")
+    print(f"[TODO] Log: {server_log_path}")
+    return 0
+
+
 def _command_serve_artifacts(args: argparse.Namespace) -> int:
     root = args.root.resolve()
     if not root.is_dir():
@@ -3479,9 +3686,18 @@ def _command_serve_artifacts(args: argparse.Namespace) -> int:
         print("[TODO] Create or populate the directory before serving it.")
         return 1
 
+    selected_port = _select_artifact_server_port(args)
+    if selected_port is None:
+        return 1
+
     settings = _load_user_settings_from_args(args)
     configured_host_ip = settings.network.host_ip
-    base_url = args.base_url or _default_base_url(args.bind, args.port, host_ip=configured_host_ip)
+    base_url = (args.base_url or _default_base_url(args.bind, selected_port, host_ip=configured_host_ip)).rstrip("/")
+    if args.port == 0:
+        print(f"[DONE] Selected ephemeral artifact server port {selected_port}.")
+    elif selected_port != args.port:
+        print(f"[DONE] Requested port {args.port} was unavailable; selected {selected_port}.")
+
     manifest_path = write_manifest(
         root,
         base_url=base_url,
@@ -3495,11 +3711,39 @@ def _command_serve_artifacts(args: argparse.Namespace) -> int:
         script_name=args.pull_script_name,
         manifest_name=args.manifest_name,
     )
+
+    if not args.foreground:
+        return _spawn_background_artifact_server(
+            args,
+            root=root,
+            port=selected_port,
+            base_url=base_url,
+            manifest_path=manifest_path,
+            pull_script_path=pull_script_path,
+        )
+
     server, thread = serve_directory(
         root,
         bind=args.bind,
-        port=args.port,
+        port=selected_port,
         duration_seconds=args.duration_seconds,
+        health_name=args.health_name,
+    )
+    health_url = _artifact_health_url(base_url, args.health_name)
+    existing_registry = load_artifact_server_registry(selected_port)
+    write_artifact_server_registry(
+        ArtifactServerRegistry(
+            root=str(root),
+            bind=args.bind,
+            port=selected_port,
+            base_url=base_url,
+            health_url=health_url,
+            pid=os.getpid(),
+            manifest_path=str(manifest_path),
+            pull_script_path=str(pull_script_path),
+            log_path=existing_registry.log_path if existing_registry is not None else None,
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
     )
     try:
         print("[ oooo. ] 4/5 steps")
@@ -3507,6 +3751,7 @@ def _command_serve_artifacts(args: argparse.Namespace) -> int:
         print(f"[DONE] Manifest: {manifest_path}")
         print(f"[DONE] Pull script: {pull_script_path}")
         print(f"[ACTIVE] Base URL: {base_url}/")
+        print(f"[DONE] Health URL: {health_url}")
         print(f"[TODO] Manifest URL: {base_url}/{args.manifest_name}")
         print(f"[TODO] Pull script URL: {base_url}/{args.pull_script_name}")
         if args.duration_seconds is None:
@@ -3520,7 +3765,49 @@ def _command_serve_artifacts(args: argparse.Namespace) -> int:
     finally:
         server.shutdown()
         server.server_close()
+        remove_artifact_server_registry(selected_port)
     return 0
+
+
+def _command_artifact_server(args: argparse.Namespace) -> int:
+    if args.artifact_server_command == "list":
+        registries = list_artifact_server_registries()
+        if args.port is not None:
+            registries = [registry for registry in registries if registry.port == args.port]
+        if not registries:
+            print("[ oo... ] 2/5 steps")
+            print("[DONE] No artifact servers registered")
+            return 0
+        print("[ ooo.. ] 3/5 steps")
+        for registry in registries:
+            running = artifact_server_pid_is_running(registry.pid)
+            healthy = probe_http_url(registry.health_url, timeout=0.5)
+            status = "healthy" if healthy else "registered"
+            if not running:
+                status = "stale"
+            print(f"[DONE] port={registry.port} pid={registry.pid} status={status} base_url={registry.base_url}")
+            print(f"       root={registry.root}")
+            print(f"       health={registry.health_url}")
+            if registry.log_path:
+                print(f"       log={registry.log_path}")
+        return 0
+
+    if args.artifact_server_command == "stop":
+        result = stop_artifact_server(args.port)
+        if result.get("status") == "missing":
+            print("[ oo... ] 2/5 steps")
+            print(f"[ERROR] No artifact server registry found for port {args.port}")
+            return 1
+        if result.get("status") == "error":
+            print("[ oxx.. ] 2/5 steps")
+            print(f"[ERROR] Failed to stop artifact server: {result.get('error')}")
+            return 1
+        print("[ ooo.. ] 3/5 steps")
+        print(f"[DONE] Stopped artifact server port={result.get('port')} pid={result.get('pid')}")
+        return 0
+
+    print(f"[ERROR] Unsupported artifact-server command: {args.artifact_server_command}")
+    return 1
 
 
 def _command_device_pull(args: argparse.Namespace) -> int:
@@ -5185,6 +5472,8 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_bootstrap_network(args)
     if args.command == "serve-artifacts":
         return _command_serve_artifacts(args)
+    if args.command == "artifact-server":
+        return _command_artifact_server(args)
     if args.command == "device-pull":
         return _command_device_pull(args)
     if args.command == "observe":

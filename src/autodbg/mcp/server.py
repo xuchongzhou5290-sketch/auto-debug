@@ -10,6 +10,7 @@ from autodbg.agent import (
     AGENT_SCHEMA_VERSION,
     AgentCallError,
     build_agent_error_response,
+    build_agent_intake_plan,
     build_agent_tool_manifest,
     execute_agent_request,
 )
@@ -18,6 +19,112 @@ from autodbg.cli.main import _build_parser, _dispatch_command
 
 SERVER_NAME = "embedded-device-auto-debug-mcp"
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+
+
+def _build_agent_request_schema(
+    *,
+    action_names: list[str],
+    require_action: bool,
+    include_goal: bool = False,
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "schema_version": {
+            "type": "integer",
+            "enum": [AGENT_SCHEMA_VERSION],
+            "default": AGENT_SCHEMA_VERSION,
+        },
+        "action": {
+            "type": "string",
+            "enum": action_names,
+            "description": "Structured auto-debug action name.",
+        },
+        "connection": {
+            "type": "object",
+            "description": "现场连接参数；敏感字段只在运行时环境里使用，不写入 argv。",
+            "properties": {
+                "serial_port": {"type": "string"},
+                "baudrate": {"type": "integer"},
+                "device_password": {"type": "string"},
+                "login_prompt": {"type": "string"},
+                "shell_prompt": {"type": "string"},
+                "host_ip": {"type": "string"},
+                "preferred_interfaces": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ]
+                },
+                "expected_ip": {"type": "string"},
+                "pull_base_url": {"type": "string"},
+                "pull_workspace": {"type": "string"},
+                "wifi_ssid": {"type": "string"},
+                "wifi_password": {"type": "string"},
+                "wifi_mode": {"type": "string"},
+                "network_dir": {"type": "string"},
+                "sdcard_drive": {"type": "string"},
+                "retrieved_root": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "profiles": {
+            "type": "object",
+            "description": "Profile 和默认路径覆盖项。",
+            "properties": {
+                "device": {"type": "string"},
+                "model": {"type": "string"},
+                "task": {"type": "string"},
+                "transport": {"type": "string"},
+                "profiles_defaults": {"type": "string"},
+                "artifacts_root": {"type": "string"},
+                "settings": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "options": {
+            "type": "object",
+            "description": "CLI 参数的 snake_case 形式；不同 action 的字段不同。",
+            "additionalProperties": True,
+        },
+        "loop": {
+            "type": "object",
+            "description": "跨轮调试上下文；用于把上一轮 session 和当前轮次稳定传入。",
+            "properties": {
+                "goal_id": {"type": "string"},
+                "goal": {"type": "string"},
+                "prev_session": {"type": "string"},
+                "iteration": {"type": "integer"},
+                "max_iterations": {"type": "integer"},
+                "attempt_note": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "response": {
+            "type": "object",
+            "description": "返回内容控制项。",
+            "properties": {
+                "include_summary": {"type": "boolean"},
+                "include_stdout": {"type": "boolean"},
+                "include_stderr": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        "request": {
+            "type": "object",
+            "description": "可选兼容包装；如果提供，server 会把它当作完整请求体。",
+            "additionalProperties": True,
+        },
+    }
+    if include_goal:
+        properties["goal"] = {
+            "type": "string",
+            "description": "Natural-language debug goal; used only to infer a likely action when action is omitted.",
+        }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["action"] if require_action else [],
+        "additionalProperties": False,
+    }
 
 
 def build_mcp_tools(*, project_root: Path) -> list[dict[str, Any]]:
@@ -37,103 +144,24 @@ def build_mcp_tools(*, project_root: Path) -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "autodbg_prepare",
+            "description": (
+                "Plan an embedded auto-debug request before execution. "
+                "Use this to identify missing required parameters and generate concise questions for the user."
+            ),
+            "inputSchema": _build_agent_request_schema(
+                action_names=action_names,
+                require_action=False,
+                include_goal=True,
+            ),
+        },
+        {
             "name": "autodbg_action",
             "description": (
                 "Execute one structured embedded auto-debug request. "
                 f"Supported actions: {', '.join(action_names)}."
             ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "schema_version": {
-                        "type": "integer",
-                        "enum": [AGENT_SCHEMA_VERSION],
-                        "default": AGENT_SCHEMA_VERSION,
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": action_names,
-                        "description": "Structured auto-debug action name.",
-                    },
-                    "connection": {
-                        "type": "object",
-                        "description": "现场连接参数；敏感字段只在运行时环境里使用，不写入 argv。",
-                        "properties": {
-                            "serial_port": {"type": "string"},
-                            "baudrate": {"type": "integer"},
-                            "device_password": {"type": "string"},
-                            "login_prompt": {"type": "string"},
-                            "shell_prompt": {"type": "string"},
-                            "host_ip": {"type": "string"},
-                            "preferred_interfaces": {
-                                "oneOf": [
-                                    {"type": "string"},
-                                    {"type": "array", "items": {"type": "string"}},
-                                ]
-                            },
-                            "expected_ip": {"type": "string"},
-                            "pull_base_url": {"type": "string"},
-                            "pull_workspace": {"type": "string"},
-                            "wifi_ssid": {"type": "string"},
-                            "wifi_password": {"type": "string"},
-                            "wifi_mode": {"type": "string"},
-                            "network_dir": {"type": "string"},
-                            "sdcard_drive": {"type": "string"},
-                            "retrieved_root": {"type": "string"},
-                        },
-                        "additionalProperties": False,
-                    },
-                    "profiles": {
-                        "type": "object",
-                        "description": "Profile 和默认路径覆盖项。",
-                        "properties": {
-                            "device": {"type": "string"},
-                            "model": {"type": "string"},
-                            "task": {"type": "string"},
-                            "transport": {"type": "string"},
-                            "profiles_defaults": {"type": "string"},
-                            "artifacts_root": {"type": "string"},
-                            "settings": {"type": "string"},
-                        },
-                        "additionalProperties": False,
-                    },
-                    "options": {
-                        "type": "object",
-                        "description": "CLI 参数的 snake_case 形式；不同 action 的字段不同。",
-                        "additionalProperties": True,
-                    },
-                    "loop": {
-                        "type": "object",
-                        "description": "跨轮调试上下文；用于把上一轮 session 和当前轮次稳定传入。",
-                        "properties": {
-                            "goal_id": {"type": "string"},
-                            "goal": {"type": "string"},
-                            "prev_session": {"type": "string"},
-                            "iteration": {"type": "integer"},
-                            "max_iterations": {"type": "integer"},
-                            "attempt_note": {"type": "string"},
-                        },
-                        "additionalProperties": False,
-                    },
-                    "response": {
-                        "type": "object",
-                        "description": "返回内容控制项。",
-                        "properties": {
-                            "include_summary": {"type": "boolean"},
-                            "include_stdout": {"type": "boolean"},
-                            "include_stderr": {"type": "boolean"},
-                        },
-                        "additionalProperties": False,
-                    },
-                    "request": {
-                        "type": "object",
-                        "description": "可选兼容包装；如果提供，server 会把它当作完整请求体。",
-                        "additionalProperties": True,
-                    },
-                },
-                "required": ["action"],
-                "additionalProperties": False,
-            },
+            "inputSchema": _build_agent_request_schema(action_names=action_names, require_action=True),
         },
     ]
 
@@ -144,6 +172,23 @@ def call_mcp_tool(name: str, arguments: dict[str, Any] | None, *, project_root: 
         return {
             "content": [{"type": "text", "text": json.dumps(manifest, indent=2, ensure_ascii=False)}],
             "structuredContent": manifest,
+        }
+    if name == "autodbg_prepare":
+        payload = arguments or {}
+        nested_request = payload.get("request")
+        if isinstance(nested_request, dict):
+            request = dict(nested_request)
+        else:
+            request = dict(payload)
+        request.setdefault("schema_version", AGENT_SCHEMA_VERSION)
+        try:
+            response = build_agent_intake_plan(request, project_root=project_root)
+        except (AgentCallError, json.JSONDecodeError, ValueError) as exc:
+            response = build_agent_error_response(project_root=project_root, error=exc)
+        return {
+            "content": [{"type": "text", "text": json.dumps(response, indent=2, ensure_ascii=False)}],
+            "structuredContent": response,
+            "isError": bool(response.get("error")),
         }
     if name == "autodbg_action":
         payload = arguments or {}
@@ -193,6 +238,8 @@ def dispatch_mcp_request(message: dict[str, Any], *, project_root: Path) -> dict
                 },
                 "instructions": (
                     "Use autodbg_describe first when an agent needs discovery. "
+                    "Use autodbg_prepare before autodbg_action when required parameters are uncertain, "
+                    "then ask the user for missing_required fields. "
                     "Use autodbg_action for actual serial observation, control, evidence, and transport flows."
                 ),
             },

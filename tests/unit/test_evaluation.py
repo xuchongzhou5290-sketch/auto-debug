@@ -104,6 +104,47 @@ class EvaluationTest(unittest.TestCase):
         self.assertEqual(evaluation["verdict"], "fail")
         self.assertTrue(any(finding["check_name"] == "serial_observation" for finding in evaluation["findings"]))
 
+    def test_evaluate_startup_run_uses_marker_window_verdict(self) -> None:
+        checks = [
+            {"name": "appver", "exit_code": 0, "output_lines": ["2.0.0.276"]},
+            {"name": "lecam_process", "exit_code": 0, "output_lines": ["609 root /opt/lecam/LeCam start"]},
+            {"name": "mmc_mount", "exit_code": 0, "output_lines": ["/dev/mmcblk0p1 on /mnt/sdcard type vfat (rw,...)"]},
+            {"name": "sdcard_listing", "exit_code": 0, "output_lines": ["System Volume Information", "logprint"]},
+        ]
+        observation = {
+            "lines_captured": 12,
+            "last_device_state": "app_ready",
+            "marker_hits": [],
+            "marker_windows": [{"kind": "success", "marker": "fw verify ok", "line": "fw verify ok"}],
+            "marker_verdict": "success",
+        }
+
+        evaluation = evaluate_startup_run(checks, app_name="LeCam", observation=observation)
+
+        self.assertEqual(evaluation["verdict"], "pass")
+        self.assertTrue(evaluation["highlights"]["app_ready_seen"])
+        self.assertEqual(evaluation["highlights"]["marker_verdict"], "success")
+
+    def test_evaluate_startup_run_fails_on_fatal_marker_window(self) -> None:
+        checks = [
+            {"name": "appver", "exit_code": 0, "output_lines": ["2.0.0.276"]},
+            {"name": "lecam_process", "exit_code": 0, "output_lines": ["609 root /opt/lecam/LeCam start"]},
+            {"name": "mmc_mount", "exit_code": 0, "output_lines": ["/dev/mmcblk0p1 on /mnt/sdcard type vfat (rw,...)"]},
+            {"name": "sdcard_listing", "exit_code": 0, "output_lines": ["System Volume Information", "logprint"]},
+        ]
+        observation = {
+            "lines_captured": 12,
+            "last_device_state": "panic_or_hang",
+            "marker_hits": [],
+            "marker_windows": [{"kind": "fatal", "marker": "hard fault", "line": "hard fault at pc"}],
+            "marker_verdict": "fatal",
+        }
+
+        evaluation = evaluate_startup_run(checks, app_name="LeCam", observation=observation)
+
+        self.assertEqual(evaluation["verdict"], "fail")
+        self.assertTrue(any(finding["check_name"] == "serial_observation" for finding in evaluation["findings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

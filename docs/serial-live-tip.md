@@ -51,6 +51,12 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 
 这一步是“每次调试会话开始前做一次”，不是每次 `run / exec / health` 前都重开一次。
 
+如果场景是“AI 在后台调试，人工也要实时看串口”，这里有一个硬规则：
+
+- 人工先开 `observe-serial`
+- AI 再用 `watch-serial` 跟随共享 trace，或直接执行会复用 broker 的 `run / exec / health / collect-evidence`
+- 人工窗口还在看时，不要主动执行 `serial-broker stop`
+
 如果你想先回看历史，再显式加：
 
 ```powershell
@@ -157,6 +163,24 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 .\.venv\Scripts\python -m autodbg observe --live --follow --poke-newline
 ```
 
+### 4.1 自动 marker 判断
+
+`run` 会把串口观察结果写入 `summary.run_results.observation`：
+
+- `marker_verdict`: `success` / `fatal` / `null`
+- `marker_windows`: 命中 marker 前后若干行上下文
+
+机型 profile 可以声明：
+
+```toml
+[markers]
+success = ["fw verify ok", "ready"]
+fatal = ["assert", "stack overflow", "hard fault"]
+context_lines = 5
+```
+
+这样上层 AI 不需要把整段串口日志塞进上下文，直接读取结构化 verdict 和关键切片即可。
+
 ## 5. 结论
 
 - `observe`：直接碰物理串口
@@ -164,5 +188,6 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - `watch-serial --raw-live`：故意长期占用物理串口
 - `observe-serial.ps1`：推荐的一键长期观察入口
 - `serial-broker stop`：释放遗留 raw-live broker
+- 人工 + AI 协同时：先人工 `observe-serial`，再让 AI 复用 broker
 
 如果你已经在当前 shell 里设置了 `AUTO_DBG_SERIAL_PORT`，那么大多数串口主命令都不再需要重复传四个 profile 路径。

@@ -15,7 +15,7 @@
 - Project root: `X:\Auto-Debug`
 - Stable entrypoint: `python -m autodbg agent-call --request -`
 - Self-description entrypoint: `python -m autodbg describe-agent-tool --format json`
-- MCP tools: `autodbg_describe`, `autodbg_action`
+- MCP tools: `autodbg_describe`, `autodbg_prepare`, `autodbg_action`
 - Relative request paths are resolved from `project_root` / `AUTO_DBG_PROJECT_ROOT`, not the caller cwd
 
 ## 2. What This Tool Is For
@@ -33,6 +33,9 @@
 - 拉回设备文件
 - 下发文件到设备
 - 归档 session 产物
+- 后台启动 artifact HTTP server
+- 列出/停止后台 artifact server
+- 从串口日志里提取 success/fatal marker 前后文
 
 它不负责：
 
@@ -61,9 +64,10 @@
 
 推荐动作链：
 
-1. `watch-serial`
-2. `run`
-3. `report`
+1. 人工先开 `observe-serial`
+2. AI 再用 `watch-serial`
+3. `run`
+4. `report`
 
 适用：
 
@@ -74,10 +78,11 @@
 
 推荐动作链：
 
-1. `watch-serial`
-2. `health`
-3. `collect-evidence`
-4. `summary`
+1. 人工先开 `observe-serial`
+2. AI 再用 `watch-serial`
+3. `health`
+4. `collect-evidence`
+5. `summary`
 
 适用：
 
@@ -102,12 +107,17 @@
 
 这是关键规则：
 
-- 如果需要一个长期不断流的观察窗口，应优先使用 `watch-serial` 或 `observe-serial.ps1`
+- AI 不能假设自己调用 `watch-serial` 就等于用户也看到了串口
+- 如果用户也要实时看串口，必须先引导用户在独立终端打开 `observe-serial` 或 `.\observe-serial.ps1`
+- AI 自己随后才使用 `watch-serial`
 - `raw-live broker` 是物理串口的单一拥有者
 - 其他 `autodbg` 命令应该复用 broker，而不是重新直接抢串口
 
 对 AI 的实际含义：
 
+- 如果用户要求“我也想同步看串口”，先给出 `observe-serial` 命令，再继续工具调用
+- 如果人工观察窗口已经存在，优先使用不带 `raw_live` 的 `watch-serial`
+- 不要在用户还在看串口时调用 `serial-broker-stop`
 - 如果用户要求“观察串口不要被调试打断”，先启动 broker，再做后续控制动作
 
 ## 6. Response Rule
@@ -133,21 +143,31 @@
 
 1. 调 `describe-agent-tool --format json`
 2. 确认用户提供了哪些连接参数
-3. 先判断用户目标属于：
+3. MCP 场景先调 `autodbg_prepare`
+4. 如果 `missing_required` 非空，先向用户提问，不要直接猜参数
+5. 先判断用户目标属于：
    - startup debug
    - health audit
    - deploy and verify
    - file retrieval
    - serial observation
-4. 组织 `agent-call` JSON 请求
-5. 只根据 JSON 响应里的 `ok / exit_code / summary / error` 判断结果
+6. 组织 `agent-call` JSON 请求
+7. 只根据 JSON 响应里的 `ok / exit_code / summary / error` 判断结果
+
+`autodbg_prepare` 是 Agent 的参数引导入口：
+
+- 输入可以是 `action`，也可以先只给 `goal`
+- 输出 `missing_required / recommended / user_questions / suggested_request`
+- 一次最多问用户 3 个缺失必填项
+- 不要猜串口、密码、远端路径、本地源文件、session 目录或 stop 目标
 
 如果目标是自动多轮调试，再额外遵守：
 
 1. 每轮结束后优先读取 `summary.result`
-2. 如果 `decision != success`，优先复用 `summary.result.carry_forward_request`
-3. 本轮改了代码、配置或现场条件后，用 `record-intervention` 写回结构化干预
-4. 下一轮请求在顶层 `loop` 里显式带上 `prev_session / iteration / goal`
+2. 串口判断优先读取 `summary.run_results.observation.marker_verdict / marker_windows`
+3. 如果 `decision != success`，优先复用 `summary.result.carry_forward_request`
+4. 本轮改了代码、配置或现场条件后，用 `record-intervention` 写回结构化干预
+5. 下一轮请求在顶层 `loop` 里显式带上 `prev_session / iteration / goal`
 
 ## 8. Safe Defaults
 
@@ -187,6 +207,13 @@
     "stdin_shell": true
   }
 }
+```
+
+这个请求只保证 AI 自己跟随共享 trace。
+如果人也要直接看到串口，先让用户单独执行：
+
+```powershell
+observe-serial
 ```
 
 ### 9.3 Fetch Device File

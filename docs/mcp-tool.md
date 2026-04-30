@@ -13,6 +13,18 @@
 - 返回 `auto-debug` 的自描述 manifest
 - 适合 Agent 在首次接管时先做能力发现
 
+### `autodbg_prepare`
+
+- 在真正执行 `autodbg_action` 前做参数体检
+- 输入可以只给 `goal` 或 `action`
+- 返回：
+  - `ready`
+  - `missing_required`
+  - `recommended`
+  - `user_questions`
+  - `suggested_request`
+- Agent 应先把 `missing_required` 转成给用户的问题，拿到答案后再调用 `autodbg_action`
+
 ### `autodbg_action`
 
 - 输入就是 `agent-call` 的结构化 JSON 请求
@@ -27,6 +39,8 @@
   - `fetch-path`
   - `bootstrap-network`
   - `serve-artifacts`
+  - `artifact-server-list`
+  - `artifact-server-stop`
   - `device-pull`
   - `stage-sd`
   - `storage`
@@ -203,10 +217,38 @@ cd X:\Auto-Debug
 ## 7. 调用建议
 
 1. 先调 `autodbg_describe`
-2. 根据返回的 `actions / required_inputs / operating_rules` 组织请求
-3. 再调 `autodbg_action`
-4. 以返回里的 `ok + exit_code + summary` 作为结果判断
-5. 如果需要多轮继续调试，优先复用 `summary.result.carry_forward_request`
+2. 调 `autodbg_prepare`，让工具返回缺失参数和建议提问
+3. 如果 `missing_required` 非空，先问用户，不要猜串口、密码、路径、stop 目标或 session
+4. `ready=true` 后再调 `autodbg_action`
+5. 以返回里的 `ok + exit_code + summary` 作为结果判断
+6. 如果需要多轮继续调试，优先复用 `summary.result.carry_forward_request`
+
+### 7.0 参数引导入口
+
+典型准备请求：
+
+```json
+{
+  "action": "run"
+}
+```
+
+如果 Agent 还不确定动作，也可以只给自然语言目标：
+
+```json
+{
+  "goal": "我想观察设备串口日志"
+}
+```
+
+返回里的 `user_questions` 是可以直接问用户的问题。规则：
+
+- 先问 `missing_required`
+- 一次最多问 3 个问题
+- `recommended` 只在会影响工作流时再问
+- 密码类字段按敏感信息处理，只放在 `connection`，不要写入命令行文本
+
+`serve-artifacts` 已改为默认非阻塞：MCP 调用会返回后台 `pid / base_url / health_url / log`，不会把工具调用卡在 HTTP server 上。需要人工前台守住服务时，才显式传 `options.foreground=true`。端口占用时默认自动换到后续可用端口；需要严格失败时传 `options.no_auto_port=true`。
 
 ### 7.1 路径解析规则
 
@@ -217,7 +259,24 @@ cd X:\Auto-Debug
   - `loop.prev_session`
 - 这意味着上层 MCP 调用方可以稳定传 repo 相对路径，比如 `profiles/devices/av130n-lab.toml`，不会再错误落到当前工作区 cwd
 
-### 7.2 多轮调试建议
+### 7.2 人工 + AI 同时看串口
+
+这是当前 MCP 接入最容易踩坑的地方：
+
+- AI 调 `watch-serial` 只能保证 AI 自己拿到共享 trace，不等于用户眼前自动出现一个串口窗口
+- 如果用户自己也要实时看串口，先引导用户在独立终端执行 `observe-serial`
+- 人工观察窗口起来后，AI 侧优先使用 `watch-serial`，但不要默认加 `raw_live`
+- 后续 `run / exec / health / collect-evidence` 应复用同一个 broker，不要重新抢物理串口
+- 只要用户还在看串口，AI 就不应主动调 `serial-broker-stop`
+
+推荐顺序：
+
+1. 用户本机执行 `observe-serial`
+2. MCP Agent 读取 `autodbg_describe`
+3. MCP Agent 调 `watch-serial` 或直接调 `run / exec / health`
+4. 调试结束后，再由用户或 AI 明确决定是否释放 broker
+
+### 7.3 多轮调试建议
 
 - 新开一轮时，使用顶层 `loop` 字段传入：
   - `goal_id`
@@ -227,6 +286,7 @@ cd X:\Auto-Debug
   - `max_iterations`
   - `attempt_note`
 - 每轮结束后，读取 `summary.loop` 和 `summary.result`
+- 串口判断优先读取 `summary.run_results.observation.marker_verdict` 和 `marker_windows`
 - 如果本轮做了代码或配置修改，再调 `record-intervention` 把干预写回目标 session
 - 下一轮优先直接使用上一轮 `summary.result.carry_forward_request`
 

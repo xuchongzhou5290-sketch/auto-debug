@@ -210,6 +210,7 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - 请求里的相对路径会按 `project_root` 解析；走 MCP / 已安装插件时，这个根目录就是 `AUTO_DBG_PROJECT_ROOT`
 - 如果要做自动多轮调试，使用顶层 `loop` 字段传 `prev_session / iteration / goal`
 - 每轮代码或配置修改后，可以用 `record-intervention` 追加结构化干预记录
+- 如果 AI 在后台调用时，用户自己也要直接看串口，先让用户在独立终端执行 `observe-serial`，AI 再走 `watch-serial` 或直接跑会复用 broker 的动作
 
 详细约定见：
 
@@ -224,6 +225,19 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 ```powershell
 .\.venv\Scripts\python -m autodbg describe-agent-tool --format json
 ```
+
+MCP Agent 场景下，真正执行前应先走参数引导：
+
+```json
+{
+  "tool": "autodbg_prepare",
+  "arguments": {
+    "action": "run"
+  }
+}
+```
+
+如果返回 `missing_required`，Agent 应先问用户这些参数；`ready=true` 后再调用 `autodbg_action`。
 
 如果要把它直接挂成 MCP Tool，再让别的 Agent 走工具调用而不是自己拼命令，直接看：
 
@@ -302,6 +316,12 @@ install-home-plugin
 
 这一步是“每次调试会话开始前做一次”，不是每条调试命令前都做一次。
 
+如果场景是“AI 在后台跑工具，人工也要同步看串口”，顺序固定为：
+
+1. 人工先开 `observe-serial`
+2. AI 再调 `watch-serial` 或 `run / exec / health`
+3. 人工窗口还开着时，不要主动 `serial-broker stop`
+
 如果你想先回看历史，再显式加：
 
 ```powershell
@@ -338,9 +358,13 @@ install-home-plugin
 ```powershell
 .\.venv\Scripts\python -m autodbg bootstrap-network --mode wlan_script
 .\.venv\Scripts\python -m autodbg serve-artifacts --port 8765 --workspace /mnt/sdcard/autodbg
+.\.venv\Scripts\python -m autodbg artifact-server list
+.\.venv\Scripts\python -m autodbg artifact-server stop --port 8765
 .\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto
 .\.venv\Scripts\python -m autodbg device-pull --mode offline --transfer-mode serial_bundle
 ```
+
+`serve-artifacts` 默认后台启动并返回 `pid / base_url / health_url / log`，避免阻塞 MCP 调用链；如果需要旧式前台阻塞模式，显式加 `--foreground`。
 
 ### SD 卡落盘
 
