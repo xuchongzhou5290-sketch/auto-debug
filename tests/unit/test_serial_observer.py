@@ -228,6 +228,31 @@ class SerialObserverTest(unittest.TestCase):
         self.assertEqual(hit.tag, "shell")
         self.assertEqual(hit.device_state, "root_shell")
 
+    def test_classify_line_matches_profile_markers_case_insensitively(self) -> None:
+        observer = SerialObserver(
+            serial_settings=SerialSettings(
+                port="COM16",
+                baudrate=115200,
+                login_prompt="closeli login:",
+                shell_prompt="[root@closeli:~]#",
+            ),
+            model_profile=ModelProfile(
+                model_id="ak-av130n-ucm55me2",
+                platform="AK_AV130N",
+                app_name="LeCam",
+                app_ready_markers=["LeCamCoreStart"],
+                app_start_markers=["LeCam goto start..."],
+            ),
+        )
+
+        ready_hit = observer.classify_line("lecamcorestart")
+        start_hit = observer.classify_line("lecam GOTO START...")
+
+        self.assertIsNotNone(ready_hit)
+        self.assertEqual(ready_hit.tag, "app_ready")
+        self.assertIsNotNone(start_hit)
+        self.assertEqual(start_hit.tag, "app_start")
+
 
 if __name__ == "__main__":
     unittest.main()

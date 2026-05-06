@@ -1,4 +1,5 @@
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -38,8 +39,30 @@ class ProfileLoaderTest(unittest.TestCase):
             self.root / "profiles" / "tasks" / "startup-check.toml",
             self.root / "profiles" / "transports" / "network-serial-fallback.toml",
         )
-        settings = load_user_settings(self.root / "config" / "user-settings.toml")
-        effective = apply_user_settings(profiles, settings)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "user-settings.toml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "[serial]",
+                        'port = "COM19"',
+                        "baudrate = 115200",
+                        "",
+                        "[network]",
+                        'preferred_interfaces = ["eth0", "wlan0", "usb0", "wlan1", "ra0", "apcli0"]',
+                        'pull_workspace = "/mnt/sdcard/autodbg"',
+                        "",
+                        "[storage]",
+                        'retrieved_root = "../retrieved"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            settings = load_user_settings(settings_path)
+            effective = apply_user_settings(profiles, settings)
+            expected_retrieved_root = (settings_path.parent / "../retrieved").resolve()
 
         self.assertEqual(effective.device.serial.port, "COM19")
         self.assertEqual(effective.device.serial.baudrate, 115200)
@@ -50,7 +73,7 @@ class ProfileLoaderTest(unittest.TestCase):
         self.assertEqual(effective.device.network.pull_workspace, "/mnt/sdcard/autodbg")
         self.assertEqual(
             Path(effective.device.storage.retrieved_root).resolve(),
-            (self.root / "retrieved").resolve(),
+            expected_retrieved_root,
         )
 
     def test_profile_defaults_manifest_resolves_expected_profile_paths(self) -> None:

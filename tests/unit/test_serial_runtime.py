@@ -96,6 +96,16 @@ class SerialRuntimeTest(unittest.TestCase):
             self.assertFalse(removed)
             self.assertTrue(lock_path.exists())
 
+    def test_acquire_pid_lock_does_not_remove_replaced_lock_on_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "com19.lock"
+
+            with runtime._acquire_pid_lock(lock_path, busy_message="busy"):
+                lock_path.write_text("999999", encoding="ascii")
+
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(lock_path.read_text(encoding="ascii"), "999999")
+
     def test_append_trace_entry_writes_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(runtime, "_serial_trace_dir", return_value=Path(temp_dir)):

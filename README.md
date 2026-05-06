@@ -109,6 +109,10 @@ $env:AUTO_DBG_PREFERRED_INTERFACES = "eth0,wlan0,usb0"
 
 ## 快速开始
 
+## 源码运行说明
+
+仓库根目录下的 `autodbg\` 只是源码 checkout 的开发期入口 shim，用来让 `python -m autodbg ...` 在未安装包时也能转到 `src\autodbg`。正式打包仍以 `pyproject.toml` 中的 `package-dir = {"" = "src"}` 为准。
+
 ### 1. 先做一次本地部署
 
 如果你手上是源码仓，先执行：

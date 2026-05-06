@@ -237,6 +237,43 @@ def _add_watch_profile_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--validation-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Device shell command that must exit 0 for target-specific validation (repeatable)",
+    )
+    parser.add_argument(
+        "--expect-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Serial output text that must appear in the observation window (repeatable)",
+    )
+    parser.add_argument(
+        "--reject-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Serial output text that must not appear in the observation window (repeatable)",
+    )
+    parser.add_argument("--expected-version", help="Version text that must appear in appver or validation output")
+
+
+def _add_intervention_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--git-commit", help="Git commit or revision that produced the candidate build")
+    parser.add_argument(
+        "--changed-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Source file changed in this intervention (repeatable)",
+    )
+    parser.add_argument("--expected-effect", help="Expected behavior change being verified")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autodbg", description="Embedded device auto-debug scaffold")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -256,6 +293,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_RUN_DEFAULT_EVIDENCE_TIMEOUT,
         help="Timeout in seconds for each default evidence command during run",
     )
+    _add_validation_arguments(run_parser)
+    _add_intervention_arguments(run_parser)
 
     stage_sd_parser = subparsers.add_parser("stage-sd", help="Copy a local file into the configured SD card drive")
     _add_profile_arguments(stage_sd_parser)
@@ -466,7 +505,49 @@ def _build_parser() -> argparse.ArgumentParser:
         "--list-command",
         help="Optional follow-up command that lists the pulled files for verification",
     )
+    device_pull_parser.add_argument(
+        "--post-pull-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Device shell command to run after the pull, such as upgrade/apply commands (repeatable)",
+    )
+    device_pull_parser.add_argument("--reboot-command", help="Device shell command that reboots or restarts the updated program")
+    device_pull_parser.add_argument(
+        "--post-observe-seconds",
+        type=float,
+        default=0.0,
+        help="Serial observation window after post-pull/reboot commands",
+    )
+    _add_validation_arguments(device_pull_parser)
+    _add_intervention_arguments(device_pull_parser)
     device_pull_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds for each shell command")
+
+    deploy_verify_parser = subparsers.add_parser(
+        "deploy-verify",
+        help="Run a closed debug loop: optional build, deploy/apply commands, observation, and target validation",
+    )
+    _add_profile_arguments(deploy_verify_parser)
+    _add_loop_arguments(deploy_verify_parser)
+    deploy_verify_parser.add_argument("--build-command", help="Host-side build command to run before deploying")
+    deploy_verify_parser.add_argument("--artifact", type=Path, help="Local artifact produced by the build or selected for deployment")
+    deploy_verify_parser.add_argument(
+        "--post-pull-command",
+        action="append",
+        default=[],
+        metavar="CMD",
+        help="Device shell deploy/apply command to run before verification (repeatable)",
+    )
+    deploy_verify_parser.add_argument("--reboot-command", help="Device shell command that reboots or restarts the updated program")
+    deploy_verify_parser.add_argument(
+        "--observe-seconds",
+        type=float,
+        default=10.0,
+        help="Serial observation window after deployment/restart",
+    )
+    deploy_verify_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds for each shell command")
+    _add_validation_arguments(deploy_verify_parser)
+    _add_intervention_arguments(deploy_verify_parser)
 
     observe_parser = subparsers.add_parser("observe", help="Capture serial output into a new session")
     _add_profile_arguments(observe_parser)
@@ -926,6 +1007,174 @@ def _format_output_excerpt(output_lines: list[str], *, max_length: int = 88) -> 
     if len(output_lines) > 1:
         return f"{first_line} (+{len(output_lines) - 1} lines)"
     return first_line
+
+
+def _hash_file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _has_validation_spec(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "validation_command", None)
+        or getattr(args, "expect_marker", None)
+        or getattr(args, "reject_marker", None)
+        or getattr(args, "expected_version", None)
+    )
+
+
+def _observation_text(observation: dict[str, Any] | None) -> str:
+    if not isinstance(observation, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("last_lines", "marker_hits", "marker_windows"):
+        value = observation.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    parts.extend(str(field) for field in item.values() if field is not None)
+                else:
+                    parts.append(str(item))
+    return "\n".join(parts)
+
+
+def _run_validation_commands(
+    *,
+    controller: DeviceController,
+    collector: EvidenceCollector,
+    commands: list[str],
+    timeout: float,
+    serial_port=None,
+    prefix: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for index, command in enumerate(commands, start=1):
+        result = _execute_structured_command(
+            controller=controller,
+            shell_command=command,
+            timeout=timeout,
+            serial_port=serial_port,
+        )
+        _write_command_artifacts(collector=collector, prefix=f"{prefix}-{index}", result=result)
+        result_dict = result.to_dict()
+        results.append(result_dict)
+        collector.append_event(
+            event_type="target_validation_command",
+            source="device_controller",
+            summary=f"Executed target validation command #{index}",
+            payload=result_dict,
+            severity="error" if result.exit_code != 0 else "info",
+        )
+    return results
+
+
+def _evaluate_validation_spec(
+    *,
+    expect_markers: list[str] | None,
+    reject_markers: list[str] | None,
+    expected_version: str | None,
+    observation: dict[str, Any] | None,
+    command_results: list[dict[str, Any]] | None,
+    app_version: str | None = None,
+) -> dict[str, Any]:
+    findings: list[dict[str, str]] = []
+    observed_text = _observation_text(observation)
+    command_text = "\n".join(
+        "\n".join(str(line) for line in result.get("output_lines", []))
+        for result in (command_results or [])
+        if isinstance(result, dict)
+    )
+    search_text = "\n".join(value for value in [observed_text, command_text, app_version or ""] if value)
+
+    for command_result in command_results or []:
+        if command_result.get("exit_code") != 0:
+            findings.append(
+                {
+                    "level": "error",
+                    "check_name": "validation_command",
+                    "message": f"Validation command failed: {command_result.get('command')}",
+                }
+            )
+    for marker in expect_markers or []:
+        if marker not in observed_text:
+            findings.append(
+                {
+                    "level": "error",
+                    "check_name": "expect_marker",
+                    "message": f"Expected serial marker not observed: {marker}",
+                }
+            )
+    for marker in reject_markers or []:
+        if marker and marker in observed_text:
+            findings.append(
+                {
+                    "level": "error",
+                    "check_name": "reject_marker",
+                    "message": f"Rejected serial marker observed: {marker}",
+                }
+            )
+    if expected_version and expected_version not in search_text:
+        findings.append(
+            {
+                "level": "error",
+                "check_name": "expected_version",
+                "message": f"Expected version was not confirmed: {expected_version}",
+            }
+        )
+
+    return {
+        "verdict": "fail" if findings else "pass",
+        "summary": "Target-specific validation passed." if not findings else f"{len(findings)} target validation issue(s) found.",
+        "checks": {
+            "validation_commands": len(command_results or []),
+            "expect_markers": list(expect_markers or []),
+            "reject_markers": list(reject_markers or []),
+            "expected_version": expected_version,
+        },
+        "findings": findings,
+        "command_results": list(command_results or []),
+    }
+
+
+def _build_intervention_context(
+    args: argparse.Namespace,
+    *,
+    artifact: Path | None = None,
+    artifact_sha256: str | None = None,
+    build_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    if getattr(args, "git_commit", None):
+        context["git_commit"] = args.git_commit
+    changed_files = getattr(args, "changed_file", None) or []
+    if changed_files:
+        context["changed_files"] = [str(item) for item in changed_files]
+    if getattr(args, "expected_effect", None):
+        context["expected_effect"] = args.expected_effect
+    if artifact is not None:
+        context["artifact"] = str(artifact)
+    if artifact_sha256:
+        context["artifact_sha256"] = artifact_sha256
+    if build_result is not None:
+        context["build_result"] = build_result
+    return context
+
+
+def _validation_key_excerpts(validation_results: dict[str, Any]) -> list[dict[str, str]]:
+    excerpts: list[dict[str, str]] = []
+    for finding in validation_results.get("findings", [])[:3]:
+        excerpts.append(
+            build_excerpt(
+                source="target_validation",
+                label=str(finding.get("check_name", "validation")),
+                text=str(finding.get("message", "")),
+                severity=str(finding.get("level", "error")),
+            )
+        )
+    return excerpts
 
 
 def _build_marker_window_excerpts(observation: dict[str, Any], *, limit: int = 3) -> list[dict[str, str]]:
@@ -1693,6 +1942,8 @@ def _build_run_next_actions(
         actions.append({"action": "health", "reason": "Validate storage and mount health before the next startup attempt."})
     if has_evidence_failures or failure_stage == "collect_evidence":
         actions.append({"action": "collect-evidence", "reason": "Collect more diagnostics before the next startup iteration."})
+    if failure_stage == "validation":
+        actions.append({"action": "deploy-verify", "reason": "Re-run the build/deploy/observe/validate loop with the target validation criteria."})
     if not actions:
         actions.append({"action": "run", "reason": "Retry the startup workflow after the next code or configuration change."})
     return _dedupe_next_actions(actions)
@@ -1746,8 +1997,23 @@ def _build_device_pull_next_actions(
         actions.append({"action": "device-pull", "reason": "Retry the artifact pull after fixing the transfer prerequisites."})
     if pull_failed:
         actions.append({"action": "serve-artifacts", "reason": "Validate the local artifact server or payload root before the next pull attempt."})
+    if list_failed:
+        actions.append({"action": "deploy-verify", "reason": "Run the closed deploy/observe/validate loop after transfer verification is repaired."})
     if not actions:
         actions.append({"action": "device-pull", "reason": "Retry device pull after the next intervention."})
+    return _dedupe_next_actions(actions)
+
+
+def _build_deploy_verify_next_actions(*, failure_stage: str | None) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    if failure_stage in {"build", "prepare_artifact"}:
+        actions.append({"action": "deploy-verify", "reason": "Retry after the host build or artifact path is fixed."})
+    if failure_stage in {"manual_upgrade", "deploy"}:
+        actions.append({"action": "device-pull", "reason": "Provide a concrete device-side upgrade command or transfer path, then retry deployment."})
+    if failure_stage in {"observe_serial", "validation"}:
+        actions.append({"action": "deploy-verify", "reason": "Retry the closed loop with the same artifact and validation criteria."})
+    if not actions:
+        actions.append({"action": "deploy-verify", "reason": "Retry the closed deploy/verify workflow after the next intervention."})
     return _dedupe_next_actions(actions)
 
 
@@ -2823,6 +3089,14 @@ def _command_run(args: argparse.Namespace) -> int:
 
     run_results: dict[str, Any] = {}
     evidence_results = {"command_results": [], "file_results": []}
+    validation_results: dict[str, Any] = _evaluate_validation_spec(
+        expect_markers=[],
+        reject_markers=[],
+        expected_version=None,
+        observation=None,
+        command_results=[],
+    )
+    intervention_context = _build_intervention_context(args)
     state.transition_task(TaskState.WAITING_BOOT, f"Observing serial for {args.observe_seconds:.1f}s.")
     collector.update_summary({"state": state.to_dict()})
 
@@ -2868,8 +3142,20 @@ def _command_run(args: argparse.Namespace) -> int:
                     current_session_dir=session.session_paths.root,
                     carry_forward_options=_collect_option_patch(
                         args,
-                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                        [
+                            "observe_seconds",
+                            "skip_evidence",
+                            "evidence_timeout",
+                            "validation_command",
+                            "expect_marker",
+                            "reject_marker",
+                            "expected_version",
+                            "git_commit",
+                            "changed_file",
+                            "expected_effect",
+                        ],
                     ),
+                    intervention_context=intervention_context,
                 ),
             }
         )
@@ -2940,6 +3226,26 @@ def _command_run(args: argparse.Namespace) -> int:
                     "command_results": evidence_command_results,
                     "file_results": evidence_file_results,
                 }
+            if _has_validation_spec(args):
+                run_stage = "target validation"
+                state.transition_task(TaskState.RUNNING_CHECKS, "Running target-specific validation.")
+                validation_command_results = _run_validation_commands(
+                    controller=controller,
+                    collector=collector,
+                    commands=list(args.validation_command),
+                    timeout=args.evidence_timeout,
+                    serial_port=serial_port,
+                    prefix="run-validation",
+                )
+                validation_results = _evaluate_validation_spec(
+                    expect_markers=list(args.expect_marker),
+                    reject_markers=list(args.reject_marker),
+                    expected_version=args.expected_version,
+                    observation=run_results.get("observation"),
+                    command_results=validation_command_results,
+                    app_version=str(evaluation.get("highlights", {}).get("app_version") or ""),
+                )
+                collector.update_summary({"validation_results": validation_results})
     except LoginRequiredError as exc:
         collector.append_event(
             event_type="baseline_blocked",
@@ -2972,8 +3278,20 @@ def _command_run(args: argparse.Namespace) -> int:
                     current_session_dir=session.session_paths.root,
                     carry_forward_options=_collect_option_patch(
                         args,
-                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                        [
+                            "observe_seconds",
+                            "skip_evidence",
+                            "evidence_timeout",
+                            "validation_command",
+                            "expect_marker",
+                            "reject_marker",
+                            "expected_version",
+                            "git_commit",
+                            "changed_file",
+                            "expected_effect",
+                        ],
                     ),
+                    intervention_context=intervention_context,
                 ),
             }
         )
@@ -3013,8 +3331,20 @@ def _command_run(args: argparse.Namespace) -> int:
                     current_session_dir=session.session_paths.root,
                     carry_forward_options=_collect_option_patch(
                         args,
-                        ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                        [
+                            "observe_seconds",
+                            "skip_evidence",
+                            "evidence_timeout",
+                            "validation_command",
+                            "expect_marker",
+                            "reject_marker",
+                            "expected_version",
+                            "git_commit",
+                            "changed_file",
+                            "expected_effect",
+                        ],
                     ),
+                    intervention_context=intervention_context,
                 ),
             }
         )
@@ -3027,6 +3357,7 @@ def _command_run(args: argparse.Namespace) -> int:
     evidence_file_failures = [item for item in evidence_results["file_results"] if item.get("status") != "ok"]
     has_evidence_failures = bool(evidence_command_failures or evidence_file_failures)
     evaluation_verdict = str(evaluation.get("verdict", ""))
+    validation_verdict = str(validation_results.get("verdict", "pass"))
     result_key_excerpts: list[dict[str, str]] = _build_marker_window_excerpts(run_results.get("observation", {}))
     for finding in evaluation.get("findings", [])[:3]:
         result_key_excerpts.append(
@@ -3057,25 +3388,37 @@ def _command_run(args: argparse.Namespace) -> int:
                 severity="error",
             )
         )
-    result_decision = "success" if evaluation_verdict == "pass" and not has_evidence_failures else "continue"
-    result_failure_stage = None if result_decision == "success" else ("collect_evidence" if has_evidence_failures else "validation")
+    result_key_excerpts.extend(_validation_key_excerpts(validation_results))
+    result_decision = "success" if evaluation_verdict == "pass" and not has_evidence_failures and validation_verdict == "pass" else "continue"
+    if result_decision == "success":
+        result_failure_stage = None
+    elif has_evidence_failures:
+        result_failure_stage = "collect_evidence"
+    else:
+        result_failure_stage = "validation"
     state.transition_task(
-        TaskState.FAILED if has_evidence_failures or evaluation_verdict == "fail" else TaskState.COMPLETED,
+        TaskState.FAILED if has_evidence_failures or evaluation_verdict == "fail" or validation_verdict == "fail" else TaskState.COMPLETED,
         "Run workflow finished.",
     )
     collector.update_summary(
         {
-            "status": "run_partial" if has_evidence_failures or evaluation_verdict != "pass" else "run_completed",
+            "status": "run_partial" if has_evidence_failures or evaluation_verdict != "pass" or validation_verdict != "pass" else "run_completed",
             "run_results": run_results,
             "evaluation": evaluation,
             "evidence_results": evidence_results,
+            "validation_results": validation_results,
+            "intervention_context": intervention_context,
             "state": state.to_dict(),
             "result": build_result_contract(
                 action="run",
                 decision=result_decision,
                 failure_stage=result_failure_stage,
                 retryable=False if result_decision == "success" else True,
-                stop_reason=None if result_decision == "success" else (evaluation.get("summary") or "Run completed without satisfying the target verdict."),
+                stop_reason=None
+                if result_decision == "success"
+                else validation_results.get("summary", "Target validation failed.")
+                if result_failure_stage == "validation"
+                else (evaluation.get("summary") or "Run completed without satisfying the target verdict."),
                 key_excerpts=result_key_excerpts,
                 next_actions=[] if result_decision == "success" else _build_run_next_actions(
                     failure_stage=result_failure_stage,
@@ -3086,8 +3429,20 @@ def _command_run(args: argparse.Namespace) -> int:
                 current_session_dir=session.session_paths.root,
                 carry_forward_options=_collect_option_patch(
                     args,
-                    ["observe_seconds", "skip_evidence", "evidence_timeout"],
+                    [
+                        "observe_seconds",
+                        "skip_evidence",
+                        "evidence_timeout",
+                        "validation_command",
+                        "expect_marker",
+                        "reject_marker",
+                        "expected_version",
+                        "git_commit",
+                        "changed_file",
+                        "expected_effect",
+                    ],
                 ),
+                intervention_context=intervention_context,
             ),
         }
     )
@@ -3095,7 +3450,7 @@ def _command_run(args: argparse.Namespace) -> int:
     _print_run_report(summary)
     print(f"[DONE] Run status: {summary.get('status', 'run_completed')}")
     print(f"[DONE] Baseline checks: {len(check_results)}")
-    return 0 if not has_evidence_failures else 1
+    return 0 if result_decision == "success" else 1
 
 
 def _command_stage_sd(args: argparse.Namespace) -> int:
@@ -3862,6 +4217,16 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "bootstrap_command",
             "check_command",
             "list_command",
+            "post_pull_command",
+            "reboot_command",
+            "post_observe_seconds",
+            "validation_command",
+            "expect_marker",
+            "reject_marker",
+            "expected_version",
+            "git_commit",
+            "changed_file",
+            "expected_effect",
             "manifest_name",
             "pull_script_name",
             "serial_bundle_chunk_size",
@@ -3872,6 +4237,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "network_dir",
         ],
     )
+    intervention_context = _build_intervention_context(args)
     collector.bootstrap(
         profiles=profiles,
         state_snapshot=state,
@@ -3894,6 +4260,15 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "requested_transfer_mode": args.transfer_mode,
                 "serial_bundle_chunk_size": args.serial_bundle_chunk_size,
                 "list_command": list_command,
+                "post_pull_commands": list(args.post_pull_command),
+                "reboot_command": args.reboot_command,
+                "post_observe_seconds": args.post_observe_seconds,
+                "validation": {
+                    "validation_commands": list(args.validation_command),
+                    "expect_markers": list(args.expect_marker),
+                    "reject_markers": list(args.reject_marker),
+                    "expected_version": args.expected_version,
+                },
                 "timeout": args.timeout,
             }
         },
@@ -4035,8 +4410,20 @@ def _command_device_pull(args: argparse.Namespace) -> int:
     transfer_details: dict[str, Any] = {}
     pull_result: dict[str, Any] | None = None
     list_result: dict[str, Any] | None = None
+    post_pull_results: list[dict[str, Any]] = []
+    reboot_result: dict[str, Any] | None = None
+    post_observation: dict[str, Any] | None = None
+    validation_command_results: list[dict[str, Any]] = []
+    validation_results: dict[str, Any] = _evaluate_validation_spec(
+        expect_markers=[],
+        reject_markers=[],
+        expected_version=None,
+        observation=None,
+        command_results=[],
+    )
     manifest_path: Path | None = None
     pull_script_path: Path | None = None
+    device_pull_stage = "transfer_artifacts"
     server = None
     thread = None
 
@@ -4193,6 +4580,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 )
 
             if pull_result is not None and pull_result.get("exit_code") == 0:
+                device_pull_stage = "validate_transfer"
                 list_exec_result = _execute_structured_command(
                     controller=controller,
                     shell_command=list_command,
@@ -4207,6 +4595,74 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     summary="Listed pulled files from the device workspace",
                     payload=list_result,
                 )
+                device_pull_stage = "deploy"
+                for index, command in enumerate(args.post_pull_command, start=1):
+                    post_result = _execute_structured_command(
+                        controller=controller,
+                        shell_command=command,
+                        timeout=args.timeout,
+                        serial_port=serial_port,
+                    )
+                    _write_command_artifacts(collector=collector, prefix=f"device-pull-post-{index}", result=post_result)
+                    post_pull_results.append(post_result.to_dict())
+                    collector.append_event(
+                        event_type="device_pull_post_command",
+                        source="device_controller",
+                        summary=f"Executed post-pull command #{index}",
+                        payload=post_result.to_dict(),
+                        severity="error" if post_result.exit_code != 0 else "info",
+                    )
+                    if post_result.exit_code != 0:
+                        raise RuntimeError(f"Post-pull command failed: {command}")
+                if args.reboot_command:
+                    reboot_exec_result = _execute_structured_command(
+                        controller=controller,
+                        shell_command=args.reboot_command,
+                        timeout=args.timeout,
+                        serial_port=serial_port,
+                    )
+                    _write_command_artifacts(collector=collector, prefix="device-pull-reboot", result=reboot_exec_result)
+                    reboot_result = reboot_exec_result.to_dict()
+                    collector.append_event(
+                        event_type="device_pull_reboot_command",
+                        source="device_controller",
+                        summary="Executed reboot/restart command after pull",
+                        payload=reboot_result,
+                        severity="error" if reboot_exec_result.exit_code != 0 else "info",
+                    )
+                    if reboot_exec_result.exit_code != 0:
+                        raise RuntimeError(f"Reboot command failed: {args.reboot_command}")
+                validation_command_results = _run_validation_commands(
+                    controller=controller,
+                    collector=collector,
+                    commands=list(args.validation_command),
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                    prefix="device-pull-validation",
+                )
+                device_pull_stage = "validation"
+            if args.post_observe_seconds > 0:
+                device_pull_stage = "observe_serial"
+                observer = SerialObserver(profiles.device.serial, profiles.model)
+                observation = observer.capture(
+                    seconds=args.post_observe_seconds,
+                    log_path=session.session_paths.logs_dir / "device-pull-post-serial.log",
+                )
+                post_observation = observation.to_dict()
+                collector.append_event(
+                    event_type="device_pull_post_observation",
+                    source="serial_observer",
+                    summary=f"Captured {observation.lines_captured} post-pull serial lines.",
+                    payload=post_observation,
+                )
+            device_pull_stage = "validation"
+            validation_results = _evaluate_validation_spec(
+                expect_markers=list(args.expect_marker),
+                reject_markers=list(args.reject_marker),
+                expected_version=args.expected_version,
+                observation=post_observation,
+                command_results=validation_command_results,
+            )
     except LoginRequiredError as exc:
         collector.update_summary(
             {
@@ -4219,6 +4675,11 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "transfer_details": transfer_details,
                 "pull_result": pull_result,
                 "list_result": list_result,
+                "post_pull_results": post_pull_results,
+                "reboot_result": reboot_result,
+                "post_observation": post_observation,
+                "validation_results": validation_results,
+                "intervention_context": intervention_context,
                 "state": state.to_dict(),
                 "result": build_result_contract(
                     action="device-pull",
@@ -4231,6 +4692,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     loop_context=loop_context,
                     current_session_dir=session.session_paths.root,
                     carry_forward_options=carry_forward_options,
+                    intervention_context=intervention_context,
                 ),
             }
         )
@@ -4251,11 +4713,16 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "transfer_details": transfer_details,
                 "pull_result": pull_result,
                 "list_result": list_result,
+                "post_pull_results": post_pull_results,
+                "reboot_result": reboot_result,
+                "post_observation": post_observation,
+                "validation_results": validation_results,
+                "intervention_context": intervention_context,
                 "state": state.to_dict(),
                 "result": build_result_contract(
                     action="device-pull",
                     decision="continue",
-                    failure_stage="transfer_artifacts",
+                    failure_stage=device_pull_stage,
                     retryable=True,
                     stop_reason=str(exc),
                     key_excerpts=[build_excerpt(source="workflow_runner", label="device_pull_failed", text=str(exc), severity="error")],
@@ -4267,6 +4734,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     loop_context=loop_context,
                     current_session_dir=session.session_paths.root,
                     carry_forward_options=carry_forward_options,
+                    intervention_context=intervention_context,
                 ),
             }
         )
@@ -4284,6 +4752,9 @@ def _command_device_pull(args: argparse.Namespace) -> int:
     failed_checks = [result for result in check_results if result.get("exit_code") != 0]
     pull_failed = pull_result is None or pull_result.get("exit_code") != 0
     list_failed = list_result is None or list_result.get("exit_code") != 0
+    post_pull_failed = any(result.get("exit_code") != 0 for result in post_pull_results)
+    reboot_failed = reboot_result is not None and reboot_result.get("exit_code") != 0
+    validation_failed = validation_results.get("verdict") == "fail"
     result_key_excerpts: list[dict[str, str]] = [
         build_excerpt(
             source="network_check",
@@ -4311,6 +4782,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 severity="error",
             )
         )
+    result_key_excerpts.extend(_validation_key_excerpts(validation_results))
     result_failure_stage = None
     if failed_checks:
         result_failure_stage = "validate_connectivity"
@@ -4318,13 +4790,18 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         result_failure_stage = "transfer_artifacts"
     elif list_failed:
         result_failure_stage = "validate_transfer"
+    elif post_pull_failed or reboot_failed:
+        result_failure_stage = "deploy"
+    elif validation_failed:
+        result_failure_stage = "validation"
+    workflow_ok = not failed_checks and not pull_failed and not list_failed and not post_pull_failed and not reboot_failed and not validation_failed
     state.transition_task(
-        TaskState.COMPLETED if not failed_checks and not pull_failed and not list_failed else TaskState.FAILED,
+        TaskState.COMPLETED if workflow_ok else TaskState.FAILED,
         "Device pull finished.",
     )
     collector.update_summary(
         {
-            "status": "device_pull_completed" if not failed_checks and not pull_failed and not list_failed else "device_pull_failed",
+            "status": "device_pull_completed" if workflow_ok else "device_pull_failed",
             "bootstrap_results": bootstrap_results,
             "check_results": check_results,
             "transfer_probe": transfer_probe,
@@ -4332,24 +4809,33 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "transfer_details": transfer_details,
             "pull_result": pull_result,
             "list_result": list_result,
+            "post_pull_results": post_pull_results,
+            "reboot_result": reboot_result,
+            "post_observation": post_observation,
+            "validation_results": validation_results,
+            "intervention_context": intervention_context,
             "state": state.to_dict(),
             "result": build_result_contract(
                 action="device-pull",
-                decision="success" if not failed_checks and not pull_failed and not list_failed else "continue",
+                decision="success" if workflow_ok else "continue",
                 failure_stage=result_failure_stage,
-                retryable=False if not failed_checks and not pull_failed and not list_failed else True,
+                retryable=False if workflow_ok else True,
                 stop_reason=None
-                if not failed_checks and not pull_failed and not list_failed
+                if workflow_ok
                 else (
                     f"{len(failed_checks)} connectivity check(s) failed."
                     if failed_checks
                     else "Artifact transfer returned a non-zero exit code."
                     if pull_failed
                     else "Post-transfer listing failed."
+                    if list_failed
+                    else "Post-pull deploy command failed."
+                    if post_pull_failed or reboot_failed
+                    else validation_results.get("summary", "Target validation failed.")
                 ),
                 key_excerpts=result_key_excerpts,
                 next_actions=[]
-                if not failed_checks and not pull_failed and not list_failed
+                if workflow_ok
                 else _build_device_pull_next_actions(
                     failed_checks=failed_checks,
                     pull_failed=pull_failed,
@@ -4359,6 +4845,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 loop_context=loop_context,
                 current_session_dir=session.session_paths.root,
                 carry_forward_options=carry_forward_options,
+                intervention_context=intervention_context,
             ),
         }
     )
@@ -4372,6 +4859,10 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         print("[ERROR] Artifact transfer returned a non-zero exit code")
     elif list_failed:
         print("[ERROR] Post-transfer listing failed")
+    elif post_pull_failed or reboot_failed:
+        print("[ERROR] Post-pull deploy command failed")
+    elif validation_failed:
+        print("[ERROR] Target validation failed")
     else:
         print("[DONE] Device pull completed successfully")
     if selected_transfer_mode == "http":
@@ -4385,7 +4876,394 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             f"{bundle_info.get('chunk_count', 'unknown')} chunks"
         )
     print(f"[TODO] Session directory: {session.session_paths.root}")
-    return 0 if not failed_checks and not pull_failed and not list_failed else 1
+    return 0 if workflow_ok else 1
+
+
+def _run_host_build_command(command: str, *, timeout: float) -> dict[str, Any]:
+    completed = subprocess.run(
+        command,
+        cwd=_project_root(),
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return {
+        "command": command,
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout.splitlines(),
+        "stderr": completed.stderr.splitlines(),
+    }
+
+
+def _command_deploy_verify(args: argparse.Namespace) -> int:
+    profiles = _load_profiles_from_args(args)
+    session, loop_context = _create_session_with_loop(
+        args,
+        profiles=profiles,
+        task_type=f"{profiles.task.task_type}_deploy_verify",
+    )
+    state = StateSnapshot()
+    state.transition_task(TaskState.DEPLOYING, "Preparing closed deploy/verify workflow.")
+    collector = EvidenceCollector(session)
+    workflow_name, workflow_steps = WorkflowRunner(profiles).build_plan()
+    carry_forward_options = _collect_option_patch(
+        args,
+        [
+            "build_command",
+            "artifact",
+            "post_pull_command",
+            "reboot_command",
+            "observe_seconds",
+            "timeout",
+            "validation_command",
+            "expect_marker",
+            "reject_marker",
+            "expected_version",
+            "git_commit",
+            "changed_file",
+            "expected_effect",
+        ],
+    )
+    collector.bootstrap(
+        profiles=profiles,
+        state_snapshot=state,
+        workflow_name=f"{workflow_name}_deploy_verify",
+        workflow_steps=WorkflowRunner.as_dicts(workflow_steps),
+        action_name="deploy-verify",
+        loop_context=loop_context,
+        plan_details={
+            "closed_loop": {
+                "build_command": args.build_command,
+                "artifact": str(args.artifact) if args.artifact else None,
+                "post_pull_commands": list(args.post_pull_command),
+                "reboot_command": args.reboot_command,
+                "observe_seconds": args.observe_seconds,
+                "validation_commands": list(args.validation_command),
+                "expect_markers": list(args.expect_marker),
+                "reject_markers": list(args.reject_marker),
+                "expected_version": args.expected_version,
+            }
+        },
+    )
+
+    artifact_path = args.artifact.resolve() if args.artifact else None
+    artifact_sha256: str | None = None
+    build_result: dict[str, Any] | None = None
+    deploy_results: list[dict[str, Any]] = []
+    reboot_result: dict[str, Any] | None = None
+    observation: dict[str, Any] | None = None
+    validation_command_results: list[dict[str, Any]] = []
+    validation_results: dict[str, Any] = _evaluate_validation_spec(
+        expect_markers=[],
+        reject_markers=[],
+        expected_version=None,
+        observation=None,
+        command_results=[],
+    )
+
+    try:
+        if args.build_command:
+            state.transition_task(TaskState.RUNNING_CHECKS, "Running host build command.")
+            collector.update_summary({"state": state.to_dict()})
+            build_result = _run_host_build_command(args.build_command, timeout=max(args.timeout, 1.0))
+            collector.write_text_artifact(
+                "logs/deploy-verify-build-stdout.log",
+                "\n".join(build_result["stdout"]) + ("\n" if build_result["stdout"] else ""),
+            )
+            collector.write_text_artifact(
+                "logs/deploy-verify-build-stderr.log",
+                "\n".join(build_result["stderr"]) + ("\n" if build_result["stderr"] else ""),
+            )
+            collector.append_event(
+                event_type="deploy_verify_build",
+                source="host",
+                summary="Executed host build command",
+                payload=build_result,
+                severity="error" if build_result["exit_code"] != 0 else "info",
+            )
+            if build_result["exit_code"] != 0:
+                raise RuntimeError("Host build command failed.")
+
+        if artifact_path is not None:
+            if not artifact_path.is_file():
+                raise FileNotFoundError(f"Artifact does not exist: {artifact_path}")
+            artifact_sha256 = _hash_file_sha256(artifact_path)
+            collector.write_text_artifact(
+                "deploy/artifact.json",
+                json.dumps(
+                    {
+                        "path": str(artifact_path),
+                        "size_bytes": artifact_path.stat().st_size,
+                        "sha256": artifact_sha256,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+            )
+
+        intervention_context = _build_intervention_context(
+            args,
+            artifact=artifact_path,
+            artifact_sha256=artifact_sha256,
+            build_result=build_result,
+        )
+
+        if artifact_path is not None and not args.post_pull_command and not args.reboot_command:
+            collector.update_summary(
+                {
+                    "status": "deploy_verify_manual_required",
+                    "build_result": build_result,
+                    "deploy_results": deploy_results,
+                    "reboot_result": reboot_result,
+                    "post_observation": observation,
+                    "validation_results": validation_results,
+                    "intervention_context": intervention_context,
+                    "state": state.to_dict(),
+                    "result": build_result_contract(
+                        action="deploy-verify",
+                        decision="manual_required",
+                        failure_stage="manual_upgrade",
+                        retryable=True,
+                        stop_reason="Artifact is available but no device-side deploy/restart command was provided.",
+                        key_excerpts=[
+                            build_excerpt(
+                                source="workflow_runner",
+                                label="manual_upgrade_required",
+                                text="Provide --post-pull-command and/or --reboot-command so the artifact is applied on the device.",
+                                severity="warning",
+                            )
+                        ],
+                        next_actions=_build_deploy_verify_next_actions(failure_stage="manual_upgrade"),
+                        loop_context=loop_context,
+                        current_session_dir=session.session_paths.root,
+                        carry_forward_options=carry_forward_options,
+                        intervention_context=intervention_context,
+                    ),
+                }
+            )
+            print("[ ●●●○○ ] 3/5 steps")
+            print("[ERROR] Manual upgrade command is required")
+            print("[TODO] Pass --post-pull-command and/or --reboot-command, then retry deploy-verify.")
+            print(f"[TODO] Session directory: {session.session_paths.root}")
+            return 1
+
+        controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+        if args.post_pull_command or args.reboot_command or args.validation_command:
+            state.transition_device(DeviceState.ROOT_SHELL, "Deploy/verify uses an interactive root shell.")
+            collector.update_summary({"state": state.to_dict()})
+            with open_serial_port(
+                profiles.device.serial.port,
+                profiles.device.serial.baudrate,
+                timeout=0.2,
+            ) as serial_port:
+                for index, command in enumerate(args.post_pull_command, start=1):
+                    result = _execute_structured_command(
+                        controller=controller,
+                        shell_command=command,
+                        timeout=args.timeout,
+                        serial_port=serial_port,
+                    )
+                    _write_command_artifacts(collector=collector, prefix=f"deploy-verify-deploy-{index}", result=result)
+                    deploy_results.append(result.to_dict())
+                    collector.append_event(
+                        event_type="deploy_verify_deploy_command",
+                        source="device_controller",
+                        summary=f"Executed deploy command #{index}",
+                        payload=result.to_dict(),
+                        severity="error" if result.exit_code != 0 else "info",
+                    )
+                    if result.exit_code != 0:
+                        raise RuntimeError(f"Deploy command failed: {command}")
+                if args.reboot_command:
+                    reboot_exec_result = _execute_structured_command(
+                        controller=controller,
+                        shell_command=args.reboot_command,
+                        timeout=args.timeout,
+                        serial_port=serial_port,
+                    )
+                    _write_command_artifacts(collector=collector, prefix="deploy-verify-reboot", result=reboot_exec_result)
+                    reboot_result = reboot_exec_result.to_dict()
+                    collector.append_event(
+                        event_type="deploy_verify_reboot_command",
+                        source="device_controller",
+                        summary="Executed deploy restart/reboot command",
+                        payload=reboot_result,
+                        severity="error" if reboot_exec_result.exit_code != 0 else "info",
+                    )
+                    if reboot_exec_result.exit_code != 0:
+                        raise RuntimeError(f"Reboot command failed: {args.reboot_command}")
+                validation_command_results = _run_validation_commands(
+                    controller=controller,
+                    collector=collector,
+                    commands=list(args.validation_command),
+                    timeout=args.timeout,
+                    serial_port=serial_port,
+                    prefix="deploy-verify-validation",
+                )
+
+        if args.observe_seconds > 0:
+            state.transition_task(TaskState.WAITING_BOOT, f"Observing serial for {args.observe_seconds:.1f}s.")
+            collector.update_summary({"state": state.to_dict()})
+            observer = SerialObserver(profiles.device.serial, profiles.model)
+            captured = observer.capture(
+                seconds=args.observe_seconds,
+                log_path=session.session_paths.logs_dir / "deploy-verify-serial.log",
+            )
+            observation = captured.to_dict()
+            collector.append_event(
+                event_type="deploy_verify_observation",
+                source="serial_observer",
+                summary=f"Captured {captured.lines_captured} deploy/verify serial lines.",
+                payload=observation,
+            )
+
+        validation_results = _evaluate_validation_spec(
+            expect_markers=list(args.expect_marker),
+            reject_markers=list(args.reject_marker),
+            expected_version=args.expected_version,
+            observation=observation,
+            command_results=validation_command_results,
+        )
+    except LoginRequiredError as exc:
+        intervention_context = _build_intervention_context(
+            args,
+            artifact=artifact_path,
+            artifact_sha256=artifact_sha256,
+            build_result=build_result,
+        )
+        collector.update_summary(
+            {
+                "status": "deploy_verify_blocked",
+                "error": str(exc),
+                "build_result": build_result,
+                "deploy_results": deploy_results,
+                "reboot_result": reboot_result,
+                "post_observation": observation,
+                "validation_results": validation_results,
+                "intervention_context": intervention_context,
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="deploy-verify",
+                    decision="blocked",
+                    failure_stage="establish_control",
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="device_controller", label="login_required", text=str(exc), severity="warning")],
+                    next_actions=_build_deploy_verify_next_actions(failure_stage="establish_control"),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                    intervention_context=intervention_context,
+                ),
+            }
+        )
+        print("[ ●●○○○ ] 2/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry deploy-verify.")
+        return 1
+    except Exception as exc:
+        intervention_context = _build_intervention_context(
+            args,
+            artifact=artifact_path,
+            artifact_sha256=artifact_sha256,
+            build_result=build_result,
+        )
+        failure_stage = "build" if build_result and build_result.get("exit_code") != 0 else "prepare_artifact" if isinstance(exc, FileNotFoundError) else "deploy"
+        collector.update_summary(
+            {
+                "status": "deploy_verify_failed",
+                "error": str(exc),
+                "build_result": build_result,
+                "deploy_results": deploy_results,
+                "reboot_result": reboot_result,
+                "post_observation": observation,
+                "validation_results": validation_results,
+                "intervention_context": intervention_context,
+                "state": state.to_dict(),
+                "result": build_result_contract(
+                    action="deploy-verify",
+                    decision="continue",
+                    failure_stage=failure_stage,
+                    retryable=True,
+                    stop_reason=str(exc),
+                    key_excerpts=[build_excerpt(source="workflow_runner", label=failure_stage, text=str(exc), severity="error")],
+                    next_actions=_build_deploy_verify_next_actions(failure_stage=failure_stage),
+                    loop_context=loop_context,
+                    current_session_dir=session.session_paths.root,
+                    carry_forward_options=carry_forward_options,
+                    intervention_context=intervention_context,
+                ),
+            }
+        )
+        print("[ ●●○○○ ] 2/5 steps")
+        print(f"[ERROR] deploy-verify failed: {exc}")
+        print("[TODO] Check the latest session summary for the failing stage.")
+        return 1
+
+    intervention_context = _build_intervention_context(
+        args,
+        artifact=artifact_path,
+        artifact_sha256=artifact_sha256,
+        build_result=build_result,
+    )
+    validation_missing = not _has_validation_spec(args)
+    validation_failed = validation_results.get("verdict") == "fail"
+    decision = "manual_required" if validation_missing else "continue" if validation_failed else "success"
+    failure_stage = "validation" if validation_failed or validation_missing else None
+    state.transition_task(TaskState.COMPLETED if decision == "success" else TaskState.FAILED, "Deploy/verify workflow finished.")
+    collector.update_summary(
+        {
+            "status": "deploy_verify_completed" if decision == "success" else "deploy_verify_manual_required" if validation_missing else "deploy_verify_failed",
+            "build_result": build_result,
+            "deploy_results": deploy_results,
+            "reboot_result": reboot_result,
+            "post_observation": observation,
+            "validation_results": validation_results,
+            "intervention_context": intervention_context,
+            "state": state.to_dict(),
+            "result": build_result_contract(
+                action="deploy-verify",
+                decision=decision,
+                failure_stage=failure_stage,
+                retryable=decision != "success",
+                stop_reason=None
+                if decision == "success"
+                else "No target-specific validation criteria were provided."
+                if validation_missing
+                else validation_results.get("summary", "Target validation failed."),
+                key_excerpts=_validation_key_excerpts(validation_results)
+                if validation_failed
+                else [
+                    build_excerpt(
+                        source="workflow_runner",
+                        label="validation_required",
+                        text="Pass --validation-command, --expect-marker, --reject-marker, or --expected-version to confirm the fix.",
+                        severity="warning",
+                    )
+                ]
+                if validation_missing
+                else [],
+                next_actions=[] if decision == "success" else _build_deploy_verify_next_actions(failure_stage=failure_stage),
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=carry_forward_options,
+                intervention_context=intervention_context,
+            ),
+        }
+    )
+    print("[ ●●●●○ ] 4/5 steps")
+    print(f"[DONE] Deploy commands: {len(deploy_results)}")
+    print(f"[DONE] Validation commands: {len(validation_command_results)}")
+    if decision == "success":
+        print("[DONE] Deploy/verify completed successfully")
+    elif validation_missing:
+        print("[ERROR] Target validation criteria missing")
+    else:
+        print("[ERROR] Target validation failed")
+    print(f"[TODO] Session directory: {session.session_paths.root}")
+    return 0 if decision == "success" else 1
 
 
 def _command_health(args: argparse.Namespace) -> int:
@@ -5481,6 +6359,8 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_artifact_server(args)
     if args.command == "device-pull":
         return _command_device_pull(args)
+    if args.command == "deploy-verify":
+        return _command_deploy_verify(args)
     if args.command == "observe":
         return _command_observe(args)
     if args.command == "exec":

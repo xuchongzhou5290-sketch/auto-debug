@@ -19,6 +19,7 @@ from autodbg.cli.main import _build_parser, _dispatch_command
 
 SERVER_NAME = "embedded-device-auto-debug-mcp"
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+MAX_LSP_CONTENT_LENGTH = 10 * 1024 * 1024
 
 
 def _build_agent_request_schema(
@@ -342,7 +343,13 @@ def _read_mcp_message(stream: BinaryIO) -> dict[str, Any] | None:
             length_text = headers.get("content-length")
             if not length_text:
                 raise json.JSONDecodeError("Missing Content-Length header.", "", 0)
-            payload = stream.read(int(length_text))
+            try:
+                length = int(length_text)
+            except ValueError as exc:
+                raise json.JSONDecodeError("Invalid Content-Length header.", "", 0) from exc
+            if length <= 0 or length > MAX_LSP_CONTENT_LENGTH:
+                raise json.JSONDecodeError("Invalid Content-Length header.", "", 0)
+            payload = stream.read(length)
             return json.loads(payload.decode("utf-8"))
 
         # 默认：newline-delimited JSON。

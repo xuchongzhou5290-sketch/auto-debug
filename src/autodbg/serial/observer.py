@@ -255,23 +255,23 @@ class SerialObserver:
             )
 
         for marker in self.model_profile.fatal_markers:
-            if marker.lower() in line.lower():
+            if _marker_in_line(marker, line):
                 return MarkerHit(marker=marker, line=line, tag="fatal", device_state=DeviceState.PANIC_OR_HANG.value)
 
         for marker in self.model_profile.app_ready_markers:
-            if marker in line:
+            if _marker_in_line(marker, line):
                 return MarkerHit(marker=marker, line=line, tag="app_ready", device_state=DeviceState.APP_READY.value)
 
         for marker in self.model_profile.success_markers:
-            if marker.lower() in line.lower():
+            if _marker_in_line(marker, line):
                 return MarkerHit(marker=marker, line=line, tag="success", device_state=DeviceState.APP_READY.value)
 
         for marker in self.model_profile.app_start_markers:
-            if marker in line:
+            if _marker_in_line(marker, line):
                 return MarkerHit(marker=marker, line=line, tag="app_start", device_state=DeviceState.APP_STARTING.value)
 
         for marker in self.model_profile.panic_markers:
-            if marker.lower() in line.lower():
+            if _marker_in_line(marker, line):
                 return MarkerHit(marker=marker, line=line, tag="panic", device_state=DeviceState.PANIC_OR_HANG.value)
 
         if "U-Boot" in line:
@@ -281,3 +281,7 @@ class SerialObserver:
             return MarkerHit(marker="kernel", line=line, tag="kernel", device_state=DeviceState.KERNEL_BOOTING.value)
 
         return None
+
+
+def _marker_in_line(marker: str, line: str) -> bool:
+    return marker.lower() in line.lower()

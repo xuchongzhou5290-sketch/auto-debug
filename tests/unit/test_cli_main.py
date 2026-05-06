@@ -52,6 +52,7 @@ from autodbg.cli.main import (
     _parse_fetch_output_lines,
     _print_watch_trace_entry,
     _extract_structured_output_lines,
+    _evaluate_validation_spec,
     _load_profiles_from_args,
     _read_trace_entries,
     _resolve_watch_start_index,
@@ -402,6 +403,58 @@ class CliMainTest(unittest.TestCase):
         self.assertIsNone(args.task)
         self.assertIsNone(args.transport)
 
+    def test_build_parser_accepts_deploy_verify_closed_loop_args(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "deploy-verify",
+                "--build-command",
+                "make app",
+                "--artifact",
+                "payloads/APP.bin",
+                "--post-pull-command",
+                "lanupg /mnt/sdcard/APP.bin",
+                "--reboot-command",
+                "reboot",
+                "--expect-marker",
+                "LeCam ready",
+                "--reject-marker",
+                "panic",
+                "--expected-version",
+                "2.0.0.300",
+            ]
+        )
+
+        self.assertEqual(args.command, "deploy-verify")
+        self.assertEqual(args.build_command, "make app")
+        self.assertEqual(args.artifact, Path("payloads/APP.bin"))
+        self.assertEqual(args.post_pull_command, ["lanupg /mnt/sdcard/APP.bin"])
+        self.assertEqual(args.reboot_command, "reboot")
+        self.assertEqual(args.expect_marker, ["LeCam ready"])
+        self.assertEqual(args.reject_marker, ["panic"])
+        self.assertEqual(args.expected_version, "2.0.0.300")
+
+    def test_evaluate_validation_spec_requires_expected_markers_and_rejects_bad_markers(self) -> None:
+        validation = _evaluate_validation_spec(
+            expect_markers=["ready"],
+            reject_markers=["panic"],
+            expected_version="2.0.0.300",
+            observation={"last_lines": ["boot complete", "panic: demo"]},
+            command_results=[
+                {
+                    "command": "cat /opt/appver.txt",
+                    "exit_code": 0,
+                    "output_lines": ["2.0.0.299"],
+                }
+            ],
+        )
+
+        self.assertEqual(validation["verdict"], "fail")
+        check_names = [finding["check_name"] for finding in validation["findings"]]
+        self.assertIn("expect_marker", check_names)
+        self.assertIn("reject_marker", check_names)
+        self.assertIn("expected_version", check_names)
+
     def test_load_profiles_from_args_uses_defaults_manifest(self) -> None:
         root = Path(__file__).resolve().parents[2]
         args = argparse.Namespace(
@@ -437,6 +490,13 @@ class CliMainTest(unittest.TestCase):
                 observe_seconds=1.0,
                 skip_evidence=False,
                 evidence_timeout=12.5,
+                validation_command=[],
+                expect_marker=[],
+                reject_marker=[],
+                expected_version=None,
+                git_commit=None,
+                changed_file=[],
+                expected_effect=None,
             )
             serial_handle = object()
             baseline_results = [
@@ -578,30 +638,37 @@ class CliMainTest(unittest.TestCase):
         )
 
     def test_command_watch_serial_can_use_serial_settings_defaults(self) -> None:
-        args = argparse.Namespace(
-            serial_port=None,
-            tail=0,
-            follow=True,
-            show_system=False,
-            raw_live=True,
-            baudrate=None,
-            stdin_probe=False,
-            stdin_shell=False,
-            settings=Path(__file__).resolve().parents[2] / "config" / "user-settings.toml",
-        )
+        with tempfile.TemporaryDirectory() as settings_dir:
+            settings_path = Path(settings_dir) / "user-settings.toml"
+            settings_path.write_text(
+                "\n".join(["[serial]", 'port = "COM19"', "baudrate = 115200", ""]),
+                encoding="utf-8",
+                newline="\n",
+            )
+            args = argparse.Namespace(
+                serial_port=None,
+                tail=0,
+                follow=True,
+                show_system=False,
+                raw_live=True,
+                baudrate=None,
+                stdin_probe=False,
+                stdin_shell=False,
+                settings=settings_path,
+            )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            trace_path = Path(temp_dir) / "com19.jsonl"
-            broker_mock = unittest.mock.Mock()
-            with (
-                patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path) as trace_path_mock,
-                patch("autodbg.cli.main._read_trace_entries", return_value=[]),
-                patch("autodbg.cli.main.load_serial_broker_registry", return_value=None),
-                patch("autodbg.cli.main.SerialBroker", return_value=broker_mock) as broker_ctor,
-                patch("autodbg.cli.main.time.sleep", side_effect=KeyboardInterrupt),
-                patch("builtins.print") as print_mock,
-            ):
-                exit_code = _command_watch_serial(args)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                trace_path = Path(temp_dir) / "com19.jsonl"
+                broker_mock = unittest.mock.Mock()
+                with (
+                    patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path) as trace_path_mock,
+                    patch("autodbg.cli.main._read_trace_entries", return_value=[]),
+                    patch("autodbg.cli.main.load_serial_broker_registry", return_value=None),
+                    patch("autodbg.cli.main.SerialBroker", return_value=broker_mock) as broker_ctor,
+                    patch("autodbg.cli.main.time.sleep", side_effect=KeyboardInterrupt),
+                    patch("builtins.print") as print_mock,
+                ):
+                    exit_code = _command_watch_serial(args)
 
         self.assertEqual(exit_code, 0)
         trace_path_mock.assert_called_once_with("COM19")

@@ -31,6 +31,32 @@ class SessionContractTest(unittest.TestCase):
         )
         self.assertEqual(result["carry_forward_request"]["options"]["observe_seconds"], 3.0)
 
+    def test_build_result_contract_carries_intervention_context(self) -> None:
+        result = build_result_contract(
+            action="deploy-verify",
+            decision="manual_required",
+            failure_stage="manual_upgrade",
+            retryable=True,
+            loop_context={
+                "goal_id": "upgrade-fix-001",
+                "goal": "Upgrade and confirm fix",
+                "iteration": 1,
+            },
+            current_session_dir=Path("C:/repo/auto-debug/artifacts/20260420/deploy-session"),
+            carry_forward_options={"artifact": "payloads/APP.bin"},
+            intervention_context={
+                "git_commit": "abc1234",
+                "artifact_sha256": "deadbeef",
+                "expected_effect": "APP_READY appears",
+            },
+        )
+
+        self.assertEqual(result["intervention_context"]["git_commit"], "abc1234")
+        self.assertEqual(
+            result["carry_forward_request"]["intervention_context"]["artifact_sha256"],
+            "deadbeef",
+        )
+
     def test_build_intervention_record_defaults_to_empty_metadata(self) -> None:
         record = build_intervention_record(
             kind="ai_patch",

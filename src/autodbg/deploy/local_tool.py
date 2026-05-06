@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import os
 import shutil
+import stat
 from pathlib import Path
 
 
@@ -93,7 +96,17 @@ def _copy_tree(source: Path, destination: Path) -> None:
 
 def _copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_existing_file_for_replace(destination)
     shutil.copy2(source, destination)
+
+
+def _prepare_existing_file_for_replace(path: Path) -> None:
+    if not path.exists():
+        return
+    if os.name == "nt":
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)
+    path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    path.unlink()
 
 
 def _copy_tree_contents(source: Path, destination: Path, *, ignore_names: set[str]) -> None:

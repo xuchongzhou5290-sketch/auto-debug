@@ -1,6 +1,10 @@
+import ctypes
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from autodbg.deploy.local_tool import install_local_tool
 
@@ -77,6 +81,39 @@ class LocalToolInstallTest(unittest.TestCase):
                 (install_root / "config" / "user-settings.toml").read_text(encoding="utf-8"),
                 "custom=1\n",
             )
+
+    def test_install_local_tool_replaces_hidden_readonly_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_root = root / "project"
+            install_root = root / "installed"
+            project_root.mkdir(parents=True)
+            install_root.mkdir(parents=True)
+            (project_root / ".gitignore").write_text("new\n", encoding="utf-8", newline="\n")
+            target = install_root / ".gitignore"
+            target.write_text("old\n", encoding="utf-8", newline="\n")
+            target.chmod(stat.S_IREAD)
+            if os.name == "nt":
+                ctypes.windll.kernel32.SetFileAttributesW(str(target), 0x2)
+
+            try:
+                with patch("autodbg.deploy.local_tool.LOCAL_COPY_DIRS", []), patch(
+                    "autodbg.deploy.local_tool.LOCAL_COPY_FILES",
+                    [".gitignore"],
+                ):
+                    install_local_tool(
+                        project_root=project_root,
+                        install_root=install_root,
+                        include_venv=False,
+                        include_local_settings=False,
+                    )
+
+                self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+            finally:
+                if target.exists():
+                    if os.name == "nt":
+                        ctypes.windll.kernel32.SetFileAttributesW(str(target), 0x80)
+                    target.chmod(stat.S_IWRITE | stat.S_IREAD)
 
 
 if __name__ == "__main__":

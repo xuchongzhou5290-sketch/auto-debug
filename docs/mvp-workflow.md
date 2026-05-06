@@ -43,8 +43,8 @@ flowchart TD
     G -->|success| H["Stop loop"]
     G -->|continue| I["Prepare next iteration"]
     G -->|blocked| J["Wait for prerequisite fix"]
-    G -->|manual_required| K["Reserved state\nnot emitted yet"]
-    G -->|stalled| L["Reserved state\nnot emitted yet"]
+    G -->|manual_required| K["Pause for operator action\nthen resume carry-forward request"]
+    G -->|stalled| L["No progress across attempts\nrequires new input"]
     G -->|pending| M["Abnormal state\niteration did not close cleanly"]
 
     I --> N["Read next_actions"]
@@ -65,7 +65,8 @@ Current stop / pause semantics:
 - `success`: stop the multi-iteration loop
 - `continue`: soft break; upper-layer AI should inspect `failure_stage`, apply changes, then use `carry_forward_request`
 - `blocked`: hard break; fix prerequisites first, then continue
-- `manual_required` / `stalled`: reserved by the contract but not emitted by the current code yet
+- `manual_required`: emitted when `deploy-verify` has a build artifact but no concrete device-side apply/restart step, or when a closed loop runs without target-specific validation criteria. The caller should ask the developer for the missing manual step or validation signal, then resume from `carry_forward_request`
+- `stalled`: emitted by the contract for repeated no-progress loops. Built-in commands preserve the state so upper-layer agents can stop retrying and request new evidence or human intervention
 - `pending`: bootstrap default only; if it remains at the end, treat the iteration as abnormal
 
 Common `failure_stage` breakpoints in the current implementation:
@@ -85,6 +86,21 @@ Common `failure_stage` breakpoints in the current implementation:
 - `fetch_path`
 - `deploy_artifacts`
 - `running_checks`
+
+## Closed Deploy/Verify Loop
+
+Use `deploy-verify` when the task is not just "check device health" but "prove this code change reached the device and fixed the reported issue".
+
+Minimal inputs:
+
+- `--build-command`: optional host-side build command
+- `--artifact`: optional local file recorded with size and SHA256
+- `--post-pull-command`: repeatable device-side deploy/apply command
+- `--reboot-command`: optional device restart command
+- `--observe-seconds`: serial observation window after deploy/restart
+- `--validation-command`, `--expect-marker`, `--reject-marker`, `--expected-version`: target-specific success criteria
+
+`device-pull` can also run `--post-pull-command`, `--reboot-command`, post observation, and the same validation flags after transfer. This keeps the artifact transfer path from stopping at "file copied" when the developer actually needs an upgrade-and-verify loop.
 
 ## First CLI Entry
 

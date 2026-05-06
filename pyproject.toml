@@ -11,11 +11,12 @@ requires-python = ">=3.11"
 authors = [
   { name = "Codex" }
 ]
-dependencies = []
+dependencies = [
+  "pyserial>=3.5",
+]
 
 [project.optional-dependencies]
 full = [
-  "pyserial>=3.5",
   "requests>=2.32.0",
   "pydantic>=2.8.0",
   "typer>=0.12.0",

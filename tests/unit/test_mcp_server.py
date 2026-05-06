@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import tempfile
@@ -5,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from autodbg.mcp.server import build_mcp_tools, call_mcp_tool, dispatch_mcp_request
+from autodbg.mcp.server import build_mcp_tools, call_mcp_tool, dispatch_mcp_request, _read_mcp_message
 
 
 class McpServerTest(unittest.TestCase):
@@ -104,6 +105,21 @@ class McpServerTest(unittest.TestCase):
 
         self.assertEqual(response["error"]["code"], -32602)
         self.assertIn("Unsupported MCP tool", response["error"]["message"])
+
+    def test_read_mcp_message_rejects_invalid_content_length(self) -> None:
+        with self.assertRaises(json.JSONDecodeError):
+            _read_mcp_message(io.BytesIO(b"Content-Length: -1\r\n\r\n{}"))
+
+        with self.assertRaises(json.JSONDecodeError):
+            _read_mcp_message(io.BytesIO(b"Content-Length: 10485761\r\n\r\n{}"))
+
+    def test_read_mcp_message_accepts_lsp_content_length(self) -> None:
+        payload = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        stream = io.BytesIO(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
+
+        message = _read_mcp_message(stream)
+
+        self.assertEqual(message["method"], "tools/list")
 
 
 if __name__ == "__main__":

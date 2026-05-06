@@ -41,6 +41,7 @@ def build_next_iteration_request(
     loop_context: dict[str, Any] | None,
     current_session_dir: Path | None,
     options: dict[str, Any] | None = None,
+    intervention_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if loop_context is None or current_session_dir is None:
         return {}
@@ -61,6 +62,8 @@ def build_next_iteration_request(
     }
     if options:
         request["options"] = dict(options)
+    if intervention_context:
+        request["intervention_context"] = dict(intervention_context)
     return request
 
 
@@ -77,6 +80,7 @@ def build_result_contract(
     current_session_dir: Path | None = None,
     carry_forward_action: str | None = None,
     carry_forward_options: dict[str, Any] | None = None,
+    intervention_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = default_result_contract(action=action)
     result["decision"] = decision
@@ -90,7 +94,10 @@ def build_result_contract(
         loop_context=loop_context,
         current_session_dir=current_session_dir,
         options=carry_forward_options,
+        intervention_context=intervention_context,
     )
+    if intervention_context:
+        result["intervention_context"] = dict(intervention_context)
     if decision in {"continue", "blocked", "manual_required", "stalled"} and carry_forward_request:
         result["carry_forward_request"] = carry_forward_request
     return result

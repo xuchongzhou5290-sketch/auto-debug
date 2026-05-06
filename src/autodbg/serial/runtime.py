@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
 import signal
 import socket
 import tempfile
@@ -15,9 +16,7 @@ import threading
 import time
 from typing import Protocol
 
-if os.name == "nt":  # pragma: no cover - exercised in Windows runtime
-    import ctypes
-    from ctypes import wintypes
+from autodbg.utils.process import pid_is_running
 
 
 class SerialPortProtocol(Protocol):
@@ -260,27 +259,11 @@ def _open_direct_serial_port(port: str, baudrate: int, timeout: float = 0.2):
 @contextmanager
 def _acquire_port_lock(port: str):
     lock_path = _serial_lock_path(port)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd: int | None = None
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    with _acquire_pid_lock(
+        lock_path,
+        busy_message=f"Serial port {port} is already in use by another autodbg process.",
+    ):
         yield
-    except FileExistsError as exc:
-        if _remove_stale_lock(lock_path):
-            with _acquire_port_lock(port):
-                yield
-            return
-        raise SerialPortBusyError(
-            f"Serial port {port} is already in use by another autodbg process."
-        ) from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                pass
 
 
 def _serial_lock_dir() -> Path:
@@ -294,27 +277,35 @@ def _serial_lock_path(port: str) -> Path:
 @contextmanager
 def _acquire_control_lock(port: str):
     lock_path = _serial_control_lock_path(port)
+    with _acquire_pid_lock(
+        lock_path,
+        busy_message=f"Serial port {port} is already in use by another autodbg control session.",
+    ):
+        yield
+
+
+@contextmanager
+def _acquire_pid_lock(lock_path: Path, *, busy_message: str):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd: int | None = None
+    for attempt in range(3):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            break
+        except FileExistsError as exc:
+            if not _remove_stale_lock(lock_path):
+                raise SerialPortBusyError(busy_message) from exc
+            time.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
+    else:
+        raise SerialPortBusyError(busy_message)
+
     try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
         yield
-    except FileExistsError as exc:
-        if _remove_stale_lock(lock_path):
-            with _acquire_control_lock(port):
-                yield
-            return
-        raise SerialPortBusyError(
-            f"Serial port {port} is already in use by another autodbg control session."
-        ) from exc
     finally:
         if fd is not None:
             os.close(fd)
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                pass
+            _release_pid_lock(lock_path)
 
 
 def _serial_control_lock_dir() -> Path:
@@ -430,6 +421,8 @@ def _cleanup_serial_broker_artifacts(port: str) -> None:
 def _terminate_pid(pid: int) -> None:
     if pid <= 0:
         return
+    # On Windows, SIGTERM is implemented by Python with TerminateProcess.
+    # The serial broker is a helper process and forceful termination is intentional here.
     os.kill(pid, signal.SIGTERM)
 
 
@@ -460,19 +453,16 @@ def _read_lock_pid(lock_path: Path) -> int | None:
 
 
 def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        process = ctypes.windll.kernel32.OpenProcess(0x1000, False, wintypes.DWORD(pid))
-        if process:
-            ctypes.windll.kernel32.CloseHandle(process)
-            return True
-        return False
+    return pid_is_running(pid)
+
+
+def _release_pid_lock(lock_path: Path) -> None:
+    if _read_lock_pid(lock_path) != os.getpid():
+        return
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _serial_trace_dir() -> Path:

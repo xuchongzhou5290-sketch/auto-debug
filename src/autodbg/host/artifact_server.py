@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -14,6 +13,9 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+from autodbg.utils.hash import sha256_file
+from autodbg.utils.process import pid_is_running
 
 DEFAULT_HEALTH_NAME = "__autodbg_health.json"
 
@@ -96,7 +98,7 @@ def build_manifest(
         entry = ArtifactEntry(
             relative_path=relative_path,
             size_bytes=path.stat().st_size,
-            sha256=_sha256_file(path),
+            sha256=sha256_file(path),
             url=f"{base_url.rstrip('/')}/{relative_path}" if base_url else None,
         )
         entries.append(entry.to_dict())
@@ -355,28 +357,7 @@ def probe_http_url(url: str, *, timeout: float = 0.5) -> bool:
 
 
 def artifact_server_pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        process_query_limited_information = 0x1000
-        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
-        if not handle:
-            return False
-        try:
-            exit_code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return exit_code.value == 259
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return pid_is_running(pid)
 
 
 def stop_artifact_server(port: int, *, timeout_seconds: float = 3.0) -> dict[str, Any]:
@@ -398,15 +379,6 @@ def stop_artifact_server(port: int, *, timeout_seconds: float = 3.0) -> dict[str
 
     remove_artifact_server_registry(port)
     return {"status": "stopped", "port": int(port), "pid": registry.pid}
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
 
 def _sh_single_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"

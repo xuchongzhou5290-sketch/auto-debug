@@ -17,6 +17,7 @@ _PROFILE_ACTIONS = {
     "stage-sd",
     "bootstrap-network",
     "device-pull",
+    "deploy-verify",
     "observe",
     "exec",
     "fetch-file",
@@ -117,6 +118,11 @@ _FIELD_PROMPTS: dict[str, dict[str, Any]] = {
         "question": "请提供要下发或复制的本地源文件路径。",
         "example": "payloads\\APP_FT.bin",
     },
+    "artifact": {
+        "target": "options",
+        "question": "请提供本轮要部署或验证的本地产物路径。",
+        "example": "payloads\\APP_FT.bin",
+    },
     "session_dir": {
         "target": "options",
         "question": "请提供要读取或记录的 session 目录。",
@@ -169,6 +175,7 @@ _DEFAULT_ACTION_SUGGESTIONS = [
     {"action": "watch-serial", "when": "用户想实时看串口或确认设备是否在刷日志"},
     {"action": "run", "when": "用户想跑一轮启动观察、检查和结构化 verdict"},
     {"action": "health", "when": "用户想审计设备进程、SD、网络等健康状态"},
+    {"action": "deploy-verify", "when": "用户想闭环执行构建、部署、重启、串口观察和目标验证"},
     {"action": "fetch-file", "when": "用户想从设备拉取单个文件"},
     {"action": "device-pull", "when": "用户想让设备从 PC artifact server 拉取文件"},
     {"action": "report", "when": "用户想查看已有 session 报告"},
@@ -271,7 +278,44 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "summary": "Serve local artifacts and trigger a device-side pull via LAN or serial bundle fallback.",
         "required_connection": ["serial_port", "device_password"],
         "recommended_connection": ["wifi_ssid", "wifi_password", "wifi_mode", "host_ip", "pull_base_url"],
-        "common_options": ["mode", "transfer_mode", "workspace", "port", "bind", "list_command", "timeout"],
+        "common_options": [
+            "mode",
+            "transfer_mode",
+            "workspace",
+            "port",
+            "bind",
+            "list_command",
+            "post_pull_command",
+            "reboot_command",
+            "post_observe_seconds",
+            "validation_command",
+            "expect_marker",
+            "reject_marker",
+            "expected_version",
+            "timeout",
+        ],
+        "creates_session": True,
+    },
+    "deploy-verify": {
+        "category": "workflow",
+        "summary": "Run one closed debug loop: optional host build, device deploy/apply commands, restart, serial observation, and target-specific validation.",
+        "required_connection": ["serial_port", "device_password"],
+        "recommended_connection": ["host_ip", "pull_base_url"],
+        "common_options": [
+            "build_command",
+            "artifact",
+            "post_pull_command",
+            "reboot_command",
+            "observe_seconds",
+            "validation_command",
+            "expect_marker",
+            "reject_marker",
+            "expected_version",
+            "git_commit",
+            "changed_file",
+            "expected_effect",
+            "timeout",
+        ],
         "creates_session": True,
     },
     "stage-sd": {
@@ -471,7 +515,7 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
         if command_name == "serial-broker" and key == "serial_port":
             continue
         flag = "--" + key.replace("_", "-")
-        if key in {"source", "root", "output", "session_dir", "prev_session"}:
+        if key in {"source", "root", "output", "session_dir", "prev_session", "artifact", "changed_file"}:
             _append_path_option(argv, flag, value, project_root=project_root)
             continue
         if key == "file":
@@ -886,11 +930,13 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return "health"
     if any(token in text for token in ["拉取文件", "取文件", "fetch file", "remote file"]):
         return "fetch-file"
+    if any(token in text for token in ["闭环", "升级验证", "构建部署", "deploy verify", "deploy-verify", "build deploy", "刷机验证"]):
+        return "deploy-verify"
     if any(token in text for token in ["下发", "拉包", "device pull", "lanupg", "artifact"]):
         return "device-pull"
     if any(token in text for token in ["报告", "report"]):
         return "report"
-    if any(token in text for token in ["启动", "调试", "debug", "run", "闭环"]):
+    if any(token in text for token in ["启动", "调试", "debug", "run"]):
         return "run"
     return None
 
@@ -970,7 +1016,7 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
         "required_inputs": {
             "minimum": ["serial_port"],
             "conditional": {
-                "device_password": ["run", "exec", "health", "collect-evidence", "fetch-file", "fetch-path", "bootstrap-network", "device-pull"],
+                "device_password": ["run", "exec", "health", "collect-evidence", "fetch-file", "fetch-path", "bootstrap-network", "device-pull", "deploy-verify"],
                 "wifi_ssid,wifi_password,wifi_mode": ["bootstrap-network", "device-pull when mode is wlan_script"],
                 "sdcard_drive": ["stage-sd"],
             },

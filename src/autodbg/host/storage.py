@@ -60,10 +60,10 @@ def list_host_drives() -> list[DriveInfo]:
 
 def get_drive_info(path: str | Path) -> DriveInfo:
     root = _normalize_drive_root(path)
+    total_bytes: int | None = None
+    free_bytes: int | None = None
     if os.name != "nt":
         resolved = Path(root)
-        total_bytes: int | None = None
-        free_bytes: int | None = None
         if resolved.exists():
             usage = shutil.disk_usage(resolved)
             total_bytes = usage.total
@@ -81,8 +81,6 @@ def get_drive_info(path: str | Path) -> DriveInfo:
     drive_type_code = ctypes.windll.kernel32.GetDriveTypeW(root)
     drive_type = DRIVE_TYPE_NAMES.get(drive_type_code, "unknown")
     volume_name, filesystem = _get_volume_information(root)
-    total_bytes: int | None = None
-    free_bytes: int | None = None
     try:
         usage = shutil.disk_usage(root)
     except OSError:

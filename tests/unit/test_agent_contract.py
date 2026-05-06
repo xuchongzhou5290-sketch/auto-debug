@@ -111,6 +111,36 @@ class AgentContractTest(unittest.TestCase):
         )
         self.assertIsNone(invocation.artifacts_root)
 
+    def test_build_agent_invocation_supports_deploy_verify_artifact_context(self) -> None:
+        project_root = Path("C:/repo/auto-debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "deploy-verify",
+                "connection": {"serial_port": "COM19", "device_password": "secret"},
+                "options": {
+                    "artifact": "payloads/APP.bin",
+                    "post_pull_command": "lanupg /mnt/sdcard/APP.bin",
+                    "expect_marker": "APP_READY",
+                    "changed_file": ["src/app/main.c"],
+                },
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv[0], "deploy-verify")
+        self.assertIn("--artifact", invocation.argv)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--artifact") + 1],
+            "C:\\repo\\auto-debug\\payloads\\APP.bin",
+        )
+        self.assertIn("--post-pull-command", invocation.argv)
+        self.assertIn("--expect-marker", invocation.argv)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--changed-file") + 1],
+            "C:\\repo\\auto-debug\\src\\app\\main.c",
+        )
+        self.assertEqual(invocation.env_updates["AUTO_DBG_DEVICE_PASSWORD"], "secret")
+
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
         manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 
@@ -126,6 +156,9 @@ class AgentContractTest(unittest.TestCase):
         self.assertTrue(
             any("operator still needs the shared serial view" in rule for rule in manifest["operating_rules"])
         )
+        action_names = {action["name"] for action in manifest["actions"]}
+        self.assertIn("deploy-verify", action_names)
+        self.assertIn("deploy-verify", manifest["required_inputs"]["conditional"]["device_password"])
 
     def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
@@ -146,6 +179,15 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(plan["inferred_action"], "watch-serial")
         self.assertFalse(plan["ready"])
         self.assertEqual(plan["missing_required"][0]["field"], "serial_port")
+
+    def test_build_agent_intake_plan_infers_deploy_verify_from_closed_loop_goal(self) -> None:
+        with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
+            plan = build_agent_intake_plan({"goal": "构建部署后闭环验证修复"}, project_root=Path("C:/repo/auto-debug"))
+
+        self.assertEqual(plan["action"], "deploy-verify")
+        self.assertEqual(plan["inferred_action"], "deploy-verify")
+        missing_fields = [item["field"] for item in plan["missing_required"]]
+        self.assertEqual(missing_fields, ["serial_port", "device_password"])
 
     def test_command_agent_call_returns_structured_json_and_detects_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
