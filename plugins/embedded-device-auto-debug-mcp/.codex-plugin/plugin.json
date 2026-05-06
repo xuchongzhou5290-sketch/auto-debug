@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "Embedded Auto-Debug",
     "shortDescription": "MCP tools for serial observation, control, evidence, and transfer.",
-    "longDescription": "Wrap the X:\\Auto-Debug embedded device automation workflow as MCP tools so other AI agents can observe serial output, run checks, collect evidence, and pull structured session results.",
+    "longDescription": "Wrap the embedded device automation workflow as MCP tools so other AI agents can observe serial output, run checks, collect evidence, and pull structured session results from any local clone or installed copy.",
     "developerName": "Codex",
     "category": "Coding",
     "capabilities": [

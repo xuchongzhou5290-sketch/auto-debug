@@ -9,7 +9,7 @@
 当前入口命令：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\.venv\Scripts\python -m autodbg agent-call --request request.json --pretty
 ```
 
@@ -122,13 +122,13 @@ AI 想先拿自描述清单时，可以直接调用：
 默认情况下，不传这些字段时会走：
 
 ```powershell
-X:\Auto-Debug\profiles\defaults.toml
+<repo-root>\profiles\defaults.toml
 ```
 
 路径规则：
 
 - `profiles` 里的路径字段如果传相对路径，会按 `project_root` 解析
-- 直接 CLI 调用时，这个 `project_root` 就是仓库根目录 `X:\Auto-Debug`
+- 直接 CLI 调用时，这个 `project_root` 就是当前仓库根目录
 - 通过 MCP / 已安装插件调用时，这个 `project_root` 来自 `AUTO_DBG_PROJECT_ROOT`
 - 也就是说，像 `profiles/devices/av130n-lab.toml` 这类值不会再按调用方当前工作目录解析
 
@@ -393,9 +393,9 @@ python -m autodbg agent-call --request -
 
 当前已经补了一层 repo-local MCP plugin：
 
-- 插件目录：`X:\Auto-Debug\plugins\embedded-device-auto-debug-mcp`
-- MCP 配置：`X:\Auto-Debug\plugins\embedded-device-auto-debug-mcp\.mcp.json`
-- Marketplace：`X:\Auto-Debug\.agents\plugins\marketplace.json`
+- 插件目录：`<repo-root>\plugins\embedded-device-auto-debug-mcp`
+- MCP 配置：`<repo-root>\plugins\embedded-device-auto-debug-mcp\.mcp.json`
+- Marketplace：`<repo-root>\.agents\plugins\marketplace.json`
 
 当前暴露三个 MCP tools：
 

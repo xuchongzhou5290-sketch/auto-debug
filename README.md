@@ -37,7 +37,7 @@
 默认 profile 入口定义在：
 
 ```powershell
-X:\Auto-Debug\profiles\defaults.toml
+<repo-root>\profiles\defaults.toml
 ```
 
 默认情况下，`run / observe / exec / health / collect-evidence / device-pull / stage-sd` 这类命令会自动从这里解析：
@@ -114,9 +114,14 @@ $env:AUTO_DBG_PREFERRED_INTERFACES = "eth0,wlan0,usb0"
 如果你手上是源码仓，先执行：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\install-local-tool.ps1
 ```
+
+前置条件：
+
+- Windows PowerShell
+- Python 3.11+，可用 `python`、`py -3.11`，或通过 `-PythonExe` 显式指定
 
 如果安装目录下已有正在运行的 `auto-debug` / MCP 进程，脚本现在会先提示是否强制关闭后再继续。
 如果你要在自动化场景里直接强制处理占用，可以显式加：
@@ -128,6 +133,8 @@ cd X:\Auto-Debug
 它会自动：
 
 - 复制独立运行所需内容到 `%LOCALAPPDATA%\Programs\auto-debug`
+- 创建安装版独立运行时：`%LOCALAPPDATA%\Programs\auto-debug\.venv`
+- 安装 `auto-debug[full]` 依赖
 - 写入用户环境变量：
   - `AUTO_DBG_HOME`
   - `AUTO_DBG_PROJECT_ROOT`
@@ -161,7 +168,7 @@ observe-serial
 如果你暂时还在源码模式里运行，也可以继续用：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\.venv\Scripts\python -m autodbg show-mvp
 .\.venv\Scripts\python -m autodbg ports
 .\.venv\Scripts\python -m autodbg run
@@ -214,11 +221,11 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 
 详细约定见：
 
-- [agent-tool-contract.md](/X:/Auto-Debug/docs/agent-tool-contract.md)
-- [embedded-device-auto-debug-ai-tool.md](/X:/Auto-Debug/docs/embedded-device-auto-debug-ai-tool.md)
-- [agent-call-run.json](/X:/Auto-Debug/docs/examples/agent-call-run.json)
-- [agent-call-run-loop.json](/X:/Auto-Debug/docs/examples/agent-call-run-loop.json)
-- [agent-call-record-intervention.json](/X:/Auto-Debug/docs/examples/agent-call-record-intervention.json)
+- `docs\agent-tool-contract.md`
+- `docs\embedded-device-auto-debug-ai-tool.md`
+- `docs\examples\agent-call-run.json`
+- `docs\examples\agent-call-run-loop.json`
+- `docs\examples\agent-call-record-intervention.json`
 
 如果要让新的 AI 会话先快速理解这个工具，再决定怎么调用，推荐先执行：
 
@@ -241,19 +248,19 @@ MCP Agent 场景下，真正执行前应先走参数引导：
 
 如果要把它直接挂成 MCP Tool，再让别的 Agent 走工具调用而不是自己拼命令，直接看：
 
-- [mcp-tool.md](/X:/Auto-Debug/docs/mcp-tool.md)
-- [plugin.json](/X:/Auto-Debug/plugins/embedded-device-auto-debug-mcp/.codex-plugin/plugin.json)
-- [marketplace.json](/X:/Auto-Debug/.agents/plugins/marketplace.json)
+- `docs\mcp-tool.md`
+- `plugins\embedded-device-auto-debug-mcp\.codex-plugin\plugin.json`
+- `.agents\plugins\marketplace.json`
 
 如果你要的是“任何工作区都能直接装”的全局插件，当前也已经有 home-local 版本：
 
-- [C:\Users\xcz5290\plugins\embedded-device-auto-debug-mcp](</C:/Users/xcz5290/plugins/embedded-device-auto-debug-mcp/README.md>)
-- [C:\Users\xcz5290\.agents\plugins\marketplace.json](</C:/Users/xcz5290/.agents/plugins/marketplace.json>)
+- `%USERPROFILE%\plugins\embedded-device-auto-debug-mcp`
+- `%USERPROFILE%\.agents\plugins\marketplace.json`
 
 现在也补了自动安装/升级入口。最推荐的入口已经不是直接刷 home plugin，而是先做本地部署：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\install-local-tool.ps1
 ```
 
@@ -397,7 +404,7 @@ install-home-plugin
 也可以直接修改：
 
 ```powershell
-X:\Auto-Debug\profiles\defaults.toml
+<repo-root>\profiles\defaults.toml
 ```
 
 ## 路径依赖收口说明
@@ -434,7 +441,7 @@ X:\Auto-Debug\profiles\defaults.toml
 
 ## 依赖
 
-当前虚拟环境建议安装：
+`install-local-tool.ps1` 会在安装目录内自动创建 `.venv` 并安装 `auto-debug[full]`。如果你在源码模式手工维护开发环境，建议安装：
 
 - `pyserial`
 - `requests`

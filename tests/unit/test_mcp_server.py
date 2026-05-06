@@ -10,7 +10,7 @@ from autodbg.mcp.server import build_mcp_tools, call_mcp_tool, dispatch_mcp_requ
 
 class McpServerTest(unittest.TestCase):
     def test_build_mcp_tools_contains_describe_prepare_and_action(self) -> None:
-        tools = build_mcp_tools(project_root=Path("X:/Auto-Debug"))
+        tools = build_mcp_tools(project_root=Path("C:/repo/auto-debug"))
         tool_names = [item["name"] for item in tools]
 
         self.assertEqual(tool_names, ["autodbg_describe", "autodbg_prepare", "autodbg_action"])
@@ -24,14 +24,14 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("loop", action_schema["properties"])
 
     def test_call_mcp_tool_describe_returns_manifest(self) -> None:
-        result = call_mcp_tool("autodbg_describe", {}, project_root=Path("X:/Auto-Debug"))
+        result = call_mcp_tool("autodbg_describe", {}, project_root=Path("C:/repo/auto-debug"))
 
         self.assertIn("structuredContent", result)
         self.assertEqual(result["structuredContent"]["tool"]["name"], "embedded-device-auto-debug")
 
     def test_call_mcp_tool_prepare_returns_user_questions(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
-            result = call_mcp_tool("autodbg_prepare", {"action": "fetch-file"}, project_root=Path("X:/Auto-Debug"))
+            result = call_mcp_tool("autodbg_prepare", {"action": "fetch-file"}, project_root=Path("C:/repo/auto-debug"))
 
         self.assertFalse(result.get("isError", False))
         payload = result["structuredContent"]
@@ -81,7 +81,7 @@ class McpServerTest(unittest.TestCase):
                 "id": 2,
                 "method": "tools/list",
             },
-            project_root=Path("X:/Auto-Debug"),
+            project_root=Path("C:/repo/auto-debug"),
         )
 
         self.assertEqual(response["id"], 2)
@@ -99,7 +99,7 @@ class McpServerTest(unittest.TestCase):
                     "arguments": {},
                 },
             },
-            project_root=Path("X:/Auto-Debug"),
+            project_root=Path("C:/repo/auto-debug"),
         )
 
         self.assertEqual(response["error"]["code"], -32602)

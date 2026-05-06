@@ -96,7 +96,7 @@ class CliMainTest(unittest.TestCase):
 
     def test_command_install_home_plugin_prints_summary(self) -> None:
         args = argparse.Namespace(
-            project_root=Path("X:/Auto-Debug"),
+            project_root=Path("C:/repo/auto-debug"),
             home_root=Path("C:/Temp/home"),
             plugin_name="embedded-device-auto-debug-mcp",
         )
@@ -119,16 +119,16 @@ class CliMainTest(unittest.TestCase):
 
     def test_command_install_local_tool_prints_summary(self) -> None:
         args = argparse.Namespace(
-            project_root=Path("X:/Auto-Debug"),
-            install_root=Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug"),
+            project_root=Path("C:/repo/auto-debug"),
+            install_root=Path("C:/Users/demo/AppData/Local/Programs/auto-debug"),
             skip_venv=False,
             skip_local_settings=False,
         )
         fake_result = {
-            "install_root": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug"),
-            "bin_dir": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin"),
-            "autodbg_cmd": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin/autodbg.cmd"),
-            "observe_cmd": Path("C:/Users/xcz5290/AppData/Local/Programs/auto-debug/bin/observe-serial.cmd"),
+            "install_root": Path("C:/Users/demo/AppData/Local/Programs/auto-debug"),
+            "bin_dir": Path("C:/Users/demo/AppData/Local/Programs/auto-debug/bin"),
+            "autodbg_cmd": Path("C:/Users/demo/AppData/Local/Programs/auto-debug/bin/autodbg.cmd"),
+            "observe_cmd": Path("C:/Users/demo/AppData/Local/Programs/auto-debug/bin/observe-serial.cmd"),
         }
 
         with patch("autodbg.cli.main.install_local_tool", return_value=fake_result):

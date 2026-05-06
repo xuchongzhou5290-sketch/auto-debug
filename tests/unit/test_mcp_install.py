@@ -7,6 +7,18 @@ from autodbg.mcp.install import HOME_PLUGIN_NAME, install_home_plugin
 
 
 class McpInstallTest(unittest.TestCase):
+    def test_repo_local_plugin_config_is_relocatable(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        legacy_root = "X:" + "\\Auto-Debug"
+        plugin_dir = root / "plugins" / HOME_PLUGIN_NAME
+        mcp_config = json.loads((plugin_dir / ".mcp.json").read_text(encoding="utf-8"))
+        server = mcp_config["mcpServers"]["embedded-device-auto-debug"]
+
+        self.assertEqual(server["command"], "powershell.exe")
+        self.assertIn(".\\scripts\\launch-autodbg-mcp.ps1", server["args"])
+        self.assertTrue((plugin_dir / "scripts" / "launch-autodbg-mcp.ps1").is_file())
+        self.assertNotIn(legacy_root, json.dumps(mcp_config, ensure_ascii=False))
+
     def test_install_home_plugin_creates_expected_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -31,15 +43,16 @@ class McpInstallTest(unittest.TestCase):
             self.assertIn(str(result["launcher_script"]), server["args"])
 
             launcher_text = result["launcher_script"].read_text(encoding="utf-8")
+            legacy_root = "X:" + "\\Auto-Debug"
             self.assertIn("$PSScriptRoot", launcher_text)
-            self.assertNotIn("C:\\Users\\xcz5290\\plugins", launcher_text)
+            self.assertNotIn("C:\\Users\\demo\\plugins", launcher_text)
             self.assertIn("AUTO_DBG_HOME", launcher_text)
-            self.assertNotIn("X:\\Auto-Debug", launcher_text)
+            self.assertNotIn(legacy_root, launcher_text)
 
             server_text = result["server_script"].read_text(encoding="utf-8")
             self.assertIn('AUTO_DBG_PROJECT_ROOT', server_text)
             self.assertIn('AUTO_DBG_HOME', server_text)
-            self.assertNotIn("X:\\Auto-Debug", server_text)
+            self.assertNotIn(legacy_root, server_text)
 
     def test_install_home_plugin_upserts_marketplace_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

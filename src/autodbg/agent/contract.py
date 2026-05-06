@@ -115,7 +115,7 @@ _FIELD_PROMPTS: dict[str, dict[str, Any]] = {
     "source": {
         "target": "options",
         "question": "请提供要下发或复制的本地源文件路径。",
-        "example": "X:\\Auto-Debug\\payloads\\APP_FT.bin",
+        "example": "payloads\\APP_FT.bin",
     },
     "session_dir": {
         "target": "options",

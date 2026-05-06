@@ -1,10 +1,13 @@
 {
   "mcpServers": {
     "embedded-device-auto-debug": {
-      "command": "X:\\Auto-Debug\\.venv\\Scripts\\python.exe",
+      "command": "powershell.exe",
       "args": [
-        "-u",
-        "X:\\Auto-Debug\\plugins\\embedded-device-auto-debug-mcp\\scripts\\autodbg_mcp_server.py"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        ".\\scripts\\launch-autodbg-mcp.ps1"
       ],
       "env": {
         "PYTHONUTF8": "1"

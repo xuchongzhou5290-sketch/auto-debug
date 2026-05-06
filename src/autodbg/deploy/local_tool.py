@@ -41,7 +41,10 @@ def install_local_tool(
     for relative in LOCAL_COPY_DIRS:
         source = project_root / relative
         if source.is_dir():
-            _copy_tree(source, install_root / relative)
+            if relative == "config" and not include_local_settings:
+                _copy_tree_contents(source, install_root / relative, ignore_names={"user-settings.toml"})
+            else:
+                _copy_tree(source, install_root / relative)
 
     for relative in LOCAL_COPY_FILES:
         source = project_root / relative
@@ -57,10 +60,6 @@ def install_local_tool(
         local_settings = project_root / "config" / "user-settings.toml"
         if local_settings.is_file():
             _copy_file(local_settings, install_root / "config" / "user-settings.toml")
-    else:
-        skipped_settings = install_root / "config" / "user-settings.toml"
-        if skipped_settings.exists():
-            skipped_settings.unlink()
 
     bin_dir = install_root / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +94,18 @@ def _copy_tree(source: Path, destination: Path) -> None:
 def _copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+
+
+def _copy_tree_contents(source: Path, destination: Path, *, ignore_names: set[str]) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.name in ignore_names:
+            continue
+        target = destination / item.name
+        if item.is_dir():
+            _copy_tree(item, target)
+        elif item.is_file():
+            _copy_file(item, target)
 
 
 def _render_autodbg_cmd() -> str:

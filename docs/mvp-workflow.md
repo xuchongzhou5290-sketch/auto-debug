@@ -93,7 +93,7 @@ Common `failure_stage` breakpoints in the current implementation:
 Primary command:
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 $env:AUTO_DBG_SERIAL_PORT = "COM19"
 python -m autodbg ports
 python -m autodbg run

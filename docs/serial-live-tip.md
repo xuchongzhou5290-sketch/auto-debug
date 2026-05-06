@@ -9,7 +9,7 @@
 ## 1. 先做一次基础准备
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 $env:AUTO_DBG_SERIAL_PORT = "COM19"
 ```
 

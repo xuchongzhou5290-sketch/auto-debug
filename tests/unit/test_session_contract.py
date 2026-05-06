@@ -17,7 +17,7 @@ class SessionContractTest(unittest.TestCase):
                 "iteration": 2,
                 "max_iterations": 6,
             },
-            current_session_dir=Path("X:/Auto-Debug/artifacts/20260420/demo-session"),
+            current_session_dir=Path("C:/repo/auto-debug/artifacts/20260420/demo-session"),
             carry_forward_options={"observe_seconds": 3.0},
         )
 
@@ -27,7 +27,7 @@ class SessionContractTest(unittest.TestCase):
         self.assertEqual(result["carry_forward_request"]["loop"]["iteration"], 3)
         self.assertEqual(
             result["carry_forward_request"]["loop"]["prev_session"],
-            "X:\\Auto-Debug\\artifacts\\20260420\\demo-session",
+            "C:\\repo\\auto-debug\\artifacts\\20260420\\demo-session",
         )
         self.assertEqual(result["carry_forward_request"]["options"]["observe_seconds"], 3.0)
 
@@ -35,12 +35,12 @@ class SessionContractTest(unittest.TestCase):
         record = build_intervention_record(
             kind="ai_patch",
             summary="Adjust retry window",
-            files=["X:/Auto-Debug/src/autodbg/cli/main.py"],
+            files=["C:/repo/auto-debug/src/autodbg/cli/main.py"],
         )
 
         self.assertEqual(record["kind"], "ai_patch")
         self.assertEqual(record["summary"], "Adjust retry window")
-        self.assertEqual(record["files"], ["X:/Auto-Debug/src/autodbg/cli/main.py"])
+        self.assertEqual(record["files"], ["C:/repo/auto-debug/src/autodbg/cli/main.py"])
         self.assertEqual(record["metadata"], {})
 
 

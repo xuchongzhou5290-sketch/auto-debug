@@ -4,7 +4,7 @@
 
 目标：
 
-- 用最少上下文理解 `X:\Auto-Debug`
+- 用最少上下文理解当前 `auto-debug` 工具根目录
 - 知道这个工具能做什么、什么时候调用什么动作
 - 知道必须提供哪些现场参数
 - 知道如何判断调用是否成功
@@ -12,7 +12,7 @@
 ## 1. Tool Identity
 
 - Tool name: `embedded-device-auto-debug`
-- Project root: `X:\Auto-Debug`
+- Project root: current repository root or `AUTO_DBG_PROJECT_ROOT`
 - Stable entrypoint: `python -m autodbg agent-call --request -`
 - Self-description entrypoint: `python -m autodbg describe-agent-tool --format json`
 - MCP tools: `autodbg_describe`, `autodbg_prepare`, `autodbg_action`
@@ -171,10 +171,10 @@
 
 ## 8. Safe Defaults
 
-- 默认 profile 入口：`X:\Auto-Debug\profiles\defaults.toml`
-- 默认 settings：`X:\Auto-Debug\config\user-settings.toml`
-- 默认 session root：`X:\Auto-Debug\artifacts`
-- 默认 fetched files root：`X:\Auto-Debug\retrieved`
+- 默认 profile 入口：`<project_root>\profiles\defaults.toml`
+- 默认 settings：`<project_root>\config\user-settings.toml`
+- 默认 session root：`<project_root>\artifacts`
+- 默认 fetched files root：`<project_root>\retrieved`
 
 ## 9. Typical AI Requests
 

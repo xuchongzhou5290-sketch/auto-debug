@@ -1,13 +1,127 @@
 param(
     [string]$ProjectRoot = $PSScriptRoot,
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "Programs\auto-debug"),
+    [string]$PythonExe,
     [switch]$SkipVenv,
     [switch]$SkipLocalSettings,
     [switch]$SkipHomePlugin,
-    [switch]$ForceCloseInUseProcesses
+    [switch]$ForceCloseInUseProcesses,
+    [switch]$SkipDependencyInstall
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-AutodbgFullPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Get-AutodbgPythonArgs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PythonCommand
+    )
+
+    if ($PythonCommand.Count -le 1) {
+        return @()
+    }
+    return @($PythonCommand[1..($PythonCommand.Count - 1)])
+}
+
+function Invoke-AutodbgPython {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PythonCommand,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $allArgs = @()
+    $allArgs += Get-AutodbgPythonArgs -PythonCommand $PythonCommand
+    $allArgs += $Arguments
+    & $PythonCommand[0] @allArgs
+}
+
+function Test-AutodbgPythonCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PythonCommand
+    )
+
+    try {
+        Invoke-AutodbgPython -PythonCommand $PythonCommand -Arguments @(
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        ) *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Resolve-AutodbgBootstrapPython {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+        [string]$RequestedPython
+    )
+
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPython)) {
+        $candidates += ,@($RequestedPython)
+    }
+
+    $sourcePython = Join-Path $RootPath ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $sourcePython) {
+        $candidates += ,@($sourcePython)
+    }
+
+    $candidates += ,@("py", "-3.11")
+    $candidates += ,@("py", "-3")
+    $candidates += ,@("python")
+
+    foreach ($candidate in $candidates) {
+        if (Test-AutodbgPythonCommand -PythonCommand $candidate) {
+            return [string[]]$candidate
+        }
+    }
+
+    throw "Python 3.11+ was not found. Install Python 3.11+ or rerun with -PythonExe <path-to-python.exe>."
+}
+
+function Format-AutodbgPythonCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$PythonCommand
+    )
+
+    return ($PythonCommand -join " ")
+}
+
+function Remove-AutodbgPathInsideRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath
+    )
+
+    $rootFull = (Get-AutodbgFullPath -Path $RootPath).TrimEnd('\')
+    $targetFull = (Get-AutodbgFullPath -Path $TargetPath).TrimEnd('\')
+    $rootPrefix = "$rootFull\"
+
+    if (-not $targetFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove path outside install root: $targetFull"
+    }
+
+    if (Test-Path -LiteralPath $targetFull) {
+        Remove-Item -LiteralPath $targetFull -Recurse -Force
+    }
+}
 
 function Get-AutodbgInstallProcesses {
     param(
@@ -15,12 +129,12 @@ function Get-AutodbgInstallProcesses {
         [string]$RootPath
     )
 
-    $normalizedRoot = [System.IO.Path]::GetFullPath($RootPath).TrimEnd('\')
+    $normalizedRoot = (Get-AutodbgFullPath -Path $RootPath).TrimEnd('\')
     $rootPrefix = "$normalizedRoot\"
 
     $matched = Get-CimInstance Win32_Process | Where-Object {
         $_.ProcessId -ne $PID -and (
-            ($_.ExecutablePath -and [System.IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) -or
+            ($_.ExecutablePath -and (Get-AutodbgFullPath -Path $_.ExecutablePath).StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) -or
             ($_.CommandLine -and $_.CommandLine.IndexOf($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
         )
     }
@@ -95,10 +209,21 @@ function Confirm-AutodbgInstallProcessesClosed {
     Stop-AutodbgInstallProcesses -Processes $processes
 }
 
-$pythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $pythonExe)) {
-    throw "Python entrypoint does not exist: $pythonExe"
+if ($SkipVenv) {
+    throw "-SkipVenv is no longer supported for local deployment because the generated wrappers and MCP launcher require an installed Python runtime."
 }
+
+$ProjectRoot = Get-AutodbgFullPath -Path $ProjectRoot
+$InstallRoot = Get-AutodbgFullPath -Path $InstallRoot
+if ($ProjectRoot.TrimEnd('\').Equals($InstallRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "InstallRoot must be different from ProjectRoot because deployment recreates the install .venv."
+}
+$bootstrapPython = Resolve-AutodbgBootstrapPython -RootPath $ProjectRoot -RequestedPython $PythonExe
+
+Write-Output "[ oo... ] 2/5 steps"
+Write-Output "[DONE] Project root: $ProjectRoot"
+Write-Output "[DONE] Install root: $InstallRoot"
+Write-Output "[DONE] Bootstrap Python: $(Format-AutodbgPythonCommand -PythonCommand $bootstrapPython)"
 
 Confirm-AutodbgInstallProcessesClosed -RootPath $InstallRoot -ForceClose:$ForceCloseInUseProcesses
 
@@ -110,22 +235,48 @@ if ([string]::IsNullOrWhiteSpace($existingPythonPath)) {
     $env:PYTHONPATH = "$projectPythonPath;$existingPythonPath"
 }
 
-$args = @(
+$installArgs = @(
     "-m", "autodbg",
     "install-local-tool",
     "--project-root", $ProjectRoot,
-    "--install-root", $InstallRoot
+    "--install-root", $InstallRoot,
+    "--skip-venv"
 )
-if ($SkipVenv) {
-    $args += "--skip-venv"
-}
 if ($SkipLocalSettings) {
-    $args += "--skip-local-settings"
+    $installArgs += "--skip-local-settings"
 }
 
-& $pythonExe @args
+Invoke-AutodbgPython -PythonCommand $bootstrapPython -Arguments $installArgs
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
+}
+
+$installVenv = Join-Path $InstallRoot ".venv"
+$installPython = Join-Path $installVenv "Scripts\python.exe"
+Write-Output "[ ooo.. ] 3/5 steps"
+Write-Output "[ACTIVE] Creating isolated install runtime: $installVenv"
+Remove-AutodbgPathInsideRoot -RootPath $InstallRoot -TargetPath $installVenv
+Invoke-AutodbgPython -PythonCommand $bootstrapPython -Arguments @("-m", "venv", $installVenv)
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+if (-not (Test-Path -LiteralPath $installPython)) {
+    throw "Installed Python runtime was not created: $installPython"
+}
+
+if (-not $SkipDependencyInstall) {
+    Write-Output "[ACTIVE] Installing auto-debug package and runtime dependencies"
+    & $installPython -m pip install --upgrade pip setuptools wheel
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    $packageSpec = "{0}[full]" -f $InstallRoot
+    & $installPython -m pip install --upgrade --editable $packageSpec
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+} else {
+    Write-Output "[TODO] Dependency installation skipped; serial/network commands may fail until dependencies are installed."
 }
 
 [Environment]::SetEnvironmentVariable("AUTO_DBG_HOME", $InstallRoot, "User")

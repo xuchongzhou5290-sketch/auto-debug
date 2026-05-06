@@ -43,7 +43,7 @@ class LocalToolInstallTest(unittest.TestCase):
             self.assertIn("PYTHONPATH", autodbg_cmd_text)
             self.assertIn("-m autodbg", autodbg_cmd_text)
 
-    def test_install_local_tool_can_skip_venv_and_local_settings(self) -> None:
+    def test_install_local_tool_can_skip_venv_and_preserve_installed_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             project_root = root / "project"
@@ -58,6 +58,12 @@ class LocalToolInstallTest(unittest.TestCase):
             (project_root / "config" / "user-settings.toml").write_text("demo=1\n", encoding="utf-8", newline="\n")
             (project_root / ".venv" / "Scripts").mkdir(parents=True)
             (project_root / ".venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8", newline="\n")
+            (install_root / "config").mkdir(parents=True)
+            (install_root / "config" / "user-settings.toml").write_text(
+                "custom=1\n",
+                encoding="utf-8",
+                newline="\n",
+            )
 
             install_local_tool(
                 project_root=project_root,
@@ -67,7 +73,10 @@ class LocalToolInstallTest(unittest.TestCase):
             )
 
             self.assertFalse((install_root / ".venv").exists())
-            self.assertFalse((install_root / "config" / "user-settings.toml").exists())
+            self.assertEqual(
+                (install_root / "config" / "user-settings.toml").read_text(encoding="utf-8"),
+                "custom=1\n",
+            )
 
 
 if __name__ == "__main__":

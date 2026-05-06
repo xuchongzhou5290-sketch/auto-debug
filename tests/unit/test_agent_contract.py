@@ -15,7 +15,7 @@ from autodbg.session.manager import SessionManager
 
 class AgentContractTest(unittest.TestCase):
     def test_build_agent_invocation_translates_request_to_cli_and_env(self) -> None:
-        project_root = Path("X:/Auto-Debug")
+        project_root = Path("C:/repo/auto-debug")
         invocation = build_agent_invocation(
             {
                 "action": "run",
@@ -27,7 +27,7 @@ class AgentContractTest(unittest.TestCase):
                     "wifi_password": "demo-pass",
                 },
                 "profiles": {
-                    "artifacts_root": "X:/Auto-Debug/artifacts-custom",
+                    "artifacts_root": "C:/repo/auto-debug/artifacts-custom",
                 },
                 "options": {
                     "skip_evidence": True,
@@ -37,7 +37,7 @@ class AgentContractTest(unittest.TestCase):
             project_root=project_root,
         )
 
-        self.assertEqual(invocation.argv[:5], ["run", "--artifacts-root", "X:\\Auto-Debug\\artifacts-custom", "--serial-port", "COM19"])
+        self.assertEqual(invocation.argv[:5], ["run", "--artifacts-root", "C:\\repo\\auto-debug\\artifacts-custom", "--serial-port", "COM19"])
         self.assertIn("--skip-evidence", invocation.argv)
         self.assertIn("--observe-seconds", invocation.argv)
         self.assertEqual(invocation.env_updates["AUTO_DBG_DEVICE_PASSWORD"], "secret")
@@ -45,7 +45,7 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(invocation.env_updates["AUTO_DBG_WIFI_PASSWORD"], "demo-pass")
 
     def test_build_agent_invocation_resolves_loop_and_relative_paths(self) -> None:
-        project_root = Path("X:/Auto-Debug")
+        project_root = Path("C:/repo/auto-debug")
         invocation = build_agent_invocation(
             {
                 "action": "run",
@@ -71,19 +71,19 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("--device", invocation.argv)
         self.assertEqual(
             invocation.argv[invocation.argv.index("--device") + 1],
-            "X:\\Auto-Debug\\profiles\\devices\\av130n-lab.toml",
+            "C:\\repo\\auto-debug\\profiles\\devices\\av130n-lab.toml",
         )
         self.assertEqual(
             invocation.argv[invocation.argv.index("--prev-session") + 1],
-            "X:\\Auto-Debug\\artifacts\\20260420\\demo-prev",
+            "C:\\repo\\auto-debug\\artifacts\\20260420\\demo-prev",
         )
         self.assertEqual(invocation.argv[invocation.argv.index("--iteration") + 1], "2")
         self.assertEqual(invocation.argv[invocation.argv.index("--max-iterations") + 1], "6")
         self.assertEqual(invocation.argv[invocation.argv.index("--attempt-note") + 1], "retry after patch")
-        self.assertEqual(invocation.artifacts_root, Path("X:/Auto-Debug/artifacts-custom"))
+        self.assertEqual(invocation.artifacts_root, Path("C:/repo/auto-debug/artifacts-custom"))
 
     def test_build_agent_invocation_supports_record_intervention(self) -> None:
-        project_root = Path("X:/Auto-Debug")
+        project_root = Path("C:/repo/auto-debug")
         invocation = build_agent_invocation(
             {
                 "action": "record-intervention",
@@ -103,16 +103,16 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(invocation.argv[0], "record-intervention")
         self.assertEqual(
             invocation.argv[invocation.argv.index("--session-dir") + 1],
-            "X:\\Auto-Debug\\artifacts\\20260420\\demo-session",
+            "C:\\repo\\auto-debug\\artifacts\\20260420\\demo-session",
         )
         self.assertEqual(
             invocation.argv[invocation.argv.index("--file") + 1],
-            "X:\\Auto-Debug\\src\\autodbg\\cli\\main.py",
+            "C:\\repo\\auto-debug\\src\\autodbg\\cli\\main.py",
         )
         self.assertIsNone(invocation.artifacts_root)
 
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
-        manifest = build_agent_tool_manifest(project_root=Path("X:/Auto-Debug"))
+        manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 
         self.assertEqual(manifest["intake_protocol"]["mcp_tool"], "autodbg_prepare")
         self.assertTrue(any("missing_required" in rule for rule in manifest["intake_protocol"]["question_policy"]))
@@ -129,7 +129,7 @@ class AgentContractTest(unittest.TestCase):
 
     def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
-            plan = build_agent_intake_plan({"action": "exec"}, project_root=Path("X:/Auto-Debug"))
+            plan = build_agent_intake_plan({"action": "exec"}, project_root=Path("C:/repo/auto-debug"))
 
         self.assertFalse(plan["ready"])
         missing_fields = [item["field"] for item in plan["missing_required"]]
@@ -140,7 +140,7 @@ class AgentContractTest(unittest.TestCase):
 
     def test_build_agent_intake_plan_infers_action_from_goal(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": ""}):
-            plan = build_agent_intake_plan({"goal": "我想观察串口日志"}, project_root=Path("X:/Auto-Debug"))
+            plan = build_agent_intake_plan({"goal": "我想观察串口日志"}, project_root=Path("C:/repo/auto-debug"))
 
         self.assertEqual(plan["action"], "watch-serial")
         self.assertEqual(plan["inferred_action"], "watch-serial")

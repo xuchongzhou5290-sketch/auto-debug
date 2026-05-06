@@ -55,16 +55,16 @@
 
 ## 3. repo-local 插件路径
 
-- 插件目录：`X:\Auto-Debug\plugins\embedded-device-auto-debug-mcp`
-- MCP 配置：`X:\Auto-Debug\plugins\embedded-device-auto-debug-mcp\.mcp.json`
-- Marketplace：`X:\Auto-Debug\.agents\plugins\marketplace.json`
+- 插件目录：`<repo-root>\plugins\embedded-device-auto-debug-mcp`
+- MCP 配置：`<repo-root>\plugins\embedded-device-auto-debug-mcp\.mcp.json`
+- Marketplace：`<repo-root>\.agents\plugins\marketplace.json`
 
 ## 4. 本地部署工具
 
 当前已经补了一个“本地安装版”：
 
 - 默认安装目录：`%LOCALAPPDATA%\Programs\auto-debug`
-- 安装脚本：`X:\Auto-Debug\install-local-tool.ps1`
+- 安装脚本：`<repo-root>\install-local-tool.ps1`
 - 直接调用入口：
   - `autodbg`
   - `observe-serial`
@@ -81,7 +81,7 @@
 
 这意味着：
 
-- `MCP server` 不再依赖 `X:\Auto-Debug`
+- `MCP server` 不再依赖某个固定源码盘符
 - 任何工作区都可以共用同一份本地安装版
 - 只要当前用户环境变量生效，`autodbg` 和 `observe-serial` 就能直接调用
 
@@ -89,8 +89,8 @@
 
 为了让任何工作区都能直接装，当前又补了一层 home-local 插件：
 
-- 插件目录：`C:\Users\xcz5290\plugins\embedded-device-auto-debug-mcp`
-- 用户级 marketplace：`C:\Users\xcz5290\.agents\plugins\marketplace.json`
+- 插件目录：`%USERPROFILE%\plugins\embedded-device-auto-debug-mcp`
+- 用户级 marketplace：`%USERPROFILE%\.agents\plugins\marketplace.json`
 
 这层插件的启动方式不是写死某个 workspace，而是：
 
@@ -102,24 +102,27 @@
 
 - 任意工作区都可以装同一个 home-local 插件
 - 独立工具项目如果将来迁移路径，只需要改 `AUTO_DBG_PROJECT_ROOT`
-- 但前提仍然是该根目录下要有本地安装版 `auto-debug` 和对应 `.venv`
+- 但前提仍然是该根目录下要有本地安装版 `auto-debug` 和对应 `.venv`；`install-local-tool.ps1` 会自动创建这份运行时
 
 ### 自动安装 / 升级
 
 当前最推荐的安装入口：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\install-local-tool.ps1
 ```
+
+前置条件是 Windows PowerShell 和 Python 3.11+。脚本会优先复用源码 `.venv`，否则自动尝试 `py -3.11`、`py -3`、`python`；特殊环境可以传 `-PythonExe <path-to-python.exe>`。
 
 它会自动：
 
 1. 安装或覆盖本地工具目录
-2. 写入用户环境变量和 `Path`
-3. 安装或覆盖 `~\plugins\embedded-device-auto-debug-mcp`
-4. 安装或更新 `~\.agents\plugins\marketplace.json`
-5. 将 `.mcp.json` 的默认 `AUTO_DBG_PROJECT_ROOT` 指向本地安装目录
+2. 创建安装版 `.venv` 并安装 `auto-debug[full]`
+3. 写入用户环境变量和 `Path`
+4. 安装或覆盖 `~\plugins\embedded-device-auto-debug-mcp`
+5. 安装或更新 `~\.agents\plugins\marketplace.json`
+6. 将 `.mcp.json` 的默认 `AUTO_DBG_PROJECT_ROOT` 指向本地安装目录
 
 如果只想单独刷新 home plugin：
 
@@ -205,10 +208,10 @@ claude mcp add autodbg --scope user -- powershell.exe -NoProfile -ExecutionPolic
 
 ### 6.6 版本刷新
 
-MCP server 启动时走的是**本地安装副本**（`%LOCALAPPDATA%\Programs\auto-debug\`）的 `.venv`，不是源码项目 `X:\Auto-Debug\` 的 `.venv`。修改了源码要让 MCP 里生效，需要重刷本地副本：
+MCP server 启动时走的是**本地安装副本**（`%LOCALAPPDATA%\Programs\auto-debug\`）的 `.venv`，不是源码项目的 `.venv`。修改了源码要让 MCP 里生效，需要重刷本地副本：
 
 ```powershell
-cd X:\Auto-Debug
+cd <repo-root>
 .\install-local-tool.ps1
 ```
 
@@ -318,5 +321,5 @@ cd X:\Auto-Debug
 
 ### 8.5 MCP 层边界
 
-- 现在虽然已经有本地安装版和 home-local 全局插件，但它仍然依赖 `.venv`
-- 还没有做成完全自带运行时、零 Python 前置条件的独立发布包
+- 现在已经有本地安装版和 home-local 全局插件，安装脚本会自动创建安装版 `.venv`
+- 还没有做成完全自带 Python 解释器、零 Python 前置条件的独立发布包

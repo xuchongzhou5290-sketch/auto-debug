@@ -698,7 +698,7 @@ def _build_parser() -> argparse.ArgumentParser:
     install_local_tool_parser.add_argument(
         "--skip-venv",
         action="store_true",
-        help="Do not copy .venv into the local install root",
+        help="Copy files without copying a source .venv; install-local-tool.ps1 uses this internally before creating a fresh runtime",
     )
     install_local_tool_parser.add_argument(
         "--skip-local-settings",

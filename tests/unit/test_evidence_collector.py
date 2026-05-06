@@ -301,7 +301,7 @@ class EvidenceCollectorTest(unittest.TestCase):
                 kind="ai_patch",
                 summary="Adjust observe timeout",
                 details="Increase observe window before the next run.",
-                files=["X:/Auto-Debug/src/autodbg/cli/main.py"],
+                files=["C:/repo/auto-debug/src/autodbg/cli/main.py"],
                 git_commit="abc1234",
                 expected_effect="More boot logs in the next iteration.",
             )
