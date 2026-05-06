@@ -1217,13 +1217,15 @@ def _build_transfer_probe_command() -> str:
 
 def _build_fetch_file_command(remote_path: str) -> str:
     quoted_remote_path = _sh_single_quote(remote_path)
+    mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=file\n")
+    source_meta = _sh_single_quote(_FETCH_META_PREFIX + "SOURCE=" + remote_path + "\n")
     return (
         f"if [ ! -f {quoted_remote_path} ]; then "
         f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
         "exit 2; "
         "fi; "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=file\\n')}; "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"printf {mode_meta}; "
+        f"printf {source_meta}; "
         f"base64 < {quoted_remote_path} | "
         "while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done"
     )
@@ -1231,14 +1233,17 @@ def _build_fetch_file_command(remote_path: str) -> str:
 
 def _build_fetch_path_command(remote_path: str) -> str:
     quoted_remote_path = _sh_single_quote(remote_path)
+    file_mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=file\n")
+    tar_mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=tar\n")
+    source_meta = _sh_single_quote(_FETCH_META_PREFIX + "SOURCE=" + remote_path + "\n")
     return (
         f"if [ -f {quoted_remote_path} ]; then "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=file\\n')}; "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"printf {file_mode_meta}; "
+        f"printf {source_meta}; "
         f"base64 < {quoted_remote_path} | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
         f"elif [ -d {quoted_remote_path} ]; then "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'MODE=tar\\n')}; "
-        f"printf {_sh_single_quote(_FETCH_META_PREFIX + 'SOURCE=' + remote_path + '\\n')}; "
+        f"printf {tar_mode_meta}; "
+        f"printf {source_meta}; "
         f"tar -cf - {quoted_remote_path} | base64 | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
         "else "
         f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
