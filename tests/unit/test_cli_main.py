@@ -21,6 +21,7 @@ from autodbg.cli.main import (
     _build_auto_wlan_bootstrap_commands,
     _build_collect_evidence_commands,
     _build_sd_http_helper_compile_command,
+    _build_quickstart_action_plan,
     _build_structured_command,
     _default_collect_evidence_files,
     _build_fetch_file_command,
@@ -466,6 +467,65 @@ class CliMainTest(unittest.TestCase):
         self.assertIsNone(args.model)
         self.assertIsNone(args.task)
         self.assertIsNone(args.transport)
+
+    def test_build_parser_accepts_quickstart_args(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "quickstart",
+                "--goal",
+                "健康检查",
+                "--serial-port",
+                "COM19",
+                "--device-password-known",
+                "--sdcard-drive",
+                "E:",
+            ]
+        )
+
+        self.assertEqual(args.command, "quickstart")
+        self.assertEqual(args.goal, "健康检查")
+        self.assertEqual(args.serial_port, "COM19")
+        self.assertTrue(args.device_password_known)
+        self.assertEqual(args.sdcard_drive, "E:")
+
+    def test_build_quickstart_action_plan_guides_health_check(self) -> None:
+        args = argparse.Namespace(
+            goal="健康检查",
+            serial_port="COM19",
+            baudrate=115200,
+            device_password_known=True,
+            sdcard_drive=None,
+            helper_cc=None,
+            artifact=None,
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertTrue(plan["ready"])
+        self.assertEqual(plan["goal"], "health")
+        self.assertEqual(plan["questions"], [])
+        self.assertEqual(plan["next_requests"][0]["action"], "health")
+        self.assertEqual(plan["next_requests"][0]["connection"]["serial_port"], "COM19")
+        self.assertEqual(plan["next_requests"][0]["connection"]["device_password"], "<provided-secret>")
+
+    def test_build_quickstart_action_plan_limits_questions_for_unknown_goal(self) -> None:
+        args = argparse.Namespace(
+            goal=None,
+            serial_port=None,
+            baudrate=None,
+            device_password_known=False,
+            sdcard_drive=None,
+            helper_cc=None,
+            artifact=None,
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["goal"], "unknown")
+        self.assertLessEqual(len(plan["questions"]), 3)
+        self.assertEqual(plan["next_requests"][0]["action"], "ports")
 
     def test_build_parser_accepts_deploy_verify_closed_loop_args(self) -> None:
         parser = _build_parser()

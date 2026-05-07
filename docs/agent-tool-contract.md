@@ -427,11 +427,14 @@ python -m autodbg agent-call --request -
 
 建议 MCP 上层调用顺序：
 
-1. 先调 `autodbg_describe`
-2. 调 `autodbg_prepare` 检查参数是否齐全
-3. 如果返回 `missing_required`，先向用户询问这些字段
-4. `ready=true` 后再调 `autodbg_action`
-5. 仍然以 `ok / exit_code / summary / error` 为主判断结果
+1. 新手或目标不明确时，先调 `quickstart`
+2. 再调 `autodbg_describe`
+3. 调 `autodbg_prepare` 检查参数是否齐全
+4. 如果返回 `missing_required`，先向用户询问这些字段
+5. `ready=true` 后再调 `autodbg_action`
+6. 仍然以 `ok / exit_code / summary / error` 为主判断结果
+
+`quickstart` 是正式快捷引导 action，适合用户只说“我要开始调试设备”这类模糊目标时使用。它会返回 `questions / detected_ports / next_requests`，AI 应先问完 `questions`，再对选定的 `next_requests` 调 `autodbg_prepare`。
 
 `autodbg_prepare` 不会接触设备，只返回参数引导：
 

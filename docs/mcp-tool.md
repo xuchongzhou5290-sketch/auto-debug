@@ -25,6 +25,31 @@
   - `suggested_request`
 - Agent 应先把 `missing_required` 转成给用户的问题，拿到答案后再调用 `autodbg_action`
 
+### `quickstart` action
+
+`quickstart` 是面向新手的正式快捷引导入口。它不是直接操作设备，而是检测串口、归类用户目标，并输出下一步 MCP request 模板。
+
+示例：
+
+```json
+{
+  "schema_version": 1,
+  "action": "quickstart",
+  "options": {
+    "goal": "我想先观察设备启动日志"
+  }
+}
+```
+
+返回重点：
+
+- `questions`：最多 3 个需要问用户的问题
+- `detected_ports`：主机检测到的串口
+- `next_requests`：建议下一步调用的 MCP request
+- `agent_instructions`：AI 后续执行规则
+
+上层 AI 规则：先把 `questions` 问完；选定 `next_requests` 后，仍然先跑 `autodbg_prepare`，再跑 `autodbg_action`。
+
 ### `autodbg_action`
 
 - 输入就是 `agent-call` 的结构化 JSON 请求
@@ -32,6 +57,7 @@
   - `run`
   - `observe`
   - `watch-serial`
+  - `quickstart`
   - `exec`
   - `health`
   - `collect-evidence`

@@ -179,6 +179,7 @@ _ONE_OF_ACTION_OPTIONS: dict[str, list[dict[str, Any]]] = {
 
 _DEFAULT_ACTION_SUGGESTIONS = [
     {"action": "watch-serial", "when": "用户想实时看串口或确认设备是否在刷日志"},
+    {"action": "quickstart", "when": "用户刚开始使用 MCP，需要 AI 逐步引导选择下一步动作"},
     {"action": "run", "when": "用户想跑一轮启动观察、检查和结构化 verdict"},
     {"action": "health", "when": "用户想审计设备进程、SD、网络等健康状态"},
     {"action": "deploy-verify", "when": "用户想闭环执行构建、部署、重启、串口观察和目标验证"},
@@ -211,6 +212,14 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "required_connection": ["serial_port"],
         "recommended_connection": [],
         "common_options": ["tail", "follow", "show_system", "raw_live", "baudrate", "stdin_probe", "stdin_shell"],
+        "creates_session": False,
+    },
+    "quickstart": {
+        "category": "meta",
+        "summary": "Guide a first-time user by detecting serial ports, asking for missing inputs, and returning suggested MCP requests.",
+        "required_connection": [],
+        "recommended_connection": [],
+        "common_options": ["goal", "serial_port", "baudrate", "sdcard_drive", "helper_cc", "artifact"],
         "creates_session": False,
     },
     "exec": {
@@ -517,6 +526,12 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
     elif command_name == "watch-serial":
         _append_option(argv, "--serial-port", options.get("serial_port", connection.get("serial_port")))
         _append_option(argv, "--baudrate", options.get("baudrate", connection.get("baudrate")))
+    elif command_name == "quickstart":
+        _append_option(argv, "--serial-port", options.get("serial_port", connection.get("serial_port")))
+        _append_option(argv, "--baudrate", options.get("baudrate", connection.get("baudrate")))
+        if _is_present(connection.get("device_password")):
+            argv.append("--device-password-known")
+        _append_option(argv, "--sdcard-drive", options.get("sdcard_drive", connection.get("sdcard_drive")))
     elif command_name == "serial-broker":
         if len(action_tokens) < 2:
             raise AgentCallError("serial-broker action must include list or stop.")
@@ -528,6 +543,8 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
 
     for key, value in options.items():
         if command_name == "watch-serial" and key in {"serial_port", "baudrate"}:
+            continue
+        if command_name == "quickstart" and key in {"serial_port", "baudrate", "sdcard_drive", "device_password_known"}:
             continue
         if command_name == "serial-broker" and key == "serial_port":
             continue
@@ -950,6 +967,8 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return None
     if any(token in text for token in ["端口", "ports", "com口", "串口列表"]):
         return "ports"
+    if any(token in text for token in ["quickstart", "快速开始", "快捷引导", "刚接触", "小白", "新手", "开始使用"]):
+        return "quickstart"
     if any(token in text for token in ["观察串口", "看串口", "串口日志", "serial log", "watch serial"]):
         return "watch-serial"
     if any(token in text for token in ["健康", "health", "状态检查", "sd卡", "进程"]):
@@ -1027,7 +1046,7 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
         "discovery": {
             "defaults_path": str(defaults_path),
             "settings_path": str(settings_path),
-            "recommended_first_actions": ["ports", "watch-serial", "run"],
+            "recommended_first_actions": ["quickstart", "ports", "watch-serial", "run"],
         },
         "serial_collaboration": {
             "goal": "Keep the human operator and the AI on the same serial session without fighting over the physical COM port.",

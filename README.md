@@ -283,6 +283,29 @@ install-home-plugin
 
 ## 常用命令
 
+### 快捷引导
+
+刚接触工具时，先跑快捷引导，不需要先记 action 名称：
+
+```powershell
+.\.venv\Scripts\python -m autodbg quickstart --goal "观察设备启动日志"
+.\.venv\Scripts\python -m autodbg quickstart --goal "升级后验证" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
+```
+
+MCP Agent 可以直接调用：
+
+```json
+{
+  "schema_version": 1,
+  "action": "quickstart",
+  "options": {
+    "goal": "健康检查"
+  }
+}
+```
+
+`quickstart` 会返回检测到的串口、最多 3 个待询问问题，以及下一步建议的 MCP request。AI 拿到 `next_requests` 后应先对选中的请求调用 `autodbg_prepare`，确认参数齐全后再执行 `autodbg_action`。
+
 ### 串口观察
 
 ```powershell

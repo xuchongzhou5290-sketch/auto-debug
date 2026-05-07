@@ -163,6 +163,29 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("--no-static", invocation.argv)
         self.assertIsNone(invocation.artifacts_root)
 
+    def test_build_agent_invocation_supports_quickstart_from_connection(self) -> None:
+        project_root = Path("C:/repo/auto-debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "quickstart",
+                "connection": {
+                    "serial_port": "COM19",
+                    "baudrate": 115200,
+                    "device_password": "secret",
+                    "sdcard_drive": "E:",
+                },
+                "options": {"goal": "健康检查"},
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv[0], "quickstart")
+        self.assertIn("--serial-port", invocation.argv)
+        self.assertEqual(invocation.argv[invocation.argv.index("--serial-port") + 1], "COM19")
+        self.assertIn("--device-password-known", invocation.argv)
+        self.assertIn("--sdcard-drive", invocation.argv)
+        self.assertNotIn("secret", invocation.argv)
+
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
         manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 
@@ -181,6 +204,7 @@ class AgentContractTest(unittest.TestCase):
         action_names = {action["name"] for action in manifest["actions"]}
         self.assertIn("deploy-verify", action_names)
         self.assertIn("build-sd-http-helper", action_names)
+        self.assertIn("quickstart", action_names)
         self.assertIn("deploy-verify", manifest["required_inputs"]["conditional"]["device_password"])
 
     def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
@@ -202,6 +226,14 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(plan["inferred_action"], "watch-serial")
         self.assertFalse(plan["ready"])
         self.assertEqual(plan["missing_required"][0]["field"], "serial_port")
+
+    def test_build_agent_intake_plan_infers_quickstart_from_new_user_goal(self) -> None:
+        plan = build_agent_intake_plan({"goal": "我是小白，想开始使用"}, project_root=Path("C:/repo/auto-debug"))
+
+        self.assertEqual(plan["action"], "quickstart")
+        self.assertEqual(plan["inferred_action"], "quickstart")
+        self.assertTrue(plan["ready"])
+        self.assertFalse(plan["should_ask_user"])
 
     def test_build_agent_intake_plan_infers_deploy_verify_from_closed_loop_goal(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
