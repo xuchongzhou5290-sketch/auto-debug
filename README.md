@@ -16,7 +16,7 @@
 
 - 单设备
 - 单默认 profile 组
-- 串口优先，网络和 SD 为补充通道
+- 传输自动选择优先级：SD 卡 HTTP helper、设备 downloader、串口 base64+tar bundle
 - session 化产物归档
 - 以项目根目录相对路径运行，不依赖旧工作区路径
 
@@ -409,7 +409,7 @@ MCP Agent 可以直接调用：
 .\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto --sd-http-helper-path /mnt/sdcard/autodbg/autodbg-http-pull
 ```
 
-`auto` 的选择顺序是：SD 卡 HTTP helper、设备自带 downloader、串口 base64+tar bundle。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。目标 toolchain 不支持静态链接时给 `build-sd-http-helper` 加 `--no-static`。
+`auto` 的选择顺序是：SD 卡 HTTP helper、设备自带 downloader、串口 base64+tar bundle。探测 SD helper 时要求目标文件存在且可执行；如果 auto 已选择 SD helper 但运行失败，会在设备存在 `curl / wget / busybox wget` 时自动回退到普通 HTTP。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。目标 toolchain 不支持静态链接时给 `build-sd-http-helper` 加 `--no-static`。
 
 ### SD 卡落盘
 

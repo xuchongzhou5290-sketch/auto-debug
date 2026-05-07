@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+from importlib import resources
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
 import socket
@@ -558,8 +559,8 @@ def _build_parser() -> argparse.ArgumentParser:
     helper_build_parser.add_argument(
         "--source",
         type=Path,
-        default=Path("src/autodbg/assets/autodbg_http_pull.c"),
-        help="C source file for the helper",
+        default=None,
+        help="C source file for the helper; defaults to the packaged autodbg_http_pull.c",
     )
     helper_build_parser.add_argument(
         "--output",
@@ -2773,6 +2774,8 @@ def _normalize_quickstart_goal(goal: str | None) -> str:
     text = (goal or "").strip().lower()
     if not text:
         return "unknown"
+    if any(token in text for token in ["quickstart", "快速开始", "快捷引导", "刚接触", "小白", "新手", "开始使用"]):
+        return "quickstart"
     if any(token in text for token in ["helper", "curl", "wget", "交叉编译", "sd http"]):
         return "sd_http_helper"
     if any(token in text for token in ["闭环", "升级", "验证", "deploy", "刷机"]):
@@ -2792,15 +2795,17 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
     password_known = bool(args.device_password_known or os.environ.get("AUTO_DBG_DEVICE_PASSWORD"))
 
     questions: list[str] = []
-    if serial_port is None and goal in {"unknown", "watch_serial", "health", "device_pull", "deploy_verify"}:
+    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify"}:
         questions.append("请提供目标设备串口号；如果不确定，先运行 ports 或从 detected_ports 里选择。")
     if goal in {"health", "device_pull", "deploy_verify"} and not password_known:
         questions.append("请提供设备 shell 登录密码；该密码只放 connection.device_password，不要写进普通日志。")
     if goal == "sd_http_helper" and not args.helper_cc:
         questions.append("请提供目标设备交叉编译器命令或完整路径，例如 arm-linux-gnueabihf-gcc。")
+    if goal == "sd_http_helper" and not args.sdcard_drive:
+        questions.append("请提供本机 SD 卡盘符，用于把编译出的 helper 放入 SD 卡，例如 E:。")
     if goal == "deploy_verify" and args.artifact is None:
         questions.append("请提供要部署验证的本地产物路径，例如 payloads/APP.bin。")
-    if goal == "unknown":
+    if goal in {"unknown", "quickstart"}:
         questions.append("请说明你想做什么：观察串口、健康检查、下发程序、升级验证，或编译 SD HTTP helper。")
 
     connection: dict[str, Any] = {}
@@ -2808,13 +2813,11 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
         connection["serial_port"] = serial_port
     if args.baudrate:
         connection["baudrate"] = args.baudrate
-    if password_known and goal in {"health", "device_pull", "deploy_verify"}:
-        connection["device_password"] = "<provided-secret>"
     if args.sdcard_drive:
         connection["sdcard_drive"] = args.sdcard_drive
 
     next_requests: list[dict[str, Any]] = []
-    if serial_port is None and goal in {"unknown", "watch_serial", "health", "device_pull", "deploy_verify"}:
+    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify"}:
         next_requests.append({"schema_version": 1, "action": "ports"})
     if goal == "watch_serial":
         next_requests.append(
@@ -2899,6 +2902,7 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
             "Call autodbg_prepare on the selected next_request before autodbg_action.",
             "Ask the questions list first, at most three questions at a time.",
             "Do not print device_password; pass it only through connection.device_password.",
+            "If device_password_known is true, reuse the existing secret source and never copy a placeholder value into connection.device_password.",
         ],
     }
 
@@ -2910,12 +2914,13 @@ def _command_quickstart(args: argparse.Namespace) -> int:
         ports = []
     payload = _build_quickstart_action_plan(args, ports)
     print("[ ●●○○○ ] 2/5 steps")
-    print("[DONE] Quickstart guidance generated")
     if payload["questions"]:
+        print("[ACTIVE] Quickstart guidance needs user input")
         print("[ACTIVE] Missing inputs:")
         for question in payload["questions"]:
             print(f"[TODO] {question}")
     else:
+        print("[DONE] Quickstart guidance generated")
         print("[DONE] Ready to run the suggested next request")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
@@ -3321,6 +3326,48 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     summary=f"Executed SD-card HTTP helper from {args.sd_http_helper_path}",
                     payload=pull_result,
                 )
+                downloader = transfer_probe["capabilities"].get("downloader", "unknown")
+                if args.transfer_mode == "auto" and helper_result.exit_code != 0 and downloader not in {"none", "unknown"}:
+                    pull_script_path = write_pull_script(
+                        root,
+                        base_url=base_url,
+                        workspace=workspace,
+                        script_name=args.pull_script_name,
+                        manifest_name=args.manifest_name,
+                        exclude_names=(args.sd_http_list_name,),
+                    )
+                    fallback_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
+                    fallback_result = controller.execute(fallback_command, timeout=args.timeout, serial_port=serial_port)
+                    _write_command_artifacts(
+                        collector=collector,
+                        prefix="device-pull-sd-http-helper-fallback-http",
+                        result=fallback_result,
+                    )
+                    pull_result = fallback_result.to_dict()
+                    selected_transfer_mode = "http"
+                    transfer_details = {
+                        "mode": "http",
+                        "fallback_from": "sd_http_helper",
+                        "fallback_reason": f"SD HTTP helper returned exit code {helper_result.exit_code}",
+                        "server": {
+                            "root": str(root),
+                            "base_url": base_url,
+                            "manifest_path": str(manifest_path),
+                            "transfer_list_path": str(transfer_list_path),
+                            "pull_script_path": str(pull_script_path),
+                        },
+                        "previous_helper": {
+                            "device_path": args.sd_http_helper_path,
+                            "list_name": args.sd_http_list_name,
+                            "result": helper_result.to_dict(),
+                        },
+                    }
+                    collector.append_event(
+                        event_type="device_pull_sd_http_helper_fallback_http",
+                        source="device_controller",
+                        summary="SD-card HTTP helper failed in auto mode; retried with device downloader.",
+                        payload=pull_result,
+                    )
             else:
                 bundle = build_serial_bundle(
                     root,
@@ -3698,13 +3745,29 @@ def _run_host_build_command(command: str, *, timeout: float) -> dict[str, Any]:
     }
 
 
+def _default_sd_http_helper_source() -> Path:
+    try:
+        return Path(resources.files("autodbg.assets").joinpath("autodbg_http_pull.c"))
+    except (TypeError, FileNotFoundError):
+        return _project_root() / "src" / "autodbg" / "assets" / "autodbg_http_pull.c"
+
+
+def _resolve_project_relative_output(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    project_root = _project_root().resolve()
+    output = (project_root / path).resolve()
+    if not output.is_relative_to(project_root):
+        raise ValueError(f"Relative --output escapes project root: {path}")
+    return output
+
+
 def _build_sd_http_helper_compile_command(args: argparse.Namespace) -> tuple[list[str], Path, Path]:
-    source = args.source
+    source = args.source or _default_sd_http_helper_source()
     output = args.output
     if not source.is_absolute():
         source = _project_root() / source
-    if not output.is_absolute():
-        output = _project_root() / output
+    output = _resolve_project_relative_output(output)
     cflags = ["-Os", *list(args.cflag)]
     if args.static:
         cflags.append("-static")
@@ -3713,7 +3776,13 @@ def _build_sd_http_helper_compile_command(args: argparse.Namespace) -> tuple[lis
 
 
 def _command_build_sd_http_helper(args: argparse.Namespace) -> int:
-    command, source, output = _build_sd_http_helper_compile_command(args)
+    try:
+        command, source, output = _build_sd_http_helper_compile_command(args)
+    except ValueError as exc:
+        print("[ ●○○○○ ] 1/5 steps")
+        print(f"[ERROR] {exc}")
+        print("[TODO] Use an output path under the project, or pass an absolute path deliberately.")
+        return 2
     print("[ ●●○○○ ] 2/5 steps")
     print(f"[ACTIVE] Compiler: {args.cc}")
     print(f"[ACTIVE] Source: {source}")

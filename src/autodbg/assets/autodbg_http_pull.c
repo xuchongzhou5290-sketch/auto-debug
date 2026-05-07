@@ -24,6 +24,10 @@
 
 #define BUF_SIZE 4096
 #define DEFAULT_HTTP_PORT "80"
+#define HTTP_HEADER_SIZE 8192
+#define HTTP_PATH_SIZE 1024
+#define HTTP_REQUEST_SIZE 1536
+#define PATH_BUFFER_SIZE 1024
 
 struct http_base {
     char host[256];
@@ -141,7 +145,7 @@ static int connect_http(const struct http_base *base) {
 }
 
 static int mkdir_p(const char *path) {
-    char tmp[1024];
+    char tmp[PATH_BUFFER_SIZE];
     char *cursor;
 
     if (strlen(path) >= sizeof(tmp)) {
@@ -167,7 +171,7 @@ static int mkdir_p(const char *path) {
 }
 
 static int mkdir_parent(const char *path) {
-    char tmp[1024];
+    char tmp[PATH_BUFFER_SIZE];
     char *slash;
 
     if (strlen(path) >= sizeof(tmp)) {
@@ -199,10 +203,10 @@ static int safe_join(char *out, size_t out_size, const char *workspace, const ch
 }
 
 static int http_get_to_file(const struct http_base *base, const char *relative_path, const char *output_path) {
-    char request[1200];
-    char url_path[1024];
+    char request[HTTP_REQUEST_SIZE];
+    char url_path[HTTP_PATH_SIZE];
     char buffer[BUF_SIZE];
-    char header[8192];
+    char header[HTTP_HEADER_SIZE];
     size_t header_len = 0;
     int header_done = 0;
     int sock;
@@ -257,9 +261,17 @@ static int http_get_to_file(const struct http_base *base, const char *relative_p
         char *body = buffer;
         size_t body_len = (size_t)count;
         if (!header_done) {
+            size_t old_header_len = header_len;
             size_t copy_len = body_len;
             char *marker;
-            if (header_len + copy_len >= sizeof(header)) {
+            size_t header_bytes_total;
+            size_t body_offset;
+            if (header_len >= sizeof(header) - 1) {
+                fprintf(stderr, "HTTP header too large for %s\n", relative_path);
+                status = 1;
+                break;
+            }
+            if (copy_len > sizeof(header) - header_len - 1) {
                 copy_len = sizeof(header) - header_len - 1;
             }
             memcpy(header + header_len, buffer, copy_len);
@@ -267,6 +279,11 @@ static int http_get_to_file(const struct http_base *base, const char *relative_p
             header[header_len] = '\0';
             marker = strstr(header, "\r\n\r\n");
             if (marker == NULL) {
+                if (copy_len < body_len) {
+                    fprintf(stderr, "HTTP header too large for %s\n", relative_path);
+                    status = 1;
+                    break;
+                }
                 continue;
             }
             header_done = 1;
@@ -275,8 +292,15 @@ static int http_get_to_file(const struct http_base *base, const char *relative_p
                 status = 1;
                 break;
             }
-            body = marker + 4;
-            body_len = header_len - (size_t)(body - header);
+            header_bytes_total = (size_t)((marker + 4) - header);
+            body_offset = header_bytes_total > old_header_len ? header_bytes_total - old_header_len : 0;
+            if (body_offset > (size_t)count) {
+                fprintf(stderr, "HTTP parser lost body offset for %s\n", relative_path);
+                status = 1;
+                break;
+            }
+            body = buffer + body_offset;
+            body_len = (size_t)count - body_offset;
             if (body_len > 0 && fwrite(body, 1, body_len, out) != body_len) {
                 perror(output_path);
                 status = 1;
@@ -304,8 +328,8 @@ static int http_get_to_file(const struct http_base *base, const char *relative_p
 }
 
 static int pull_list(const struct http_base *base, const char *workspace, const char *list_name) {
-    char list_path[1024];
-    char line[1024];
+    char list_path[PATH_BUFFER_SIZE];
+    char line[PATH_BUFFER_SIZE];
     FILE *list_file;
     int files = 0;
 
@@ -325,7 +349,7 @@ static int pull_list(const struct http_base *base, const char *workspace, const 
         return 1;
     }
     while (fgets(line, sizeof(line), list_file) != NULL) {
-        char output_path[1024];
+        char output_path[PATH_BUFFER_SIZE];
         trim_line(line);
         if (line[0] == '\0' || line[0] == '#') {
             continue;
@@ -337,6 +361,7 @@ static int pull_list(const struct http_base *base, const char *workspace, const 
         printf("AUTODBG_HTTP_HELPER_GET %s\n", line);
         fflush(stdout);
         if (http_get_to_file(base, line, output_path) != 0) {
+            unlink(output_path);
             fclose(list_file);
             return 1;
         }

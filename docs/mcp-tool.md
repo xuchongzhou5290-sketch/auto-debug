@@ -285,7 +285,7 @@ cd <repo-root>
 - `transfer_mode=http`：设备端使用 `curl / wget / busybox wget` 从 PC artifact server 拉取
 - `transfer_mode=serial_bundle`：无网络时通过串口传 base64+tar bundle
 
-`transfer_mode=auto` 的优先级是 `sd_http_helper -> http -> serial_bundle`。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，MCP Agent 可以调用 `build-sd-http-helper` 使用目标设备 C toolchain 交叉编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
+`transfer_mode=auto` 的优先级是 `sd_http_helper -> http -> serial_bundle`。SD helper 只有在设备端路径存在且可执行时才会被选中；auto 模式下 helper 运行失败，会在设备存在 downloader 时回退到 `http`。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，MCP Agent 可以调用 `build-sd-http-helper` 使用目标设备 C toolchain 交叉编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
 
 示例：
 

@@ -266,7 +266,7 @@ def _build_transfer_probe_command(sd_http_helper_path: str | None = None) -> str
     if sd_http_helper_path:
         helper_probe = (
             f"printf 'AUTODBG_SD_HTTP_HELPER='; "
-            f"if [ -f {_sh_single_quote(sd_http_helper_path)} ]; then printf 'yes\\n'; else printf 'no\\n'; fi"
+            f"if [ -x {_sh_single_quote(sd_http_helper_path)} ]; then printf 'yes\\n'; else printf 'no\\n'; fi"
         )
     return (
         "printf 'AUTODBG_DOWNLOADER='; "
@@ -482,7 +482,10 @@ def _select_transfer_mode(requested_mode: str, *, capabilities: dict[str, Any], 
 
     if requested_mode == "sd_http_helper":
         if capabilities.get("sd_http_helper") != "yes":
-            raise RuntimeError("SD HTTP helper transfer requested, but the helper executable was not found on the device.")
+            helper_status = capabilities.get("sd_http_helper")
+            if helper_status == "not_configured":
+                raise RuntimeError("SD HTTP helper transfer requested, but sd_http_helper_path is not configured.")
+            raise RuntimeError("SD HTTP helper transfer requested, but the helper is missing or not executable on the device.")
         return "sd_http_helper"
 
     if requested_mode == "serial_bundle":

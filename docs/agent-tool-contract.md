@@ -283,7 +283,7 @@ AI 想先拿自描述清单时，可以直接调用：
 
 `device-pull` 的 `transfer_mode=auto` 会按 `sd_http_helper -> http -> serial_bundle` 选择通道：
 
-- `sd_http_helper`：设备没有 downloader，但 SD 卡内已放置 `autodbg-http-pull` 可执行文件
+- `sd_http_helper`：设备没有 downloader，但 SD 卡内已放置 `autodbg-http-pull` 可执行文件；探测使用 `-x`，auto 模式下运行失败会在设备存在 downloader 时回退到 `http`
 - `http`：设备已有 `curl / wget / busybox wget`
 - `serial_bundle`：网络不可用或只能通过串口传 base64+tar
 

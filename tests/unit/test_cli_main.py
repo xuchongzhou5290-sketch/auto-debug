@@ -291,7 +291,7 @@ class CliMainTest(unittest.TestCase):
         self.assertIn("AUTODBG_BASE64=", command)
         self.assertIn("AUTODBG_TAR=", command)
         self.assertIn("AUTODBG_SD_HTTP_HELPER=", command)
-        self.assertIn("[ -f '/mnt/sdcard/autodbg/autodbg-http-pull' ]", command)
+        self.assertIn("[ -x '/mnt/sdcard/autodbg/autodbg-http-pull' ]", command)
 
     def test_build_fetch_file_command_wraps_file_check_and_base64(self) -> None:
         command = _build_fetch_file_command("/mnt/sdcard/autodbg/hello.txt")
@@ -382,10 +382,18 @@ class CliMainTest(unittest.TestCase):
             "sd_http_helper",
         )
 
+    def test_select_transfer_mode_reports_unconfigured_sd_helper(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "sd_http_helper_path is not configured"):
+            _select_transfer_mode(
+                "sd_http_helper",
+                capabilities={"downloader": "curl", "has_base64": True, "has_tar": True, "sd_http_helper": "not_configured"},
+                network_mode="lan_ready",
+            )
+
     def test_build_sd_http_helper_compile_command_uses_cross_compiler(self) -> None:
         args = argparse.Namespace(
             cc="arm-linux-gnueabihf-gcc",
-            source=Path("src/autodbg/assets/autodbg_http_pull.c"),
+            source=None,
             output=Path("artifacts/autodbg-http-pull"),
             cflag=["-Wall"],
             static=False,
@@ -399,6 +407,18 @@ class CliMainTest(unittest.TestCase):
         self.assertNotIn("-static", command)
         self.assertEqual(source, Path(__file__).resolve().parents[2] / "src" / "autodbg" / "assets" / "autodbg_http_pull.c")
         self.assertEqual(output, Path(__file__).resolve().parents[2] / "artifacts" / "autodbg-http-pull")
+
+    def test_build_sd_http_helper_compile_command_rejects_relative_output_escape(self) -> None:
+        args = argparse.Namespace(
+            cc="arm-linux-gnueabihf-gcc",
+            source=None,
+            output=Path("../../autodbg-http-pull"),
+            cflag=[],
+            static=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "escapes project root"):
+            _build_sd_http_helper_compile_command(args)
 
     def test_select_transfer_mode_rejects_network_transfer_when_offline(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "Offline mode cannot use network HTTP transfer"):
@@ -507,7 +527,25 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(plan["questions"], [])
         self.assertEqual(plan["next_requests"][0]["action"], "health")
         self.assertEqual(plan["next_requests"][0]["connection"]["serial_port"], "COM19")
-        self.assertEqual(plan["next_requests"][0]["connection"]["device_password"], "<provided-secret>")
+        self.assertNotIn("device_password", plan["next_requests"][0]["connection"])
+        self.assertTrue(plan["supplied"]["device_password_known"])
+
+    def test_build_quickstart_action_plan_handles_new_user_goal(self) -> None:
+        args = argparse.Namespace(
+            goal="我是小白，想开始使用",
+            serial_port=None,
+            baudrate=None,
+            device_password_known=False,
+            sdcard_drive=None,
+            helper_cc=None,
+            artifact=None,
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertEqual(plan["goal"], "quickstart")
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["next_requests"][0]["action"], "ports")
 
     def test_build_quickstart_action_plan_limits_questions_for_unknown_goal(self) -> None:
         args = argparse.Namespace(

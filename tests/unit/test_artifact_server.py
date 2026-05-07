@@ -76,6 +76,23 @@ class ArtifactServerTest(unittest.TestCase):
         self.assertNotIn("autodbg-pull.sh", lines)
         self.assertNotIn("autodbg-files.txt", lines)
 
+    def test_write_transfer_list_rejects_unsafe_include_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "payload.bin").write_bytes(b"demo")
+
+            list_path = write_transfer_list(
+                root,
+                list_name="autodbg-files.txt",
+                include_names=("../outside.txt", "/etc/passwd", "safe-manifest.json"),
+            )
+            lines = list_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("safe-manifest.json", lines)
+        self.assertIn("payload.bin", lines)
+        self.assertNotIn("../outside.txt", lines)
+        self.assertNotIn("/etc/passwd", lines)
+
     def test_serve_directory_exposes_health_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

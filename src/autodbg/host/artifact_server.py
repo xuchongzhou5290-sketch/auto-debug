@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import signal
 import socket
 import tempfile
@@ -225,6 +225,13 @@ def write_pull_script(
     return script_path
 
 
+def _is_safe_transfer_list_path(value: str) -> bool:
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        return False
+    return bool(path.parts) and all(part not in {"", ".", ".."} for part in path.parts)
+
+
 def write_transfer_list(
     root: Path,
     *,
@@ -236,7 +243,7 @@ def write_transfer_list(
     excluded = {list_name, *exclude_names}
     relative_paths: list[str] = []
     for include_name in include_names:
-        if include_name not in excluded:
+        if include_name not in excluded and _is_safe_transfer_list_path(include_name):
             relative_paths.append(include_name)
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -244,7 +251,7 @@ def write_transfer_list(
         if path.name in excluded:
             continue
         relative_path = path.relative_to(root).as_posix()
-        if relative_path not in relative_paths:
+        if _is_safe_transfer_list_path(relative_path) and relative_path not in relative_paths:
             relative_paths.append(relative_path)
     list_path = root / list_name
     list_path.write_text("\n".join(relative_paths) + ("\n" if relative_paths else ""), encoding="utf-8", newline="\n")
