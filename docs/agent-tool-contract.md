@@ -287,6 +287,8 @@ AI 想先拿自描述清单时，可以直接调用：
 - `http`：设备已有 `curl / wget / busybox wget`
 - `serial_bundle`：网络不可用或只能通过串口传 base64+tar
 
+`device-pull` 临时启动的 PC 端 HTTP 服务会在设备拉取命令返回后立即关闭，不会等到后续 list / post-pull / reboot / observe 阶段结束。
+
 SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，AI 作为 MCP 使用时可以先调用 `build-sd-http-helper` 交叉编译：
 
 ```json

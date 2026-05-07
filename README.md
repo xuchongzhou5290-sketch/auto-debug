@@ -410,7 +410,7 @@ MCP Agent 可以直接调用：
 .\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto --sd-http-helper-path /mnt/sdcard/autodbg/autodbg-http-pull
 ```
 
-`auto` 的选择顺序是：SD 卡 HTTP helper、设备自带 downloader、串口 base64+tar bundle。探测 SD helper 时要求目标文件存在且可执行；如果 auto 已选择 SD helper 但运行失败，会在设备存在 `curl / wget / busybox wget` 时自动回退到普通 HTTP。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。目标 toolchain 不支持静态链接时给 `build-sd-http-helper` 加 `--no-static`。
+`auto` 的选择顺序是：SD 卡 HTTP helper、设备自带 downloader、串口 base64+tar bundle。探测 SD helper 时要求目标文件存在且可执行；如果 auto 已选择 SD helper 但运行失败，会在设备存在 `curl / wget / busybox wget` 时自动回退到普通 HTTP。`device-pull` 为拉取临时启动的 PC 端 HTTP 服务会在设备拉取命令返回后立即关闭，后续 list / post-pull / reboot / observe 阶段不会继续暴露该服务。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。目标 toolchain 不支持静态链接时给 `build-sd-http-helper` 加 `--no-static`。
 
 ### SD 卡落盘
 

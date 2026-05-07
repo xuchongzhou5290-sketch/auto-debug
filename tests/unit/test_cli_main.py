@@ -64,6 +64,7 @@ from autodbg.cli.main import (
     _resolve_pull_base_url,
     _resolve_pull_workspace,
     _select_transfer_mode,
+    _shutdown_transient_artifact_server,
 )
 from autodbg.agent import build_agent_tool_manifest
 from autodbg.profiles.loader import load_run_profiles
@@ -192,6 +193,54 @@ class CliMainTest(unittest.TestCase):
         )
         self.assertTrue(excerpt.endswith("(+1 lines)"))
         self.assertIn("...", excerpt)
+
+    def test_shutdown_transient_artifact_server_closes_server_and_records_event(self) -> None:
+        class FakeServer:
+            def __init__(self) -> None:
+                self.shutdown_called = False
+                self.server_close_called = False
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+            def server_close(self) -> None:
+                self.server_close_called = True
+
+        class FakeThread:
+            def __init__(self) -> None:
+                self.join_timeout: float | None = None
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_timeout = timeout
+
+            def is_alive(self) -> bool:
+                return False
+
+        class FakeCollector:
+            def __init__(self) -> None:
+                self.events: list[dict[str, object]] = []
+
+            def append_event(self, **kwargs) -> None:
+                self.events.append(kwargs)
+
+        server = FakeServer()
+        thread = FakeThread()
+        collector = FakeCollector()
+
+        next_server, next_thread = _shutdown_transient_artifact_server(
+            server,
+            thread,
+            collector=collector,
+            reason="http_transfer_finished",
+        )
+
+        self.assertIsNone(next_server)
+        self.assertIsNone(next_thread)
+        self.assertTrue(server.shutdown_called)
+        self.assertTrue(server.server_close_called)
+        self.assertEqual(thread.join_timeout, 2.0)
+        self.assertEqual(collector.events[0]["event_type"], "artifact_server_closed")
+        self.assertEqual(collector.events[0]["payload"]["reason"], "http_transfer_finished")
 
     def test_normalize_focus_terms_discards_blanks(self) -> None:
         self.assertEqual(_normalize_focus_terms([" VQE ", "", " mmc "]), ["vqe", "mmc"])

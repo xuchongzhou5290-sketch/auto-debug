@@ -3266,7 +3266,15 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 )
                 server, thread = serve_directory(root, bind=args.bind, port=args.port)
                 remote_pull_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
-                pull_exec_result = controller.execute(remote_pull_command, timeout=args.timeout, serial_port=serial_port)
+                try:
+                    pull_exec_result = controller.execute(remote_pull_command, timeout=args.timeout, serial_port=serial_port)
+                finally:
+                    server, thread = _shutdown_transient_artifact_server(
+                        server,
+                        thread,
+                        collector=collector,
+                        reason="http_transfer_finished",
+                    )
                 _write_command_artifacts(collector=collector, prefix="device-pull-run", result=pull_exec_result)
                 pull_result = pull_exec_result.to_dict()
                 transfer_details = {
@@ -3304,7 +3312,19 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     helper_path=args.sd_http_helper_path,
                     list_name=args.sd_http_list_name,
                 )
-                helper_result = controller.execute(helper_command, timeout=args.timeout, serial_port=serial_port)
+                should_fallback_to_http = False
+                try:
+                    helper_result = controller.execute(helper_command, timeout=args.timeout, serial_port=serial_port)
+                    downloader = transfer_probe["capabilities"].get("downloader", "unknown")
+                    should_fallback_to_http = args.transfer_mode == "auto" and helper_result.exit_code != 0 and downloader not in {"none", "unknown"}
+                finally:
+                    if not should_fallback_to_http:
+                        server, thread = _shutdown_transient_artifact_server(
+                            server,
+                            thread,
+                            collector=collector,
+                            reason="sd_http_helper_transfer_finished",
+                        )
                 _write_command_artifacts(collector=collector, prefix="device-pull-sd-http-helper", result=helper_result)
                 pull_result = helper_result.to_dict()
                 transfer_details = {
@@ -3326,18 +3346,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     summary=f"Executed SD-card HTTP helper from {args.sd_http_helper_path}",
                     payload=pull_result,
                 )
-                downloader = transfer_probe["capabilities"].get("downloader", "unknown")
-                if args.transfer_mode == "auto" and helper_result.exit_code != 0 and downloader not in {"none", "unknown"}:
-                    pull_script_path = write_pull_script(
-                        root,
-                        base_url=base_url,
-                        workspace=workspace,
-                        script_name=args.pull_script_name,
-                        manifest_name=args.manifest_name,
-                        exclude_names=(args.sd_http_list_name,),
-                    )
-                    fallback_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
-                    fallback_result = controller.execute(fallback_command, timeout=args.timeout, serial_port=serial_port)
+                if should_fallback_to_http:
+                    try:
+                        pull_script_path = write_pull_script(
+                            root,
+                            base_url=base_url,
+                            workspace=workspace,
+                            script_name=args.pull_script_name,
+                            manifest_name=args.manifest_name,
+                            exclude_names=(args.sd_http_list_name,),
+                        )
+                        fallback_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
+                        fallback_result = controller.execute(fallback_command, timeout=args.timeout, serial_port=serial_port)
+                    finally:
+                        server, thread = _shutdown_transient_artifact_server(
+                            server,
+                            thread,
+                            collector=collector,
+                            reason="fallback_http_transfer_finished",
+                        )
                     _write_command_artifacts(
                         collector=collector,
                         prefix="device-pull-sd-http-helper-fallback-http",
@@ -3743,6 +3770,35 @@ def _run_host_build_command(command: str, *, timeout: float) -> dict[str, Any]:
         "stdout": completed.stdout.splitlines(),
         "stderr": completed.stderr.splitlines(),
     }
+
+
+def _shutdown_transient_artifact_server(
+    server,
+    thread,
+    *,
+    collector: EvidenceCollector | None = None,
+    reason: str = "transfer_finished",
+):
+    if server is None:
+        return None, None
+    payload: dict[str, Any] = {"reason": reason}
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception as exc:
+        payload["error"] = str(exc)
+    if thread is not None:
+        thread.join(timeout=2.0)
+        payload["thread_alive"] = bool(thread.is_alive())
+    if collector is not None:
+        collector.append_event(
+            event_type="artifact_server_closed",
+            source="artifact_server",
+            summary="Closed transient artifact HTTP server after device pull transfer.",
+            payload=payload,
+            severity="error" if payload.get("error") else "info",
+        )
+    return None, None
 
 
 def _default_sd_http_helper_source() -> Path:
