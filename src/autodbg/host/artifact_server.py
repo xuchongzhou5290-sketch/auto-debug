@@ -225,6 +225,32 @@ def write_pull_script(
     return script_path
 
 
+def write_transfer_list(
+    root: Path,
+    *,
+    list_name: str = "autodbg-files.txt",
+    include_names: tuple[str, ...] = (),
+    exclude_names: tuple[str, ...] = (),
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    excluded = {list_name, *exclude_names}
+    relative_paths: list[str] = []
+    for include_name in include_names:
+        if include_name not in excluded:
+            relative_paths.append(include_name)
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name in excluded:
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        if relative_path not in relative_paths:
+            relative_paths.append(relative_path)
+    list_path = root / list_name
+    list_path.write_text("\n".join(relative_paths) + ("\n" if relative_paths else ""), encoding="utf-8", newline="\n")
+    return list_path
+
+
 def serve_directory(
     root: Path,
     *,

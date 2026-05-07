@@ -251,7 +251,23 @@ def _build_remote_pull_command(base_url: str, *, workspace: str, script_name: st
     )
 
 
-def _build_transfer_probe_command() -> str:
+def _build_sd_http_helper_command(base_url: str, *, workspace: str, helper_path: str, list_name: str) -> str:
+    return (
+        f"chmod +x {_sh_single_quote(helper_path)} 2>/dev/null || true; "
+        f"{_sh_single_quote(helper_path)} "
+        f"{_sh_single_quote(base_url.rstrip('/'))} "
+        f"{_sh_single_quote(workspace)} "
+        f"{_sh_single_quote(list_name)}"
+    )
+
+
+def _build_transfer_probe_command(sd_http_helper_path: str | None = None) -> str:
+    helper_probe = "printf 'AUTODBG_SD_HTTP_HELPER=not_configured\\n'"
+    if sd_http_helper_path:
+        helper_probe = (
+            f"printf 'AUTODBG_SD_HTTP_HELPER='; "
+            f"if [ -f {_sh_single_quote(sd_http_helper_path)} ]; then printf 'yes\\n'; else printf 'no\\n'; fi"
+        )
     return (
         "printf 'AUTODBG_DOWNLOADER='; "
         "if command -v curl >/dev/null 2>&1; then printf 'curl\\n'; "
@@ -261,7 +277,8 @@ def _build_transfer_probe_command() -> str:
         "printf 'AUTODBG_BASE64='; "
         "if command -v base64 >/dev/null 2>&1; then printf 'yes\\n'; else printf 'no\\n'; fi; "
         "printf 'AUTODBG_TAR='; "
-        "if command -v tar >/dev/null 2>&1; then printf 'yes\\n'; else printf 'no\\n'; fi"
+        "if command -v tar >/dev/null 2>&1; then printf 'yes\\n'; else printf 'no\\n'; fi; "
+        f"{helper_probe}"
     )
 
 
@@ -435,6 +452,7 @@ def _parse_transfer_capabilities(output_lines: list[str]) -> dict[str, Any]:
         "downloader": "unknown",
         "has_base64": False,
         "has_tar": False,
+        "sd_http_helper": "unknown",
     }
     for raw_line in output_lines:
         line = raw_line.strip()
@@ -444,6 +462,8 @@ def _parse_transfer_capabilities(output_lines: list[str]) -> dict[str, Any]:
             capabilities["has_base64"] = line.partition("=")[2].lower() == "yes"
         elif line.startswith("AUTODBG_TAR="):
             capabilities["has_tar"] = line.partition("=")[2].lower() == "yes"
+        elif line.startswith("AUTODBG_SD_HTTP_HELPER="):
+            capabilities["sd_http_helper"] = line.partition("=")[2].lower()
     return capabilities
 
 
@@ -452,10 +472,18 @@ def _select_transfer_mode(requested_mode: str, *, capabilities: dict[str, Any], 
     has_base64 = bool(capabilities.get("has_base64"))
     has_tar = bool(capabilities.get("has_tar"))
 
+    if network_mode == "offline" and requested_mode in {"http", "sd_http_helper"}:
+        raise RuntimeError("Offline mode cannot use network HTTP transfer; use serial_bundle or auto.")
+
     if requested_mode == "http":
         if downloader in {"none", "unknown"}:
             raise RuntimeError("HTTP transfer requested, but the device has no usable downloader.")
         return "http"
+
+    if requested_mode == "sd_http_helper":
+        if capabilities.get("sd_http_helper") != "yes":
+            raise RuntimeError("SD HTTP helper transfer requested, but the helper executable was not found on the device.")
+        return "sd_http_helper"
 
     if requested_mode == "serial_bundle":
         if not has_base64 or not has_tar:
@@ -469,9 +497,11 @@ def _select_transfer_mode(requested_mode: str, *, capabilities: dict[str, Any], 
 
     if downloader not in {"none", "unknown"}:
         return "http"
+    if capabilities.get("sd_http_helper") == "yes":
+        return "sd_http_helper"
     if has_base64 and has_tar:
         return "serial_bundle"
-    raise RuntimeError("No usable transfer path found: downloader unavailable and serial bundle support missing.")
+    raise RuntimeError("No usable transfer path found: downloader unavailable, SD HTTP helper missing, and serial bundle support missing.")
 
 
 def _build_serial_bundle_commands(
@@ -556,4 +586,3 @@ def _execute_structured_command(
         output_lines=_extract_structured_output_lines(result.output_lines),
         transcript=result.transcript,
     )
-

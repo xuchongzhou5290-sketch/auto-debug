@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import urllib.request
 
-from autodbg.host.artifact_server import build_manifest, find_available_port, serve_directory, write_manifest, write_pull_script
+from autodbg.host.artifact_server import build_manifest, find_available_port, serve_directory, write_manifest, write_pull_script, write_transfer_list
 
 
 class ArtifactServerTest(unittest.TestCase):
@@ -55,6 +55,26 @@ class ArtifactServerTest(unittest.TestCase):
         self.assertIn('fetch_to_file "$BASE_URL/payload/agent.sh"', script_text)
         self.assertIn('verify_file "$WORKSPACE/payload/agent.sh"', script_text)
         self.assertIn("AUTODBG_PULL_OK", script_text)
+
+    def test_write_transfer_list_includes_manifest_and_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "payload").mkdir(parents=True, exist_ok=True)
+            (root / "payload" / "agent.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8", newline="\n")
+            (root / "autodbg-pull.sh").write_text("ignored\n", encoding="utf-8", newline="\n")
+
+            list_path = write_transfer_list(
+                root,
+                list_name="autodbg-files.txt",
+                include_names=("autodbg-manifest.json",),
+                exclude_names=("autodbg-pull.sh",),
+            )
+            lines = list_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(lines[0], "autodbg-manifest.json")
+        self.assertIn("payload/agent.sh", lines)
+        self.assertNotIn("autodbg-pull.sh", lines)
+        self.assertNotIn("autodbg-files.txt", lines)
 
     def test_serve_directory_exposes_health_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

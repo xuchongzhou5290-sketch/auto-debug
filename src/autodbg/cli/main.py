@@ -51,6 +51,7 @@ from autodbg.host.artifact_server import (
     write_artifact_server_registry,
     write_manifest,
     write_pull_script,
+    write_transfer_list,
 )
 from autodbg.host.network import detect_host_ipv4
 from autodbg.host.storage import get_drive_info, list_host_drives
@@ -491,9 +492,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     device_pull_parser.add_argument(
         "--transfer-mode",
-        choices=["auto", "http", "serial_bundle"],
+        choices=["auto", "http", "sd_http_helper", "serial_bundle"],
         default="auto",
-        help="Prefer HTTP pull, force serial bundle transfer, or auto-select based on device capabilities",
+        help="Prefer HTTP pull, SD-card HTTP helper, force serial bundle transfer, or auto-select based on device capabilities",
+    )
+    device_pull_parser.add_argument(
+        "--sd-http-helper-path",
+        default="/mnt/sdcard/autodbg/autodbg-http-pull",
+        help="Device-side path to the SD-card HTTP helper executable used by --transfer-mode sd_http_helper",
+    )
+    device_pull_parser.add_argument(
+        "--sd-http-list-name",
+        default="autodbg-files.txt",
+        help="Newline-delimited transfer list served to the SD-card HTTP helper",
     )
     device_pull_parser.add_argument(
         "--serial-bundle-chunk-size",
@@ -1234,6 +1245,7 @@ from autodbg.cli.transport import (
     _build_network_dir_resolver,
     _build_remote_pull_command,
     _build_serial_bundle_commands,
+    _build_sd_http_helper_command,
     _build_structured_command,
     _build_transfer_probe_command,
     _default_base_url,
@@ -2768,6 +2780,8 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "expected_effect",
             "manifest_name",
             "pull_script_name",
+            "sd_http_helper_path",
+            "sd_http_list_name",
             "serial_bundle_chunk_size",
             "timeout",
             "wifi_ssid",
@@ -2796,6 +2810,8 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "workspace": workspace,
                 "manifest_name": args.manifest_name,
                 "pull_script_name": args.pull_script_name,
+                "sd_http_helper_path": args.sd_http_helper_path,
+                "sd_http_list_name": args.sd_http_list_name,
                 "requested_transfer_mode": args.transfer_mode,
                 "serial_bundle_chunk_size": args.serial_bundle_chunk_size,
                 "list_command": list_command,
@@ -2813,23 +2829,25 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         },
     )
 
-    if args.mode == "offline" and args.transfer_mode == "http":
+    if args.mode == "offline" and args.transfer_mode in {"http", "sd_http_helper"}:
+        transfer_label = "HTTP" if args.transfer_mode == "http" else "SD HTTP helper"
+        error_text = f"Network mode is offline, so {transfer_label} transfer is not available."
         collector.update_summary(
             {
                 "status": "device_pull_blocked",
-                "error": "Network mode is offline, so HTTP transfer is not available.",
+                "error": error_text,
                 "state": state.to_dict(),
                 "result": build_result_contract(
                     action="device-pull",
                     decision="blocked",
                     failure_stage="prepare_transport",
                     retryable=True,
-                    stop_reason="Network mode is offline, so HTTP transfer is not available.",
+                    stop_reason=error_text,
                     key_excerpts=[
                         build_excerpt(
                             source="workflow_runner",
                             label="offline_http_unavailable",
-                            text="Network mode is offline, so HTTP transfer is not available.",
+                            text=error_text,
                             severity="warning",
                         )
                     ],
@@ -2841,7 +2859,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             }
         )
         print("[ oxx.. ] 2/5 steps")
-        print("[ERROR] Network mode is offline, so HTTP transfer is not available.")
+        print(f"[ERROR] {error_text}")
         print("[TODO] Retry with --transfer-mode serial_bundle or auto when the device supports base64 + tar.")
         return 1
 
@@ -3006,7 +3024,7 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     payload=result.to_dict(),
                 )
             transfer_probe_result = controller.execute(
-                _build_transfer_probe_command(),
+                _build_transfer_probe_command(args.sd_http_helper_path),
                 timeout=args.timeout,
                 serial_port=serial_port,
             )
@@ -3059,6 +3077,48 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     event_type="device_pull_run",
                     source="device_controller",
                     summary=f"Executed device pull script from {base_url}",
+                    payload=pull_result,
+                )
+            elif selected_transfer_mode == "sd_http_helper":
+                manifest_path = write_manifest(
+                    root,
+                    base_url=base_url,
+                    manifest_name=args.manifest_name,
+                    exclude_names=(args.pull_script_name, args.sd_http_list_name),
+                )
+                transfer_list_path = write_transfer_list(
+                    root,
+                    list_name=args.sd_http_list_name,
+                    include_names=(args.manifest_name,),
+                    exclude_names=(args.pull_script_name,),
+                )
+                server, thread = serve_directory(root, bind=args.bind, port=args.port)
+                helper_command = _build_sd_http_helper_command(
+                    base_url,
+                    workspace=workspace,
+                    helper_path=args.sd_http_helper_path,
+                    list_name=args.sd_http_list_name,
+                )
+                helper_result = controller.execute(helper_command, timeout=args.timeout, serial_port=serial_port)
+                _write_command_artifacts(collector=collector, prefix="device-pull-sd-http-helper", result=helper_result)
+                pull_result = helper_result.to_dict()
+                transfer_details = {
+                    "mode": "sd_http_helper",
+                    "server": {
+                        "root": str(root),
+                        "base_url": base_url,
+                        "manifest_path": str(manifest_path),
+                        "transfer_list_path": str(transfer_list_path),
+                    },
+                    "helper": {
+                        "device_path": args.sd_http_helper_path,
+                        "list_name": args.sd_http_list_name,
+                    },
+                }
+                collector.append_event(
+                    event_type="device_pull_sd_http_helper",
+                    source="device_controller",
+                    summary=f"Executed SD-card HTTP helper from {args.sd_http_helper_path}",
                     payload=pull_result,
                 )
             else:
@@ -3406,6 +3466,9 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         print("[DONE] Device pull completed successfully")
     if selected_transfer_mode == "http":
         print(f"[ACTIVE] Base URL: {base_url}/")
+    elif selected_transfer_mode == "sd_http_helper":
+        print(f"[ACTIVE] Base URL: {base_url}/")
+        print(f"[ACTIVE] SD HTTP helper: {args.sd_http_helper_path}")
     elif transfer_details:
         bundle_info = transfer_details.get("bundle", {})
         print(

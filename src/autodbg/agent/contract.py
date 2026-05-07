@@ -275,7 +275,7 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
     },
     "device-pull": {
         "category": "transport",
-        "summary": "Serve local artifacts and trigger a device-side pull via LAN or serial bundle fallback.",
+        "summary": "Serve local artifacts and trigger a device-side pull via LAN, SD HTTP helper, or serial bundle fallback.",
         "required_connection": ["serial_port", "device_password"],
         "recommended_connection": ["wifi_ssid", "wifi_password", "wifi_mode", "host_ip", "pull_base_url"],
         "common_options": [
@@ -285,6 +285,8 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
             "port",
             "bind",
             "list_command",
+            "sd_http_helper_path",
+            "sd_http_list_name",
             "post_pull_command",
             "reboot_command",
             "post_observe_seconds",

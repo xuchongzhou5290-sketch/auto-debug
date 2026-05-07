@@ -372,10 +372,21 @@ install-home-plugin
 .\.venv\Scripts\python -m autodbg artifact-server list
 .\.venv\Scripts\python -m autodbg artifact-server stop --port 8765
 .\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto
+.\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode sd_http_helper
 .\.venv\Scripts\python -m autodbg device-pull --mode offline --transfer-mode serial_bundle
 ```
 
 `serve-artifacts` 默认后台启动并返回 `pid / base_url / health_url / log`，避免阻塞 MCP 调用链；如果需要旧式前台阻塞模式，显式加 `--foreground`。
+
+当设备端没有 `curl / wget / busybox wget`，但可以从 SD 卡执行临时程序时，可以使用内置 C 源码构建一个最小 HTTP 拉取器：
+
+```powershell
+<target-gcc> -Os -static -o .\artifacts\autodbg-http-pull .\src\autodbg\assets\autodbg_http_pull.c
+.\.venv\Scripts\python -m autodbg stage-sd --source .\artifacts\autodbg-http-pull --target-subdir autodbg --dest-name autodbg-http-pull
+.\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto --sd-http-helper-path /mnt/sdcard/autodbg/autodbg-http-pull
+```
+
+`auto` 的选择顺序是：设备自带 downloader、SD 卡 HTTP helper、串口 base64+tar bundle。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。
 
 ### SD 卡落盘
 

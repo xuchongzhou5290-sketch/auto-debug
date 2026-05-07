@@ -253,6 +253,14 @@ cd <repo-root>
 
 `serve-artifacts` 已改为默认非阻塞：MCP 调用会返回后台 `pid / base_url / health_url / log`，不会把工具调用卡在 HTTP server 上。需要人工前台守住服务时，才显式传 `options.foreground=true`。端口占用时默认自动换到后续可用端口；需要严格失败时传 `options.no_auto_port=true`。
 
+`device-pull` 支持三类传输路径：
+
+- `transfer_mode=http`：设备端使用 `curl / wget / busybox wget` 从 PC artifact server 拉取
+- `transfer_mode=sd_http_helper`：设备端没有 downloader 时，执行 SD 卡内的 `autodbg-http-pull` 临时程序拉取
+- `transfer_mode=serial_bundle`：无网络时通过串口传 base64+tar bundle
+
+`transfer_mode=auto` 的优先级是 `http -> sd_http_helper -> serial_bundle`。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，应使用目标设备 C toolchain 编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
+
 ### 7.1 路径解析规则
 
 - 通过 `autodbg_action` 传入的路径字段，如果不是绝对路径，会按 `AUTO_DBG_PROJECT_ROOT` 解析

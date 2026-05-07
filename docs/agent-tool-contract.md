@@ -275,10 +275,19 @@ AI 想先拿自描述清单时，可以直接调用：
   },
   "options": {
     "mode": "lan_ready",
-    "transfer_mode": "auto"
+    "transfer_mode": "auto",
+    "sd_http_helper_path": "/mnt/sdcard/autodbg/autodbg-http-pull"
   }
 }
 ```
+
+`device-pull` 的 `transfer_mode=auto` 会按 `http -> sd_http_helper -> serial_bundle` 选择通道：
+
+- `http`：设备已有 `curl / wget / busybox wget`
+- `sd_http_helper`：设备没有 downloader，但 SD 卡内已放置 `autodbg-http-pull` 可执行文件
+- `serial_bundle`：网络不可用或只能通过串口传 base64+tar
+
+SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，需要用目标设备 toolchain 编译后通过 `stage-sd` 放入 SD 卡。
 
 ### 6.4 多轮继续跑 `run`
 

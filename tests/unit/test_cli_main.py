@@ -27,6 +27,7 @@ from autodbg.cli.main import (
     _build_network_dir_resolver,
     _build_remote_pull_command,
     _build_serial_bundle_commands,
+    _build_sd_http_helper_command,
     _build_transfer_probe_command,
     _command_run,
     _command_serial_broker,
@@ -268,11 +269,27 @@ class CliMainTest(unittest.TestCase):
         self.assertIn("curl -fsSL 'http://127.0.0.1:8765/autodbg-pull.sh'", command)
         self.assertIn("WORKSPACE='/mnt/sdcard/autodbg' sh 'autodbg-pull.sh'", command)
 
+    def test_build_sd_http_helper_command_executes_staged_helper(self) -> None:
+        command = _build_sd_http_helper_command(
+            "http://127.0.0.1:8765/",
+            workspace="/mnt/sdcard/autodbg",
+            helper_path="/mnt/sdcard/autodbg/autodbg-http-pull",
+            list_name="autodbg-files.txt",
+        )
+
+        self.assertIn("chmod +x '/mnt/sdcard/autodbg/autodbg-http-pull'", command)
+        self.assertIn(
+            "'/mnt/sdcard/autodbg/autodbg-http-pull' 'http://127.0.0.1:8765' '/mnt/sdcard/autodbg' 'autodbg-files.txt'",
+            command,
+        )
+
     def test_build_transfer_probe_command_checks_downloader_and_bundle_tools(self) -> None:
-        command = _build_transfer_probe_command()
+        command = _build_transfer_probe_command("/mnt/sdcard/autodbg/autodbg-http-pull")
         self.assertIn("AUTODBG_DOWNLOADER=", command)
         self.assertIn("AUTODBG_BASE64=", command)
         self.assertIn("AUTODBG_TAR=", command)
+        self.assertIn("AUTODBG_SD_HTTP_HELPER=", command)
+        self.assertIn("[ -f '/mnt/sdcard/autodbg/autodbg-http-pull' ]", command)
 
     def test_build_fetch_file_command_wraps_file_check_and_base64(self) -> None:
         command = _build_fetch_file_command("/mnt/sdcard/autodbg/hello.txt")
@@ -319,17 +336,19 @@ class CliMainTest(unittest.TestCase):
                 "AUTODBG_DOWNLOADER=none",
                 "AUTODBG_BASE64=yes",
                 "AUTODBG_TAR=yes",
+                "AUTODBG_SD_HTTP_HELPER=yes",
             ]
         )
         self.assertEqual(capabilities["downloader"], "none")
         self.assertTrue(capabilities["has_base64"])
         self.assertTrue(capabilities["has_tar"])
+        self.assertEqual(capabilities["sd_http_helper"], "yes")
 
-    def test_select_transfer_mode_prefers_http_then_serial_bundle(self) -> None:
+    def test_select_transfer_mode_prefers_http_then_sd_helper_then_serial_bundle(self) -> None:
         self.assertEqual(
             _select_transfer_mode(
                 "auto",
-                capabilities={"downloader": "curl", "has_base64": True, "has_tar": True},
+                capabilities={"downloader": "curl", "has_base64": True, "has_tar": True, "sd_http_helper": "yes"},
                 network_mode="lan_ready",
             ),
             "http",
@@ -337,11 +356,37 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(
             _select_transfer_mode(
                 "auto",
-                capabilities={"downloader": "none", "has_base64": True, "has_tar": True},
+                capabilities={"downloader": "none", "has_base64": False, "has_tar": False, "sd_http_helper": "yes"},
+                network_mode="lan_ready",
+            ),
+            "sd_http_helper",
+        )
+        self.assertEqual(
+            _select_transfer_mode(
+                "auto",
+                capabilities={"downloader": "none", "has_base64": True, "has_tar": True, "sd_http_helper": "no"},
                 network_mode="lan_ready",
             ),
             "serial_bundle",
         )
+
+    def test_select_transfer_mode_can_force_sd_http_helper(self) -> None:
+        self.assertEqual(
+            _select_transfer_mode(
+                "sd_http_helper",
+                capabilities={"downloader": "none", "has_base64": False, "has_tar": False, "sd_http_helper": "yes"},
+                network_mode="lan_ready",
+            ),
+            "sd_http_helper",
+        )
+
+    def test_select_transfer_mode_rejects_network_transfer_when_offline(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Offline mode cannot use network HTTP transfer"):
+            _select_transfer_mode(
+                "sd_http_helper",
+                capabilities={"downloader": "none", "has_base64": True, "has_tar": True, "sd_http_helper": "yes"},
+                network_mode="offline",
+            )
 
     def test_build_serial_bundle_commands_emits_prepare_upload_and_finalize_steps(self) -> None:
         prepare_command, upload_commands, finalize_command = _build_serial_bundle_commands(
