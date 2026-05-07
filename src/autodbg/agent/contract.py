@@ -1054,7 +1054,8 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             "ai_entrypoint": "watch-serial",
             "shared_owner": "raw-live broker",
             "rules": [
-                "If the user also needs live serial visibility, first guide them to open observe-serial in a separate terminal before long-running debug.",
+                "Serial control actions are broker-first: run, exec, health, collect-evidence, device-pull, and observe start or reuse a raw-live broker before controlling the device.",
+                "If the user also needs live serial visibility, guide them to open observe-serial in a separate terminal; this can attach even after the AI has started a broker-backed serial action.",
                 "When a human-facing observe window or broker-backed watcher is already running, prefer watch-serial without raw_live so the AI follows the shared trace instead of taking over the COM port again.",
                 "Use raw_live only when intentionally starting or attaching to the shared broker for both human and AI observers.",
                 "Do not stop serial-broker or close the broker-backed watcher until the human no longer needs the shared serial view.",

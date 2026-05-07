@@ -108,8 +108,9 @@
 这是关键规则：
 
 - AI 不能假设自己调用 `watch-serial` 就等于用户也看到了串口
-- 如果用户也要实时看串口，必须先引导用户在独立终端打开 `observe-serial` 或 `.\observe-serial.ps1`
-- AI 自己随后才使用 `watch-serial`
+- 串口主入口默认 broker-first，AI 执行串口控制动作时会优先启动或复用 raw-live broker
+- 如果用户也要实时看串口，引导用户在独立终端打开 `observe-serial` 或 `.\observe-serial.ps1`；AI 已经在使用串口时也可以再连到同一个 broker
+- AI 自己随后优先使用 `watch-serial`
 - `raw-live broker` 是物理串口的单一拥有者
 - 其他 `autodbg` 命令应该复用 broker，而不是重新直接抢串口
 

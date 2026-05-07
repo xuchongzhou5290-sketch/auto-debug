@@ -315,9 +315,10 @@ cd <repo-root>
 这是当前 MCP 接入最容易踩坑的地方：
 
 - AI 调 `watch-serial` 只能保证 AI 自己拿到共享 trace，不等于用户眼前自动出现一个串口窗口
-- 如果用户自己也要实时看串口，先引导用户在独立终端执行 `observe-serial`
+- 串口主入口默认 broker-first，`run / exec / health / collect-evidence / device-pull / observe` 会优先启动或复用 raw-live broker
+- 如果用户自己也要实时看串口，引导用户在独立终端执行 `observe-serial`；即使 AI 已经在跑串口命令，也可以再连到同一个 broker
 - 人工观察窗口起来后，AI 侧优先使用 `watch-serial`，但不要默认加 `raw_live`
-- 后续 `run / exec / health / collect-evidence` 应复用同一个 broker，不要重新抢物理串口
+- 后续串口动作应复用同一个 broker，不要重新抢物理串口
 - 只要用户还在看串口，AI 就不应主动调 `serial-broker-stop`
 
 推荐顺序：

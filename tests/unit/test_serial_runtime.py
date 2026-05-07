@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import contextmanager
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -6,7 +7,71 @@ from unittest.mock import patch
 from autodbg.serial import runtime
 
 
+@contextmanager
+def _null_context():
+    yield
+
+
 class SerialRuntimeTest(unittest.TestCase):
+    def test_open_serial_port_starts_local_broker_when_missing(self) -> None:
+        class FakeBroker:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        class FakeBrokerSerialPort:
+            def __init__(self, *, broker_registry, serial_port: str, timeout: float) -> None:
+                self.broker_registry = broker_registry
+                self.serial_port = serial_port
+                self.timeout = timeout
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        broker = FakeBroker()
+        registry = runtime.SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=1234,
+            serial_port="COM19",
+            baudrate=115200,
+        )
+
+        with (
+            patch.object(runtime, "load_serial_broker_registry", side_effect=[None, registry]),
+            patch.object(runtime, "_start_local_serial_broker", return_value=broker) as start_mock,
+            patch.object(runtime, "_BrokerSerialPort", FakeBrokerSerialPort),
+            patch.object(runtime, "_acquire_control_lock", return_value=_null_context()),
+        ):
+            with runtime.open_serial_port("COM19", 115200, timeout=0.2) as handle:
+                self.assertEqual(handle.serial_port, "COM19")
+                self.assertEqual(handle.broker_registry.tcp_port, 9001)
+
+        start_mock.assert_called_once_with("COM19", baudrate=115200, timeout=0.2)
+        self.assertTrue(handle.closed)
+        self.assertTrue(broker.stopped)
+
+    def test_open_serial_port_can_disable_broker_first_for_direct_access(self) -> None:
+        fake_handle = object()
+
+        @contextmanager
+        def fake_direct(_port: str, _baudrate: int, _timeout: float):
+            yield fake_handle
+
+        with (
+            patch.object(runtime, "load_serial_broker_registry", return_value=None),
+            patch.object(runtime, "_start_local_serial_broker") as start_mock,
+            patch.object(runtime, "_open_direct_serial_port", side_effect=fake_direct) as direct_mock,
+        ):
+            with runtime.open_serial_port("COM19", 115200, timeout=0.2, broker_first=False) as handle:
+                self.assertIs(handle, fake_handle)
+
+        start_mock.assert_not_called()
+        direct_mock.assert_called_once()
+
     def test_serial_trace_stream_client_reads_trace_entries(self) -> None:
         class FakeSocket:
             def __init__(self) -> None:

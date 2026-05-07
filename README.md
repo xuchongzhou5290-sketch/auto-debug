@@ -221,7 +221,8 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - 请求里的相对路径会按 `project_root` 解析；走 MCP / 已安装插件时，这个根目录就是 `AUTO_DBG_PROJECT_ROOT`
 - 如果要做自动多轮调试，使用顶层 `loop` 字段传 `prev_session / iteration / goal`
 - 每轮代码或配置修改后，可以用 `record-intervention` 追加结构化干预记录
-- 如果 AI 在后台调用时，用户自己也要直接看串口，先让用户在独立终端执行 `observe-serial`，AI 再走 `watch-serial` 或直接跑会复用 broker 的动作
+- 串口主入口现在默认 broker-first：AI 执行 `run / exec / health / collect-evidence / device-pull / observe` 时会优先启动或复用 raw-live broker，再通过 broker 控制串口
+- 如果 AI 已经在后台执行串口动作，用户可以再开 `observe-serial` 或 `watch-serial --follow` 连接同一个 broker，而不是直接抢物理 COM 口
 
 详细约定见：
 

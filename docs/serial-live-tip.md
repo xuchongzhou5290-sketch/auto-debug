@@ -183,11 +183,11 @@ context_lines = 5
 
 ## 5. 结论
 
-- `observe`：直接碰物理串口
+- `observe`：通过 broker-first 入口观察串口，必要时临时启动 broker
 - `watch-serial`：默认只看共享 trace
 - `watch-serial --raw-live`：故意长期占用物理串口
 - `observe-serial.ps1`：推荐的一键长期观察入口
 - `serial-broker stop`：释放遗留 raw-live broker
-- 人工 + AI 协同时：先人工 `observe-serial`，再让 AI 复用 broker
+- 人工 + AI 协同时：优先先人工 `observe-serial`；如果 AI 已经在跑串口动作，人工再开 `observe-serial` 或 `watch-serial --follow` 连接已有 broker
 
 如果你已经在当前 shell 里设置了 `AUTO_DBG_SERIAL_PORT`，那么大多数串口主命令都不再需要重复传四个 profile 路径。

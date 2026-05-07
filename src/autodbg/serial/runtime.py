@@ -224,7 +224,7 @@ def list_serial_ports() -> list[dict[str, str]]:
 
 
 @contextmanager
-def open_serial_port(port: str, baudrate: int, timeout: float = 0.2):
+def open_serial_port(port: str, baudrate: int, timeout: float = 0.2, *, broker_first: bool = True):
     broker_registry = load_serial_broker_registry(port)
     if broker_registry is not None:
         with _acquire_control_lock(port):
@@ -238,8 +238,39 @@ def open_serial_port(port: str, baudrate: int, timeout: float = 0.2):
             finally:
                 handle.close()
         return
+    if broker_first:
+        broker = _start_local_serial_broker(port, baudrate=baudrate, timeout=timeout)
+        try:
+            broker_registry = load_serial_broker_registry(port)
+            if broker_registry is None:
+                raise RuntimeError(f"Failed to start raw serial broker for {port}.")
+            with _acquire_control_lock(port):
+                handle = _BrokerSerialPort(
+                    broker_registry=broker_registry,
+                    serial_port=port,
+                    timeout=timeout,
+                )
+                try:
+                    yield handle
+                finally:
+                    handle.close()
+        finally:
+            broker.stop()
+        return
     with _open_direct_serial_port(port, baudrate, timeout) as handle:
         yield handle
+
+
+def _start_local_serial_broker(port: str, *, baudrate: int, timeout: float):
+    from autodbg.serial.broker import SerialBroker
+
+    broker = SerialBroker(
+        serial_port=port,
+        baudrate=baudrate,
+        timeout=timeout,
+    )
+    broker.start()
+    return broker
 
 
 @contextmanager
