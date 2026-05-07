@@ -141,6 +141,28 @@ class AgentContractTest(unittest.TestCase):
         )
         self.assertEqual(invocation.env_updates["AUTO_DBG_DEVICE_PASSWORD"], "secret")
 
+    def test_build_agent_invocation_supports_sd_http_helper_cross_compile(self) -> None:
+        project_root = Path("C:/repo/auto-debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "build-sd-http-helper",
+                "options": {
+                    "cc": "arm-linux-gnueabihf-gcc",
+                    "output": "artifacts/autodbg-http-pull",
+                    "cflag": ["-Wall"],
+                    "static": False,
+                },
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv[0], "build-sd-http-helper")
+        self.assertIn("--cc", invocation.argv)
+        self.assertEqual(invocation.argv[invocation.argv.index("--output") + 1], "C:\\repo\\auto-debug\\artifacts\\autodbg-http-pull")
+        self.assertIn("--cflag=-Wall", invocation.argv)
+        self.assertIn("--no-static", invocation.argv)
+        self.assertIsNone(invocation.artifacts_root)
+
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
         manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 
@@ -158,6 +180,7 @@ class AgentContractTest(unittest.TestCase):
         )
         action_names = {action["name"] for action in manifest["actions"]}
         self.assertIn("deploy-verify", action_names)
+        self.assertIn("build-sd-http-helper", action_names)
         self.assertIn("deploy-verify", manifest["required_inputs"]["conditional"]["device_password"])
 
     def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
@@ -188,6 +211,13 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(plan["inferred_action"], "deploy-verify")
         missing_fields = [item["field"] for item in plan["missing_required"]]
         self.assertEqual(missing_fields, ["serial_port", "device_password"])
+
+    def test_build_agent_intake_plan_infers_sd_http_helper_build_goal(self) -> None:
+        plan = build_agent_intake_plan({"goal": "交叉编译 autodbg-http-pull"}, project_root=Path("C:/repo/auto-debug"))
+
+        self.assertEqual(plan["action"], "build-sd-http-helper")
+        self.assertEqual(plan["inferred_action"], "build-sd-http-helper")
+        self.assertEqual([item["field"] for item in plan["missing_required"]], ["cc"])
 
     def test_command_agent_call_returns_structured_json_and_detects_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -118,6 +118,11 @@ _FIELD_PROMPTS: dict[str, dict[str, Any]] = {
         "question": "请提供要下发或复制的本地源文件路径。",
         "example": "payloads\\APP_FT.bin",
     },
+    "cc": {
+        "target": "options",
+        "question": "请提供目标设备交叉编译器路径或命令名，例如 arm-linux-gnueabihf-gcc。",
+        "example": "arm-linux-gnueabihf-gcc",
+    },
     "artifact": {
         "target": "options",
         "question": "请提供本轮要部署或验证的本地产物路径。",
@@ -160,6 +165,7 @@ _REQUIRED_ACTION_OPTIONS: dict[str, list[str]] = {
     "fetch-file": ["remote_path"],
     "fetch-path": ["remote_path"],
     "stage-sd": ["source"],
+    "build-sd-http-helper": ["cc"],
     "summary": ["session_dir"],
     "resume": ["session_dir"],
     "record-intervention": ["session_dir", "kind", "summary"],
@@ -177,6 +183,7 @@ _DEFAULT_ACTION_SUGGESTIONS = [
     {"action": "health", "when": "用户想审计设备进程、SD、网络等健康状态"},
     {"action": "deploy-verify", "when": "用户想闭环执行构建、部署、重启、串口观察和目标验证"},
     {"action": "fetch-file", "when": "用户想从设备拉取单个文件"},
+    {"action": "build-sd-http-helper", "when": "用户想为目标设备交叉编译 SD 卡 HTTP 拉取辅助程序"},
     {"action": "device-pull", "when": "用户想让设备从 PC artifact server 拉取文件"},
     {"action": "report", "when": "用户想查看已有 session 报告"},
 ]
@@ -297,6 +304,14 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
             "timeout",
         ],
         "creates_session": True,
+    },
+    "build-sd-http-helper": {
+        "category": "transport",
+        "summary": "Cross-compile the bundled C SD-card HTTP helper so devices without curl/wget can pull from the PC artifact server.",
+        "required_connection": [],
+        "recommended_connection": [],
+        "common_options": ["cc", "source", "output", "cflag", "static", "timeout"],
+        "creates_session": False,
     },
     "deploy-verify": {
         "category": "workflow",
@@ -515,6 +530,15 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
         if command_name == "watch-serial" and key in {"serial_port", "baudrate"}:
             continue
         if command_name == "serial-broker" and key == "serial_port":
+            continue
+        if command_name == "build-sd-http-helper" and key == "static" and value is False:
+            argv.append("--no-static")
+            continue
+        if command_name == "build-sd-http-helper" and key == "cflag":
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if item is not None:
+                    argv.append(f"--cflag={item}")
             continue
         flag = "--" + key.replace("_", "-")
         if key in {"source", "root", "output", "session_dir", "prev_session", "artifact", "changed_file"}:
@@ -934,6 +958,8 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return "fetch-file"
     if any(token in text for token in ["闭环", "升级验证", "构建部署", "deploy verify", "deploy-verify", "build deploy", "刷机验证"]):
         return "deploy-verify"
+    if any(token in text for token in ["交叉编译", "编译辅助", "sd http helper", "build-sd-http-helper", "autodbg-http-pull"]):
+        return "build-sd-http-helper"
     if any(token in text for token in ["下发", "拉包", "device pull", "lanupg", "artifact"]):
         return "device-pull"
     if any(token in text for token in ["报告", "report"]):

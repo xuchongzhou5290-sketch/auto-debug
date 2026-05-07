@@ -20,6 +20,7 @@ from autodbg.cli.main import (
     _build_health_checks,
     _build_auto_wlan_bootstrap_commands,
     _build_collect_evidence_commands,
+    _build_sd_http_helper_compile_command,
     _build_structured_command,
     _default_collect_evidence_files,
     _build_fetch_file_command,
@@ -344,22 +345,22 @@ class CliMainTest(unittest.TestCase):
         self.assertTrue(capabilities["has_tar"])
         self.assertEqual(capabilities["sd_http_helper"], "yes")
 
-    def test_select_transfer_mode_prefers_http_then_sd_helper_then_serial_bundle(self) -> None:
+    def test_select_transfer_mode_prefers_sd_helper_then_http_then_serial_bundle(self) -> None:
         self.assertEqual(
             _select_transfer_mode(
                 "auto",
                 capabilities={"downloader": "curl", "has_base64": True, "has_tar": True, "sd_http_helper": "yes"},
                 network_mode="lan_ready",
             ),
-            "http",
+            "sd_http_helper",
         )
         self.assertEqual(
             _select_transfer_mode(
                 "auto",
-                capabilities={"downloader": "none", "has_base64": False, "has_tar": False, "sd_http_helper": "yes"},
+                capabilities={"downloader": "curl", "has_base64": False, "has_tar": False, "sd_http_helper": "no"},
                 network_mode="lan_ready",
             ),
-            "sd_http_helper",
+            "http",
         )
         self.assertEqual(
             _select_transfer_mode(
@@ -379,6 +380,24 @@ class CliMainTest(unittest.TestCase):
             ),
             "sd_http_helper",
         )
+
+    def test_build_sd_http_helper_compile_command_uses_cross_compiler(self) -> None:
+        args = argparse.Namespace(
+            cc="arm-linux-gnueabihf-gcc",
+            source=Path("src/autodbg/assets/autodbg_http_pull.c"),
+            output=Path("artifacts/autodbg-http-pull"),
+            cflag=["-Wall"],
+            static=False,
+        )
+
+        command, source, output = _build_sd_http_helper_compile_command(args)
+
+        self.assertEqual(command[0], "arm-linux-gnueabihf-gcc")
+        self.assertIn("-Os", command)
+        self.assertIn("-Wall", command)
+        self.assertNotIn("-static", command)
+        self.assertEqual(source, Path(__file__).resolve().parents[2] / "src" / "autodbg" / "assets" / "autodbg_http_pull.c")
+        self.assertEqual(output, Path(__file__).resolve().parents[2] / "artifacts" / "autodbg-http-pull")
 
     def test_select_transfer_mode_rejects_network_transfer_when_offline(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "Offline mode cannot use network HTTP transfer"):
@@ -478,6 +497,26 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(args.expect_marker, ["LeCam ready"])
         self.assertEqual(args.reject_marker, ["panic"])
         self.assertEqual(args.expected_version, "2.0.0.300")
+
+    def test_build_parser_accepts_sd_http_helper_build_args(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "build-sd-http-helper",
+                "--cc",
+                "arm-linux-gnueabihf-gcc",
+                "--output",
+                "artifacts/autodbg-http-pull",
+                "--cflag=-Wall",
+                "--no-static",
+            ]
+        )
+
+        self.assertEqual(args.command, "build-sd-http-helper")
+        self.assertEqual(args.cc, "arm-linux-gnueabihf-gcc")
+        self.assertEqual(args.output, Path("artifacts/autodbg-http-pull"))
+        self.assertEqual(args.cflag, ["-Wall"])
+        self.assertFalse(args.static)
 
     def test_evaluate_validation_spec_requires_expected_markers_and_rejects_bad_markers(self) -> None:
         validation = _evaluate_validation_spec(

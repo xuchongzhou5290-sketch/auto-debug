@@ -495,10 +495,10 @@ def _select_transfer_mode(requested_mode: str, *, capabilities: dict[str, Any], 
             return "serial_bundle"
         raise RuntimeError("Offline mode requires serial bundle support (base64 + tar), but the device does not provide it.")
 
-    if downloader not in {"none", "unknown"}:
-        return "http"
     if capabilities.get("sd_http_helper") == "yes":
         return "sd_http_helper"
+    if downloader not in {"none", "unknown"}:
+        return "http"
     if has_base64 and has_tar:
         return "serial_bundle"
     raise RuntimeError("No usable transfer path found: downloader unavailable, SD HTTP helper missing, and serial bundle support missing.")

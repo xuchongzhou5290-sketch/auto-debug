@@ -281,13 +281,26 @@ AI 想先拿自描述清单时，可以直接调用：
 }
 ```
 
-`device-pull` 的 `transfer_mode=auto` 会按 `http -> sd_http_helper -> serial_bundle` 选择通道：
+`device-pull` 的 `transfer_mode=auto` 会按 `sd_http_helper -> http -> serial_bundle` 选择通道：
 
-- `http`：设备已有 `curl / wget / busybox wget`
 - `sd_http_helper`：设备没有 downloader，但 SD 卡内已放置 `autodbg-http-pull` 可执行文件
+- `http`：设备已有 `curl / wget / busybox wget`
 - `serial_bundle`：网络不可用或只能通过串口传 base64+tar
 
-SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，需要用目标设备 toolchain 编译后通过 `stage-sd` 放入 SD 卡。
+SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，AI 作为 MCP 使用时可以先调用 `build-sd-http-helper` 交叉编译：
+
+```json
+{
+  "schema_version": 1,
+  "action": "build-sd-http-helper",
+  "options": {
+    "cc": "arm-linux-gnueabihf-gcc",
+    "output": "artifacts/autodbg-http-pull"
+  }
+}
+```
+
+编译成功后再通过 `stage-sd` 放入 SD 卡。若目标 toolchain 不支持静态链接，传 `options.static=false`。
 
 ### 6.4 多轮继续跑 `run`
 

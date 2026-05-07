@@ -534,6 +534,38 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_intervention_arguments(device_pull_parser)
     device_pull_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout in seconds for each shell command")
 
+    helper_build_parser = subparsers.add_parser(
+        "build-sd-http-helper",
+        help="Cross-compile the bundled SD-card HTTP helper for the target device",
+    )
+    helper_build_parser.add_argument("--cc", required=True, help="Target C compiler, for example arm-linux-gnueabihf-gcc")
+    helper_build_parser.add_argument(
+        "--source",
+        type=Path,
+        default=Path("src/autodbg/assets/autodbg_http_pull.c"),
+        help="C source file for the helper",
+    )
+    helper_build_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts/autodbg-http-pull"),
+        help="Output executable path",
+    )
+    helper_build_parser.add_argument(
+        "--cflag",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="Additional compiler flag; repeatable",
+    )
+    helper_build_parser.add_argument(
+        "--static",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass -static to the compiler by default; use --no-static when the target toolchain cannot link statically",
+    )
+    helper_build_parser.add_argument("--timeout", type=float, default=120.0, help="Compiler timeout in seconds")
+
     deploy_verify_parser = subparsers.add_parser(
         "deploy-verify",
         help="Run a closed debug loop: optional build, deploy/apply commands, observation, and target validation",
@@ -3498,6 +3530,78 @@ def _run_host_build_command(command: str, *, timeout: float) -> dict[str, Any]:
     }
 
 
+def _build_sd_http_helper_compile_command(args: argparse.Namespace) -> tuple[list[str], Path, Path]:
+    source = args.source
+    output = args.output
+    if not source.is_absolute():
+        source = _project_root() / source
+    if not output.is_absolute():
+        output = _project_root() / output
+    cflags = ["-Os", *list(args.cflag)]
+    if args.static:
+        cflags.append("-static")
+    command = [args.cc, *cflags, "-o", str(output), str(source)]
+    return command, source, output
+
+
+def _command_build_sd_http_helper(args: argparse.Namespace) -> int:
+    command, source, output = _build_sd_http_helper_compile_command(args)
+    print("[ ●●○○○ ] 2/5 steps")
+    print(f"[ACTIVE] Compiler: {args.cc}")
+    print(f"[ACTIVE] Source: {source}")
+    print(f"[ACTIVE] Output: {output}")
+
+    if not source.is_file():
+        print(f"[ERROR] Helper source not found: {source}")
+        print("[TODO] Check --source or reinstall the local MCP tool.")
+        return 2
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=_project_root(),
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
+    except FileNotFoundError:
+        print(f"[ERROR] Compiler not found: {args.cc}")
+        print("[TODO] Provide a target cross compiler path with --cc, or add it to PATH.")
+        return 127
+    except subprocess.TimeoutExpired:
+        print(f"[ERROR] Compiler timed out after {args.timeout:.1f}s")
+        print("[TODO] Check the target toolchain or increase --timeout.")
+        return 124
+
+    payload = {
+        "command": command,
+        "source": str(source),
+        "output": str(output),
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout.splitlines(),
+        "stderr": completed.stderr.splitlines(),
+        "output_exists": output.is_file(),
+        "output_size_bytes": output.stat().st_size if output.is_file() else 0,
+        "next_actions": [
+            {
+                "action": "stage-sd",
+                "reason": "Copy the compiled helper to /mnt/sdcard/autodbg/autodbg-http-pull before device-pull auto selection.",
+                "source": str(output),
+                "target_subdir": "autodbg",
+                "dest_name": "autodbg-http-pull",
+            }
+        ],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if completed.returncode == 0:
+        print("[DONE] SD HTTP helper built")
+        return 0
+    print("[ERROR] SD HTTP helper build failed")
+    print("[TODO] Inspect compiler stderr and adjust --cc / --cflag / --no-static.")
+    return completed.returncode
+
+
 def _command_deploy_verify(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
     session, loop_context = _create_session_with_loop(
@@ -4961,6 +5065,8 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_artifact_server(args)
     if args.command == "device-pull":
         return _command_device_pull(args)
+    if args.command == "build-sd-http-helper":
+        return _command_build_sd_http_helper(args)
     if args.command == "deploy-verify":
         return _command_deploy_verify(args)
     if args.command == "observe":

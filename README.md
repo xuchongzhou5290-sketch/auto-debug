@@ -381,12 +381,12 @@ install-home-plugin
 当设备端没有 `curl / wget / busybox wget`，但可以从 SD 卡执行临时程序时，可以使用内置 C 源码构建一个最小 HTTP 拉取器：
 
 ```powershell
-<target-gcc> -Os -static -o .\artifacts\autodbg-http-pull .\src\autodbg\assets\autodbg_http_pull.c
+.\.venv\Scripts\python -m autodbg build-sd-http-helper --cc <target-gcc> --output .\artifacts\autodbg-http-pull
 .\.venv\Scripts\python -m autodbg stage-sd --source .\artifacts\autodbg-http-pull --target-subdir autodbg --dest-name autodbg-http-pull
 .\.venv\Scripts\python -m autodbg device-pull --mode lan_ready --transfer-mode auto --sd-http-helper-path /mnt/sdcard/autodbg/autodbg-http-pull
 ```
 
-`auto` 的选择顺序是：设备自带 downloader、SD 卡 HTTP helper、串口 base64+tar bundle。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。
+`auto` 的选择顺序是：SD 卡 HTTP helper、设备自带 downloader、串口 base64+tar bundle。强制走 SD helper 时传 `--transfer-mode sd_http_helper`。该 helper 只依赖 libc/POSIX socket，只支持普通 HTTP，不支持 HTTPS。目标 toolchain 不支持静态链接时给 `build-sd-http-helper` 加 `--no-static`。
 
 ### SD 卡落盘
 

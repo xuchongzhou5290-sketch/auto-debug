@@ -255,11 +255,25 @@ cd <repo-root>
 
 `device-pull` 支持三类传输路径：
 
-- `transfer_mode=http`：设备端使用 `curl / wget / busybox wget` 从 PC artifact server 拉取
 - `transfer_mode=sd_http_helper`：设备端没有 downloader 时，执行 SD 卡内的 `autodbg-http-pull` 临时程序拉取
+- `transfer_mode=http`：设备端使用 `curl / wget / busybox wget` 从 PC artifact server 拉取
 - `transfer_mode=serial_bundle`：无网络时通过串口传 base64+tar bundle
 
-`transfer_mode=auto` 的优先级是 `http -> sd_http_helper -> serial_bundle`。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，应使用目标设备 C toolchain 编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
+`transfer_mode=auto` 的优先级是 `sd_http_helper -> http -> serial_bundle`。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，MCP Agent 可以调用 `build-sd-http-helper` 使用目标设备 C toolchain 交叉编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
+
+示例：
+
+```json
+{
+  "schema_version": 1,
+  "action": "build-sd-http-helper",
+  "options": {
+    "cc": "arm-linux-gnueabihf-gcc",
+    "output": "artifacts/autodbg-http-pull",
+    "static": false
+  }
+}
+```
 
 ### 7.1 路径解析规则
 
