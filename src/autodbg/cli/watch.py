@@ -10,10 +10,6 @@ import sys
 import time
 from typing import Any
 
-from autodbg.cli.main import (
-    _load_profiles_from_args,
-    _resolve_serial_connection_from_settings,
-)
 from autodbg.control.controller import LoginResult
 from autodbg.serial.broker import SerialBroker
 from autodbg.serial.observer import MarkerHit
@@ -62,6 +58,13 @@ def _resolve_watch_start_index(*, last_count: int, entry_count: int, tail: int, 
 def _print_trace_entries(entries: list[SerialTraceEntry], *, show_system: bool) -> None:
     for entry in entries:
         _print_watch_trace_entry(entry, show_system=show_system)
+
+
+def _format_trace_entry(entry: SerialTraceEntry) -> str:
+    stamp = entry.timestamp.split("T")[-1]
+    direction = entry.direction.upper()
+    payload = entry.payload if entry.payload else "(empty line)"
+    return f"[{direction} {stamp}] {payload}"
 
 
 def _print_watch_trace_entry(entry: SerialTraceEntry, *, show_system: bool) -> bool:
@@ -889,7 +892,7 @@ def _follow_trace_via_broker(
 
 def _command_watch_serial(args: argparse.Namespace) -> int:
     cli_main = _cli_main_module()
-    serial_port, baudrate = _resolve_serial_connection_from_settings(
+    serial_port, baudrate = cli_main._resolve_serial_connection_from_settings(
         args,
         serial_port=getattr(args, "serial_port", None),
         baudrate=getattr(args, "baudrate", None),

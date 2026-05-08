@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 from autodbg.cli.main import (
     _build_parser,
+    _apply_watch_trace_entry_to_tui_state,
     _command_describe_agent_tool,
     _command_install_home_plugin,
     _command_install_local_tool,
@@ -1090,6 +1092,37 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(rows[-1].rstrip(), "[INPUT COM19]")
         self.assertEqual(cursor_row, 7)
         self.assertGreaterEqual(cursor_col, len("[INPUT COM19] "))
+
+    def test_apply_watch_trace_entry_to_tui_state_formats_non_system_entries(self) -> None:
+        state = _WatchStdinShellState()
+        entry = SerialTraceEntry(
+            timestamp="2026-05-08T12:34:56.789",
+            port="COM19",
+            direction="rx",
+            payload="boot ready",
+            pid=1234,
+        )
+
+        _apply_watch_trace_entry_to_tui_state(entry, show_system=False, state=state)
+
+        self.assertEqual(state.recent_lines[-1], "[RX 12:34:56.789] boot ready")
+        self.assertTrue(state.screen_dirty)
+
+    def test_cli_watch_imports_without_main_cycle(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from autodbg.cli.watch import _WatchStdinShellState; print(_WatchStdinShellState.__name__)",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("_WatchStdinShellState", result.stdout)
 
     def test_build_watch_tui_rows_marks_history_offset_in_status_line(self) -> None:
         state = _WatchStdinShellState()
