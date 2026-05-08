@@ -598,6 +598,39 @@ class CliMainTest(unittest.TestCase):
         self.assertFalse(plan["ready"])
         self.assertEqual(plan["next_requests"][0]["action"], "ports")
 
+    def test_build_quickstart_action_plan_guides_package_pull_through_sd_helper(self) -> None:
+        args = argparse.Namespace(
+            goal="拉取新包",
+            serial_port="COM19",
+            baudrate=115200,
+            device_password_known=True,
+            sdcard_drive="E:",
+            helper_cc="arm-linux-gnueabihf-gcc",
+            artifact=Path("payloads/APP.bin"),
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertTrue(plan["ready"])
+        self.assertEqual(plan["goal"], "device_pull")
+        self.assertEqual(
+            [request["action"] for request in plan["next_requests"]],
+            ["build-sd-http-helper", "stage-sd", "device-pull"],
+        )
+        self.assertEqual(plan["next_requests"][0]["options"]["cc"], "arm-linux-gnueabihf-gcc")
+        self.assertEqual(plan["next_requests"][0]["options"]["output"], "artifacts/autodbg-http-pull")
+        self.assertEqual(plan["next_requests"][1]["connection"]["sdcard_drive"], "E:")
+        self.assertEqual(plan["next_requests"][1]["options"]["dest_name"], "autodbg-http-pull")
+        self.assertEqual(plan["next_requests"][2]["options"]["transfer_mode"], "auto")
+        self.assertEqual(
+            plan["next_requests"][2]["options"]["sd_http_helper_path"],
+            "/mnt/sdcard/autodbg/autodbg-http-pull",
+        )
+        self.assertEqual(plan["next_requests"][2]["options"]["root"], "payloads")
+        self.assertTrue(
+            any("build-sd-http-helper" in instruction and "device-pull" in instruction for instruction in plan["agent_instructions"])
+        )
+
     def test_build_quickstart_action_plan_limits_questions_for_unknown_goal(self) -> None:
         args = argparse.Namespace(
             goal=None,

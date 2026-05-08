@@ -291,6 +291,7 @@ install-home-plugin
 ```powershell
 .\.venv\Scripts\python -m autodbg quickstart --goal "观察设备启动日志"
 .\.venv\Scripts\python -m autodbg quickstart --goal "升级后验证" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
+.\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin --helper-cc arm-linux-gnueabihf-gcc --sdcard-drive E:
 ```
 
 MCP Agent 可以直接调用：
@@ -305,7 +306,7 @@ MCP Agent 可以直接调用：
 }
 ```
 
-`quickstart` 会返回检测到的串口、最多 3 个待询问问题，以及下一步建议的 MCP request。AI 拿到 `next_requests` 后应先对选中的请求调用 `autodbg_prepare`，确认参数齐全后再执行 `autodbg_action`。
+`quickstart` 会返回检测到的串口、最多 3 个待询问问题，以及下一步建议的 MCP request。AI 拿到 `next_requests` 后应先对选中的请求调用 `autodbg_prepare`，确认参数齐全后再执行 `autodbg_action`。当目标是“拉取/下发新包”时，默认引导顺序是 `build-sd-http-helper -> stage-sd -> device-pull`：先用目标设备 C toolchain 交叉编译 SD 卡 HTTP 拉取器，再放入 SD 卡，最后让设备通过 `transfer_mode=auto` 优先使用该 helper 拉取新包。
 
 ### 串口观察
 

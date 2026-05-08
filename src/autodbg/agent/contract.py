@@ -979,7 +979,7 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return "deploy-verify"
     if any(token in text for token in ["交叉编译", "编译辅助", "sd http helper", "build-sd-http-helper", "autodbg-http-pull"]):
         return "build-sd-http-helper"
-    if any(token in text for token in ["下发", "拉包", "device pull", "lanupg", "artifact"]):
+    if any(token in text for token in ["下发", "拉取", "拉包", "新包", "升级包", "device pull", "lanupg", "artifact"]):
         return "device-pull"
     if any(token in text for token in ["报告", "report"]):
         return "report"
@@ -1127,6 +1127,7 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             "Prefer watch-serial without raw_live when a human-facing observe window already owns the shared broker.",
             "Raw-live broker mode is the single owner of the physical COM port; other autodbg commands should reuse the broker instead of opening the port directly.",
             "Do not stop serial-broker while the operator still needs the shared serial view.",
+            "When the user wants to pull or deploy a new package, default to preparing the SD HTTP helper first: build-sd-http-helper with the target C toolchain, stage-sd it as /mnt/sdcard/autodbg/autodbg-http-pull, then run device-pull with transfer_mode=auto and sd_http_helper_path.",
             "Use ok plus exit_code from the JSON response as the source of truth, not the outer shell exit code.",
             "Most control and evidence actions create a session directory under artifacts and may also write retrieved files under retrieved.",
             "When a transient status appears in the watch TUI, it automatically falls back to the default operation hints after a few seconds.",
@@ -1143,6 +1144,10 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             {
                 "name": "deploy_and_verify",
                 "steps": ["stage-sd or device-pull", "run", "fetch-file or fetch-path", "report"],
+            },
+            {
+                "name": "sd_helper_package_pull",
+                "steps": ["build-sd-http-helper", "stage-sd", "device-pull", "watch-serial or report"],
             },
             {
                 "name": "human_ai_shared_serial",

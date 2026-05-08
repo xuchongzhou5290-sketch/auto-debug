@@ -206,6 +206,11 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("build-sd-http-helper", action_names)
         self.assertIn("quickstart", action_names)
         self.assertIn("deploy-verify", manifest["required_inputs"]["conditional"]["device_password"])
+        self.assertTrue(
+            any("build-sd-http-helper" in rule and "device-pull" in rule for rule in manifest["operating_rules"])
+        )
+        workflow_names = {workflow["name"] for workflow in manifest["recommended_workflows"]}
+        self.assertIn("sd_helper_package_pull", workflow_names)
 
     def test_build_agent_intake_plan_reports_missing_required_fields(self) -> None:
         with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
@@ -250,6 +255,15 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(plan["action"], "build-sd-http-helper")
         self.assertEqual(plan["inferred_action"], "build-sd-http-helper")
         self.assertEqual([item["field"] for item in plan["missing_required"]], ["cc"])
+
+    def test_build_agent_intake_plan_infers_new_package_pull_goal(self) -> None:
+        with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": "", "AUTO_DBG_DEVICE_PASSWORD": ""}):
+            plan = build_agent_intake_plan({"goal": "拉取新包"}, project_root=Path("C:/repo/auto-debug"))
+
+        self.assertEqual(plan["action"], "device-pull")
+        self.assertEqual(plan["inferred_action"], "device-pull")
+        missing_fields = [item["field"] for item in plan["missing_required"]]
+        self.assertEqual(missing_fields, ["serial_port", "device_password"])
 
     def test_command_agent_call_returns_structured_json_and_detects_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
