@@ -287,7 +287,12 @@ cd <repo-root>
 
 `transfer_mode=auto` 的优先级是 `sd_http_helper -> http -> serial_bundle`。SD helper 只有在设备端路径存在且可执行时才会被选中；auto 模式下 helper 运行失败，会在设备存在 downloader 时回退到 `http`。`device-pull` 临时启动的 PC 端 HTTP 服务会在设备拉取命令返回后立即关闭，后续验证/部署/观察阶段不继续暴露该服务。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，MCP Agent 可以调用 `build-sd-http-helper` 使用目标设备 C toolchain 交叉编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
 
-当用户目标是“拉取/下发新包”时，AI 默认应按有序流水线处理：`build-sd-http-helper -> stage-sd -> device-pull`。`quickstart --goal "拉取新包"` 会直接返回这三个 next_requests，缺少交叉编译器或 SD 卡盘符时先通过 `autodbg_prepare` 追问，不要跳过 helper 准备直接假设设备有 curl/wget。
+当用户目标是“拉取/下发新包”时，AI 不应静默选择路径，必须先让用户选择 `debug_firmware_method`：
+
+- `firmware_command`：调试固件已集成拉取新包指令或 downloader，quickstart 只返回 `device-pull`，不构建 SD helper
+- `sd_http_helper`：设备端没有可靠拉取指令时，quickstart 返回有序流水线 `build-sd-http-helper -> stage-sd -> device-pull`
+
+`quickstart --goal "拉取新包"` 若未传 `debug_firmware_method`，会把该选择放进 `questions`，上层 AI 必须先追问，不能默认跳到 SD helper 或固件命令路径。
 
 示例：
 

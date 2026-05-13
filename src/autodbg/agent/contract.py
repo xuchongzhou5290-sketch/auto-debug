@@ -123,6 +123,11 @@ _FIELD_PROMPTS: dict[str, dict[str, Any]] = {
         "question": "请提供目标设备交叉编译器路径或命令名，例如 arm-linux-gnueabihf-gcc。",
         "example": "arm-linux-gnueabihf-gcc",
     },
+    "debug_firmware_method": {
+        "target": "options",
+        "question": "请选择调试固件拉取新包方式：firmware_command=固件内置指令拉取；sd_http_helper=生成 Linux helper 放 SD 卡拉取。",
+        "example": "sd_http_helper",
+    },
     "artifact": {
         "target": "options",
         "question": "请提供本轮要部署或验证的本地产物路径。",
@@ -219,7 +224,7 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "summary": "Guide a first-time user by detecting serial ports, asking for missing inputs, and returning suggested MCP requests.",
         "required_connection": [],
         "recommended_connection": [],
-        "common_options": ["goal", "serial_port", "baudrate", "sdcard_drive", "helper_cc", "artifact"],
+        "common_options": ["goal", "serial_port", "baudrate", "sdcard_drive", "helper_cc", "debug_firmware_method", "artifact"],
         "creates_session": False,
     },
     "exec": {
@@ -979,7 +984,9 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return "deploy-verify"
     if any(token in text for token in ["交叉编译", "编译辅助", "sd http helper", "build-sd-http-helper", "autodbg-http-pull"]):
         return "build-sd-http-helper"
-    if any(token in text for token in ["下发", "拉取", "拉包", "新包", "升级包", "device pull", "lanupg", "artifact"]):
+    if any(token in text for token in ["拉取新包", "下发新包", "拉包", "新包", "升级包"]):
+        return "quickstart"
+    if any(token in text for token in ["下发", "拉取", "device pull", "lanupg", "artifact"]):
         return "device-pull"
     if any(token in text for token in ["报告", "report"]):
         return "report"
@@ -1127,7 +1134,9 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             "Prefer watch-serial without raw_live when a human-facing observe window already owns the shared broker.",
             "Raw-live broker mode is the single owner of the physical COM port; other autodbg commands should reuse the broker instead of opening the port directly.",
             "Do not stop serial-broker while the operator still needs the shared serial view.",
-            "When the user wants to pull or deploy a new package, default to preparing the SD HTTP helper first: build-sd-http-helper with the target C toolchain, stage-sd it as /mnt/sdcard/autodbg/autodbg-http-pull, then run device-pull with transfer_mode=auto and sd_http_helper_path.",
+            "When the user wants to pull or deploy a new package, do not pick a path silently: first guide them to choose debug_firmware_method=firmware_command or debug_firmware_method=sd_http_helper.",
+            "If debug_firmware_method=sd_http_helper, prepare the SD HTTP helper first: build-sd-http-helper with the target C toolchain, stage-sd it as /mnt/sdcard/autodbg/autodbg-http-pull, then run device-pull with transfer_mode=auto and sd_http_helper_path.",
+            "If debug_firmware_method=firmware_command, use the firmware/downloader pull path and do not build or stage the SD helper.",
             "Use ok plus exit_code from the JSON response as the source of truth, not the outer shell exit code.",
             "Most control and evidence actions create a session directory under artifacts and may also write retrieved files under retrieved.",
             "When a transient status appears in the watch TUI, it automatically falls back to the default operation hints after a few seconds.",

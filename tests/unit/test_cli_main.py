@@ -551,6 +551,8 @@ class CliMainTest(unittest.TestCase):
                 "--device-password-known",
                 "--sdcard-drive",
                 "E:",
+                "--debug-firmware-method",
+                "sd_http_helper",
             ]
         )
 
@@ -559,6 +561,7 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(args.serial_port, "COM19")
         self.assertTrue(args.device_password_known)
         self.assertEqual(args.sdcard_drive, "E:")
+        self.assertEqual(args.debug_firmware_method, "sd_http_helper")
 
     def test_build_quickstart_action_plan_guides_health_check(self) -> None:
         args = argparse.Namespace(
@@ -606,6 +609,7 @@ class CliMainTest(unittest.TestCase):
             device_password_known=True,
             sdcard_drive="E:",
             helper_cc="arm-linux-gnueabihf-gcc",
+            debug_firmware_method="sd_http_helper",
             artifact=Path("payloads/APP.bin"),
         )
 
@@ -630,6 +634,46 @@ class CliMainTest(unittest.TestCase):
         self.assertTrue(
             any("build-sd-http-helper" in instruction and "device-pull" in instruction for instruction in plan["agent_instructions"])
         )
+
+    def test_build_quickstart_action_plan_requires_debug_firmware_method_for_package_pull(self) -> None:
+        args = argparse.Namespace(
+            goal="拉取新包",
+            serial_port="COM19",
+            baudrate=115200,
+            device_password_known=True,
+            sdcard_drive="E:",
+            helper_cc="arm-linux-gnueabihf-gcc",
+            debug_firmware_method=None,
+            artifact=Path("payloads/APP.bin"),
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["goal"], "device_pull")
+        self.assertEqual(plan["next_requests"], [])
+        self.assertTrue(any("请选择调试固件拉取新包方式" in question for question in plan["questions"]))
+
+    def test_build_quickstart_action_plan_guides_package_pull_through_firmware_command(self) -> None:
+        args = argparse.Namespace(
+            goal="拉取新包",
+            serial_port="COM19",
+            baudrate=115200,
+            device_password_known=True,
+            sdcard_drive=None,
+            helper_cc=None,
+            debug_firmware_method="firmware_command",
+            artifact=Path("payloads/APP.bin"),
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertTrue(plan["ready"])
+        self.assertEqual(plan["goal"], "device_pull")
+        self.assertEqual([request["action"] for request in plan["next_requests"]], ["device-pull"])
+        self.assertEqual(plan["next_requests"][0]["options"]["transfer_mode"], "http")
+        self.assertNotIn("sd_http_helper_path", plan["next_requests"][0]["options"])
+        self.assertEqual(plan["next_requests"][0]["options"]["root"], "payloads")
 
     def test_build_quickstart_action_plan_limits_questions_for_unknown_goal(self) -> None:
         args = argparse.Namespace(

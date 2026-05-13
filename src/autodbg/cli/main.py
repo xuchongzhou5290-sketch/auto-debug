@@ -93,6 +93,7 @@ _DEFAULT_SD_HTTP_HELPER_OUTPUT = "artifacts/autodbg-http-pull"
 _DEFAULT_SD_HTTP_HELPER_DEVICE_PATH = "/mnt/sdcard/autodbg/autodbg-http-pull"
 _DEFAULT_SD_HTTP_HELPER_TARGET_SUBDIR = "autodbg"
 _DEFAULT_SD_HTTP_HELPER_DEST_NAME = "autodbg-http-pull"
+_DEBUG_FIRMWARE_METHOD_CHOICES = ("firmware_command", "sd_http_helper")
 
 
 def _project_root() -> Path:
@@ -447,6 +448,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     quickstart_parser.add_argument("--sdcard-drive", help="Known host SD card drive, for example E:")
     quickstart_parser.add_argument("--helper-cc", help="Known target cross compiler for build-sd-http-helper")
+    quickstart_parser.add_argument(
+        "--debug-firmware-method",
+        choices=list(_DEBUG_FIRMWARE_METHOD_CHOICES),
+        help=(
+            "Required for new-package pull guidance: firmware_command means the debug firmware "
+            "has an integrated pull command; sd_http_helper means build a Linux helper and stage it on SD."
+        ),
+    )
     quickstart_parser.add_argument("--artifact", type=Path, help="Known local artifact path for deploy or transfer guidance")
 
     device_pull_parser = subparsers.add_parser(
@@ -2821,12 +2830,37 @@ def _build_sd_http_helper_quickstart_requests(args: argparse.Namespace) -> list[
     ]
 
 
+def _build_firmware_command_quickstart_request(
+    args: argparse.Namespace,
+    *,
+    connection: dict[str, Any],
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "mode": "lan_ready",
+        "transfer_mode": "http",
+    }
+    if args.artifact is not None:
+        options["root"] = str(args.artifact.parent)
+    return {
+        "schema_version": 1,
+        "action": "device-pull",
+        "connection": connection,
+        "options": options,
+    }
+
+
 def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str, Any]]) -> dict[str, Any]:
     goal = _normalize_quickstart_goal(args.goal)
     serial_port = args.serial_port or (ports[0]["device"] if len(ports) == 1 else None)
     password_known = bool(args.device_password_known or os.environ.get("AUTO_DBG_DEVICE_PASSWORD"))
+    debug_firmware_method = getattr(args, "debug_firmware_method", None)
 
     questions: list[str] = []
+    if goal == "device_pull" and debug_firmware_method is None:
+        questions.append(
+            "请选择调试固件拉取新包方式：firmware_command=固件内置指令拉取；"
+            "sd_http_helper=生成 Linux 可执行文件放 SD 卡拉取。"
+        )
     if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify"}:
         questions.append("请提供目标设备串口号；如果不确定，先运行 ports 或从 detected_ports 里选择。")
     if goal in {"health", "device_pull", "deploy_verify"} and not password_known:
@@ -2835,9 +2869,9 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
         questions.append("请提供要让设备拉取的新包或本地产物路径，例如 payloads/APP.bin。")
     if goal == "deploy_verify" and args.artifact is None:
         questions.append("请提供要部署验证的本地产物路径，例如 payloads/APP.bin。")
-    if goal in {"sd_http_helper", "device_pull"} and not args.helper_cc:
+    if (goal == "sd_http_helper" or (goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.helper_cc:
         questions.append("请提供目标设备交叉编译器命令或完整路径，用于构建 SD HTTP helper，例如 arm-linux-gnueabihf-gcc。")
-    if goal in {"sd_http_helper", "device_pull"} and not args.sdcard_drive:
+    if (goal == "sd_http_helper" or (goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.sdcard_drive:
         questions.append("请提供本机 SD 卡盘符，用于把编译出的 helper 放入 SD 卡，例如 E:。")
     if goal in {"unknown", "quickstart"}:
         questions.append("请说明你想做什么：观察串口、健康检查、下发程序、升级验证，或编译 SD HTTP helper。")
@@ -2872,22 +2906,25 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
             }
         )
     elif goal == "device_pull":
-        next_requests.extend(_build_sd_http_helper_quickstart_requests(args))
-        options: dict[str, Any] = {
-            "mode": "lan_ready",
-            "transfer_mode": "auto",
-            "sd_http_helper_path": _DEFAULT_SD_HTTP_HELPER_DEVICE_PATH,
-        }
-        if args.artifact is not None:
-            options["root"] = str(args.artifact.parent)
-        next_requests.append(
-            {
-                "schema_version": 1,
-                "action": "device-pull",
-                "connection": connection,
-                "options": options,
+        if debug_firmware_method == "sd_http_helper":
+            next_requests.extend(_build_sd_http_helper_quickstart_requests(args))
+            options: dict[str, Any] = {
+                "mode": "lan_ready",
+                "transfer_mode": "auto",
+                "sd_http_helper_path": _DEFAULT_SD_HTTP_HELPER_DEVICE_PATH,
             }
-        )
+            if args.artifact is not None:
+                options["root"] = str(args.artifact.parent)
+            next_requests.append(
+                {
+                    "schema_version": 1,
+                    "action": "device-pull",
+                    "connection": connection,
+                    "options": options,
+                }
+            )
+        elif debug_firmware_method == "firmware_command":
+            next_requests.append(_build_firmware_command_quickstart_request(args, connection=connection))
     elif goal == "deploy_verify":
         next_requests.append(
             {
@@ -2913,6 +2950,7 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
             "device_password_known": password_known,
             "sdcard_drive": args.sdcard_drive,
             "helper_cc": args.helper_cc,
+            "debug_firmware_method": debug_firmware_method,
             "artifact": str(args.artifact) if args.artifact else None,
         },
         "questions": questions[:3],
@@ -2920,7 +2958,9 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
         "agent_instructions": [
             "Call autodbg_prepare on the selected next_request before autodbg_action.",
             "Ask the questions list first, at most three questions at a time.",
-            "For package pull goals, treat next_requests as ordered: build-sd-http-helper, stage-sd, then device-pull with transfer_mode=auto and sd_http_helper_path.",
+            "For package pull goals, do not continue until debug_firmware_method is chosen: firmware_command or sd_http_helper.",
+            "If debug_firmware_method=sd_http_helper, treat next_requests as ordered: build-sd-http-helper, stage-sd, then device-pull with transfer_mode=auto and sd_http_helper_path.",
+            "If debug_firmware_method=firmware_command, use the firmware/downloader pull path and do not build or stage the SD helper.",
             "Do not print device_password; pass it only through connection.device_password.",
             "If device_password_known is true, reuse the existing secret source and never copy a placeholder value into connection.device_password.",
         ],

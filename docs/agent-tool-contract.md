@@ -304,7 +304,12 @@ SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，AI 作为 M
 
 编译成功后再通过 `stage-sd` 放入 SD 卡。若目标 toolchain 不支持静态链接，传 `options.static=false`。
 
-当用户目标是“拉取/下发新包”时，默认引导 AI 走 `build-sd-http-helper -> stage-sd -> device-pull`。`quickstart` 会把这三个 action 作为有序 `next_requests` 返回；缺少 `cc` 或 `sdcard_drive` 时，先对对应 request 调 `autodbg_prepare` 追问，不要默认跳过 SD helper 准备。
+当用户目标是“拉取/下发新包”时，默认先引导用户选择 `debug_firmware_method`，不能静默替用户决定路径：
+
+- `firmware_command`：调试固件已集成拉取新包指令或 downloader，`quickstart` 返回 `device-pull`
+- `sd_http_helper`：生成 Linux 可执行文件放入 SD 卡执行拉取，`quickstart` 返回 `build-sd-http-helper -> stage-sd -> device-pull`
+
+如果 `quickstart` 缺少 `debug_firmware_method`，会把该选择放进 `questions`；上层 AI 必须先追问。选择 `sd_http_helper` 后若缺少 `cc` 或 `sdcard_drive`，再对对应 request 调 `autodbg_prepare` 追问。
 
 ### 6.4 多轮继续跑 `run`
 
