@@ -272,6 +272,68 @@ class SerialRuntimeTest(unittest.TestCase):
         self.assertFalse((lock_root / "com19.lock").exists())
         self.assertFalse((control_root / "com19.lock").exists())
 
+    def test_stop_serial_broker_refuses_protected_human_observer(self) -> None:
+        with tempfile.TemporaryDirectory() as broker_dir:
+            broker_root = Path(broker_dir)
+            broker_path = broker_root / "com19.json"
+            broker_path.write_text(
+                (
+                    '{"host":"127.0.0.1","tcp_port":9001,"pid":1111,'
+                    '"serial_port":"COM19","baudrate":115200,'
+                    '"owner":"human-observe","protected":true}\n'
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            with patch.object(runtime, "_serial_broker_dir", return_value=broker_root):
+                with patch.object(runtime, "_pid_is_running", return_value=True):
+                    with patch.object(runtime.os, "kill") as kill_mock:
+                        with self.assertRaises(runtime.SerialBrokerProtectedError):
+                            runtime.stop_serial_broker("COM19", wait_timeout=0.1)
+
+                        kill_mock.assert_not_called()
+            self.assertTrue(broker_path.exists())
+
+    def test_stop_serial_broker_can_force_protected_human_observer(self) -> None:
+        with tempfile.TemporaryDirectory() as broker_dir, tempfile.TemporaryDirectory() as lock_dir, tempfile.TemporaryDirectory() as control_lock_dir:
+            broker_root = Path(broker_dir)
+            lock_root = Path(lock_dir)
+            control_root = Path(control_lock_dir)
+            broker_path = broker_root / "com19.json"
+            broker_path.write_text(
+                (
+                    '{"host":"127.0.0.1","tcp_port":9001,"pid":1111,'
+                    '"serial_port":"COM19","baudrate":115200,'
+                    '"owner":"human-observe","protected":true}\n'
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            alive = {"value": True}
+
+            def fake_pid_is_running(pid: int) -> bool:
+                return pid == 1111 and alive["value"]
+
+            def fake_kill(pid: int, _sig: int) -> None:
+                self.assertEqual(pid, 1111)
+                alive["value"] = False
+
+            with patch.object(runtime, "_serial_broker_dir", return_value=broker_root):
+                with patch.object(runtime, "_serial_lock_dir", return_value=lock_root):
+                    with patch.object(runtime, "_serial_control_lock_dir", return_value=control_root):
+                        with patch.object(runtime, "_pid_is_running", side_effect=fake_pid_is_running):
+                            with patch.object(runtime.os, "kill", side_effect=fake_kill) as kill_mock:
+                                registry = runtime.stop_serial_broker(
+                                    "COM19",
+                                    wait_timeout=0.1,
+                                    allow_protected=True,
+                                )
+
+        self.assertIsNotNone(registry)
+        kill_mock.assert_called_once()
+        self.assertFalse(broker_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

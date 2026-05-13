@@ -119,6 +119,7 @@
 - 如果用户要求“我也想同步看串口”，先给出 `observe-serial` 命令，再继续工具调用
 - 如果人工观察窗口已经存在，优先使用不带 `raw_live` 的 `watch-serial`
 - 不要在用户还在看串口时调用 `serial-broker-stop`
+- `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
 - 如果用户要求“观察串口不要被调试打断”，先启动 broker，再做后续控制动作
 
 ## 6. Response Rule

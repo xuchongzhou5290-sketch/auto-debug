@@ -160,6 +160,7 @@ AI 想先拿自描述清单时，可以直接调用：
 - 如果已经有人工观察窗口，AI 不应再默认加 `raw_live=true` 去重新抢物理串口
 - 只在需要启动或接管共享 broker 时才使用 `watch-serial --raw-live`
 - 只要用户还在看串口，AI 就不应主动执行 `serial-broker-stop`
+- `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
 
 ## 4. `options` 字段
 

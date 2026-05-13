@@ -327,6 +327,7 @@ cd <repo-root>
 - 人工观察窗口起来后，AI 侧优先使用 `watch-serial`，但不要默认加 `raw_live`
 - 后续串口动作应复用同一个 broker，不要重新抢物理串口
 - 只要用户还在看串口，AI 就不应主动调 `serial-broker-stop`
+- `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `options.force=true`
 
 推荐顺序：
 

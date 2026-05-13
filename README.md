@@ -337,6 +337,7 @@ MCP Agent 可以直接调用：
 
 - 在命令行里显示一个类窗口选择界面，先选当前串口和常用波特率
 - 启动或复用 `COM19` 的 raw-live broker
+- 将 `observe-serial` 启动的新 broker 标记为人工观察会话，普通 `serial-broker stop` 不会直接踢掉这个窗口
 - 打开持续观察窗口
 - 让后续 `autodbg run / exec / health / collect-evidence` 自动复用同一个 broker
 - `watch-serial` 会优先直连 broker 的实时 trace 推流，不再只靠轮询 trace 文件
@@ -345,7 +346,9 @@ MCP Agent 可以直接调用：
 - `Ctrl+L` 会按当前 device profile 走一遍自动登录流程
 - 如果该设备密码不对，窗口会提示你重新输入密码并自动重试登录
 - 观察窗口现在是全屏 TUI：顶部标题，中间日志区，底部状态行和输入行固定显示
+- `Ctrl+P` 可以暂停/恢复屏幕刷新；暂停期间新串口数据继续缓存，恢复后一次性回到最新输出
 - `PgUp / PgDn` 可以在 TUI 里翻历史日志，不再依赖终端自身滚动条
+- 超出窗口宽度的串口行会自动换行显示，不再静默截断
 - 登录中、登录失败、重试密码这些状态都会收在 TUI 的状态行里，不再混进串口日志
 - 像 `Sent newline probe` 这类短状态会显示几秒，然后自动回到常驻操作提示
 - 默认从 live edge 开始，不会先重放旧 trace
@@ -364,6 +367,7 @@ MCP Agent 可以直接调用：
 1. 人工先开 `observe-serial`
 2. AI 再调 `watch-serial` 或 `run / exec / health`
 3. 人工窗口还开着时，不要主动 `serial-broker stop`
+4. 如果确实要强制释放人工观察 broker，先确认窗口可以断开，再执行 `serial-broker stop --serial-port COM19 --force`
 
 如果你想先回看历史，再显式加：
 
@@ -384,6 +388,7 @@ MCP Agent 可以直接调用：
 .\.venv\Scripts\python -m autodbg watch-serial --serial-port COM19 --tail 0 --follow --raw-live --baudrate 115200
 .\.venv\Scripts\python -m autodbg serial-broker list
 .\.venv\Scripts\python -m autodbg serial-broker stop --serial-port COM19
+.\.venv\Scripts\python -m autodbg serial-broker stop --serial-port COM19 --force
 ```
 
 ### 串口控制与取证

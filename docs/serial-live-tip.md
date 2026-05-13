@@ -30,6 +30,7 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - 在命令行里显示一个类窗口选择界面，先选串口和常用波特率
 - 从 `config\user-settings.toml` 或 `AUTO_DBG_SERIAL_PORT` 解析串口
 - 启动或复用 raw-live broker
+- 将新启动的 broker 标记为人工观察会话，普通 `serial-broker stop` 不会直接踢掉这个窗口
 - 持续输出共享串口 trace
 - 优先直连 broker 的实时 trace 推流，不再只靠 0.3 秒轮询 trace 文件
 - 在观察窗口里可以直接输入 shell 命令，按回车发送到串口
@@ -37,7 +38,9 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - `Ctrl+L` 会按当前 device profile 走一遍自动登录流程
 - 如果该设备密码不对，窗口会提示你重新输入密码并自动重试登录
 - 观察窗口现在是全屏 TUI：顶部标题，中间日志区，底部固定显示状态行和输入行
+- `Ctrl+P` 可以暂停/恢复屏幕刷新；暂停期间新串口数据继续缓存，恢复后一次性回到最新输出
 - `PgUp / PgDn` 可以在 TUI 里翻历史日志，不再依赖终端滚动条
+- 超出窗口宽度的串口行会自动换行显示，不再静默截断
 - 热键提示、登录失败和重试密码状态都会收在状态行里，不再额外刷多行提示
 - `Sent newline probe` 这类短状态会在空闲几秒后自动切回常驻操作提示
 - 默认从 live edge 开始，不会先重放旧 trace
@@ -56,6 +59,7 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - 人工先开 `observe-serial`
 - AI 再用 `watch-serial` 跟随共享 trace，或直接执行会复用 broker 的 `run / exec / health / collect-evidence`
 - 人工窗口还在看时，不要主动执行 `serial-broker stop`
+- 如果确实要释放人工观察 broker，需要确认可以断开后执行 `serial-broker stop --serial-port COM19 --force`
 
 如果你想先回看历史，再显式加：
 
@@ -129,6 +133,7 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - 让后续 `autodbg` 控制命令通过 broker 复用同一个串口
 - 进入全屏 TUI：顶部是标题，中央是实时日志，底部固定显示状态和输入行
 - `Ctrl+L` 登录状态、密码重试提示都只会出现在底部状态行，不再把日志刷乱
+- `Ctrl+P` 暂停/恢复屏幕刷新，长串口行会按窗口宽度自动换行
 
 注意：
 
@@ -141,6 +146,7 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 ```powershell
 .\.venv\Scripts\python -m autodbg serial-broker list
 .\.venv\Scripts\python -m autodbg serial-broker stop --serial-port COM19
+.\.venv\Scripts\python -m autodbg serial-broker stop --serial-port COM19 --force
 ```
 
 ## 4. 常用变体
@@ -187,7 +193,7 @@ context_lines = 5
 - `watch-serial`：默认只看共享 trace
 - `watch-serial --raw-live`：故意长期占用物理串口
 - `observe-serial.ps1`：推荐的一键长期观察入口
-- `serial-broker stop`：释放遗留 raw-live broker
+- `serial-broker stop`：释放遗留 raw-live broker；人工观察 broker 默认会拒绝停止，需要 `--force`
 - 人工 + AI 协同时：优先先人工 `observe-serial`；如果 AI 已经在跑串口动作，人工再开 `observe-serial` 或 `watch-serial --follow` 连接已有 broker
 
 如果你已经在当前 shell 里设置了 `AUTO_DBG_SERIAL_PORT`，那么大多数串口主命令都不再需要重复传四个 profile 路径。

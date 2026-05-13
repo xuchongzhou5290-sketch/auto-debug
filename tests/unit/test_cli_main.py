@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from autodbg.serial.runtime import SerialBrokerProtectedError
+
 from autodbg.cli.main import (
     _build_parser,
     _apply_watch_trace_entry_to_tui_state,
@@ -985,6 +987,43 @@ class CliMainTest(unittest.TestCase):
         broker_ctor.assert_called_once_with(serial_port="COM19", baudrate=115200)
         self.assertTrue(any("Watching shared serial trace for COM19" in call.args[0] for call in print_mock.call_args_list))
 
+    def test_command_watch_serial_marks_observe_window_as_protected(self) -> None:
+        args = argparse.Namespace(
+            serial_port="COM19",
+            tail=0,
+            follow=False,
+            show_system=False,
+            raw_live=True,
+            baudrate=115200,
+            stdin_probe=False,
+            stdin_shell=False,
+            protect_human_session=True,
+            settings=Path(__file__).resolve().parents[2] / "config" / "user-settings.toml",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace_path = Path(temp_dir) / "com19.jsonl"
+            broker_mock = unittest.mock.Mock()
+            with (
+                patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path),
+                patch("autodbg.cli.main._read_trace_entries", return_value=[]),
+                patch("autodbg.cli.main.load_serial_broker_registry", return_value=None),
+                patch("autodbg.cli.main.SerialBroker", return_value=broker_mock) as broker_ctor,
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = _command_watch_serial(args)
+
+        self.assertEqual(exit_code, 0)
+        broker_ctor.assert_called_once_with(
+            serial_port="COM19",
+            baudrate=115200,
+            owner="human-observe",
+            protected=True,
+        )
+        broker_mock.start.assert_called_once()
+        broker_mock.stop.assert_called_once()
+        self.assertTrue(any("Human observation guard enabled" in call.args[0] for call in print_mock.call_args_list))
+
     def test_command_watch_serial_prefers_live_broker_stream_when_available(self) -> None:
         args = argparse.Namespace(
             serial_port="COM19",
@@ -1161,8 +1200,8 @@ class CliMainTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 8)
         self.assertTrue(all(len(row) == 64 for row in rows))
-        self.assertTrue(rows[0].startswith("[AUTO-DEBUG SERIAL TUI] COM19 @ 115200"))
-        self.assertIn("Ctrl+L=login", rows[0])
+        self.assertTrue(rows[0].startswith("[AUTO-DEBUG] COM19 @115200"))
+        self.assertIn("Ctrl+P=", rows[0])
         self.assertIn("PgUp/", rows[0])
         self.assertNotIn("F2", rows[0])
         self.assertEqual(rows[-2].rstrip(), "Status: COM19 connected successfully @ 115200")
@@ -1200,6 +1239,81 @@ class CliMainTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("_WatchStdinShellState", result.stdout)
+
+    def test_build_watch_tui_rows_wraps_long_log_lines(self) -> None:
+        state = _WatchStdinShellState()
+        line = "[RX 01:02:03.000] " + ("A" * 64)
+        state.recent_lines = [line]
+
+        rows, _cursor_col, _cursor_row = _build_watch_tui_rows(
+            state,
+            serial_port="COM19",
+            width=40,
+            height=8,
+            baudrate=115200,
+        )
+
+        self.assertEqual(rows[1].rstrip(), line[:40])
+        self.assertEqual(rows[2].rstrip(), line[40:80])
+        self.assertEqual(rows[3].rstrip(), line[80:])
+        self.assertNotIn("...", rows[1])
+
+    def test_consume_watch_stdin_shell_toggles_pause_and_freezes_log_view(self) -> None:
+        state = _WatchStdinShellState()
+        state.recent_lines = ["[RX 01:02:03.000] before"]
+
+        _consume_watch_stdin_shell(
+            serial_port="COM19",
+            baudrate=115200,
+            enabled=True,
+            state=state,
+            char_reader=lambda: ["__TOGGLE_PAUSE__"],
+            writer=io.StringIO(),
+        )
+
+        self.assertTrue(state.paused)
+        self.assertEqual(state.pause_log_end_index, 1)
+
+        entry = SerialTraceEntry(
+            timestamp="2026-05-13T01:02:04.000",
+            port="COM19",
+            direction="rx",
+            payload="after",
+            pid=1234,
+        )
+        _apply_watch_trace_entry_to_tui_state(entry, show_system=False, state=state)
+
+        rows, _cursor_col, _cursor_row = _build_watch_tui_rows(
+            state,
+            serial_port="COM19",
+            width=72,
+            height=8,
+            baudrate=115200,
+        )
+
+        self.assertIn("[RX 01:02:03.000] before", "\n".join(rows))
+        self.assertNotIn("[RX 01:02:04.000] after", "\n".join(rows))
+        self.assertIn("PAUSED +1 line(s)", rows[-2])
+
+        _consume_watch_stdin_shell(
+            serial_port="COM19",
+            baudrate=115200,
+            enabled=True,
+            state=state,
+            char_reader=lambda: ["__TOGGLE_PAUSE__"],
+            writer=io.StringIO(),
+        )
+
+        self.assertFalse(state.paused)
+        self.assertEqual(state.paused_new_lines, 0)
+        rows, _cursor_col, _cursor_row = _build_watch_tui_rows(
+            state,
+            serial_port="COM19",
+            width=72,
+            height=8,
+            baudrate=115200,
+        )
+        self.assertIn("[RX 01:02:04.000] after", "\n".join(rows))
 
     def test_build_watch_tui_rows_marks_history_offset_in_status_line(self) -> None:
         state = _WatchStdinShellState()
@@ -1239,13 +1353,21 @@ class CliMainTest(unittest.TestCase):
             def getwch(self) -> str:
                 return self._keys.pop(0)
 
-        fake_msvcrt = _FakeMsvcrt(["\xe0", "I", "\x00", "Q", "\xe0", "G", "\xe0", "O", "x"])
+        fake_msvcrt = _FakeMsvcrt(["\xe0", "I", "\x00", "Q", "\xe0", "G", "\xe0", "O", "\x00", "<", "\x10", "x"])
         with patch.dict(sys.modules, {"msvcrt": fake_msvcrt}, clear=False):
             chars = _watch_shell_read_chars()
 
         self.assertEqual(
             chars,
-            ["__PAGE_UP__", "__PAGE_DOWN__", "__SCROLL_TOP__", "__SCROLL_BOTTOM__", "x"],
+            [
+                "__PAGE_UP__",
+                "__PAGE_DOWN__",
+                "__SCROLL_TOP__",
+                "__SCROLL_BOTTOM__",
+                "__TOGGLE_PAUSE__",
+                "__TOGGLE_PAUSE__",
+                "x",
+            ],
         )
 
     def test_build_agent_tool_manifest_contains_core_actions(self) -> None:
@@ -1420,7 +1542,7 @@ class CliMainTest(unittest.TestCase):
         )
 
         list_args = argparse.Namespace(command="serial-broker", broker_command="list", serial_port=None)
-        stop_args = argparse.Namespace(command="serial-broker", broker_command="stop", serial_port="COM19", all=False)
+        stop_args = argparse.Namespace(command="serial-broker", broker_command="stop", serial_port="COM19", all=False, force=False)
 
         with (
             patch("autodbg.cli.main.list_serial_broker_registries", return_value=[registry]),
@@ -1430,9 +1552,44 @@ class CliMainTest(unittest.TestCase):
             self.assertEqual(_command_serial_broker(list_args), 0)
             self.assertEqual(_command_serial_broker(stop_args), 0)
 
-        stop_mock.assert_called_once_with("COM19")
+        stop_mock.assert_called_once_with("COM19", allow_protected=False)
         self.assertTrue(any("Active raw serial brokers: 1" in call.args[0] for call in print_mock.call_args_list))
         self.assertTrue(any("Stopped raw serial broker on COM19" in call.args[0] for call in print_mock.call_args_list))
+
+    def test_command_serial_broker_stop_skips_protected_human_observer(self) -> None:
+        stop_args = argparse.Namespace(command="serial-broker", broker_command="stop", serial_port="COM19", all=False, force=False)
+
+        with (
+            patch("autodbg.cli.main.stop_serial_broker", side_effect=SerialBrokerProtectedError("protected session")) as stop_mock,
+            patch("builtins.print") as print_mock,
+        ):
+            exit_code = _command_serial_broker(stop_args)
+
+        self.assertEqual(exit_code, 1)
+        stop_mock.assert_called_once_with("COM19", allow_protected=False)
+        self.assertTrue(any("Protected human observation broker was not stopped" in call.args[0] for call in print_mock.call_args_list))
+        self.assertTrue(any("--force" in call.args[0] for call in print_mock.call_args_list))
+
+    def test_command_serial_broker_stop_force_allows_protected_human_observer(self) -> None:
+        registry = SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=4321,
+            serial_port="COM19",
+            baudrate=115200,
+            owner="human-observe",
+            protected=True,
+        )
+        stop_args = argparse.Namespace(command="serial-broker", broker_command="stop", serial_port="COM19", all=False, force=True)
+
+        with (
+            patch("autodbg.cli.main.stop_serial_broker", return_value=registry) as stop_mock,
+            patch("builtins.print"),
+        ):
+            exit_code = _command_serial_broker(stop_args)
+
+        self.assertEqual(exit_code, 0)
+        stop_mock.assert_called_once_with("COM19", allow_protected=True)
 
 
 if __name__ == "__main__":

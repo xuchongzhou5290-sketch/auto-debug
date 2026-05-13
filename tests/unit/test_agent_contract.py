@@ -207,6 +207,19 @@ class AgentContractTest(unittest.TestCase):
         self.assertIn("--helper-cc", invocation.argv)
         self.assertIn("--artifact", invocation.argv)
 
+    def test_build_agent_invocation_supports_forced_serial_broker_stop(self) -> None:
+        project_root = Path("C:/repo/auto-debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "serial-broker-stop",
+                "connection": {"serial_port": "COM19"},
+                "options": {"force": True},
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv, ["serial-broker", "stop", "--serial-port", "COM19", "--force"])
+
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
         manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 

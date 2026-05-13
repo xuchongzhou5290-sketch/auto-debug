@@ -27,12 +27,16 @@ class SerialBroker:
         timeout: float = 0.2,
         host: str = "127.0.0.1",
         tcp_port: int = 0,
+        owner: str | None = None,
+        protected: bool = False,
     ) -> None:
         self.serial_port = serial_port
         self.baudrate = baudrate
         self.timeout = timeout
         self.host = host
         self.tcp_port = tcp_port
+        self.owner = owner
+        self.protected = protected
         self._serial_module = None
         self._serial = None
         self._lock_context = None
@@ -72,6 +76,8 @@ class SerialBroker:
             host=self.host,
             tcp_port=self.tcp_port,
             baudrate=self.baudrate,
+            owner=self.owner,
+            protected=self.protected,
         )
 
         self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)

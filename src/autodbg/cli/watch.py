@@ -14,6 +14,7 @@ from autodbg.control.controller import LoginResult
 from autodbg.serial.broker import SerialBroker
 from autodbg.serial.observer import MarkerHit
 from autodbg.serial.runtime import (
+    SerialBrokerProtectedError,
     SerialBrokerRegistry,
     SerialTraceEntry,
     SerialTraceStreamClient,
@@ -92,6 +93,9 @@ class _WatchStdinShellState:
         self.status_expires_at: float | None = None
         self.recent_lines: list[str] = []
         self.scroll_offset = 0
+        self.paused = False
+        self.paused_new_lines = 0
+        self.pause_log_end_index: int | None = None
         self.screen_dirty = True
 
 
@@ -100,7 +104,7 @@ _WATCH_TUI_TRANSIENT_STATUS_SECONDS = 4.0
 
 
 def _default_watch_status() -> str:
-    return "Enter=send/probe | Ctrl+L=login | PgUp/PgDn=history | Ctrl+C=exit"
+    return "Enter=send/probe | Ctrl+L=login | Ctrl+P=pause | PgUp/PgDn=history | Ctrl+C=exit"
 
 
 def _set_watch_status_message(
@@ -284,13 +288,83 @@ def _fit_watch_tui_text(text: str, width: int) -> str:
     return cleaned[: width - 3] + "..."
 
 
+def _build_watch_tui_header(serial_port: str, baudrate: int | None, width: int) -> str:
+    baudrate_text = f" @ {baudrate}" if baudrate else ""
+    header = (
+        f"[AUTO-DEBUG SERIAL TUI] {serial_port}{baudrate_text} | "
+        "Ctrl+P=pause | Ctrl+L=login | PgUp/PgDn=history | Ctrl+C=exit"
+    )
+    if len(header) <= width:
+        return header
+    compact_baudrate = f" @{baudrate}" if baudrate else ""
+    compact_header = (
+        f"[AUTO-DEBUG] {serial_port}{compact_baudrate} | "
+        "Ctrl+P=pause | ^L=login | PgUp/PgDn"
+    )
+    if len(compact_header) <= width:
+        return compact_header
+    short_header = f"{serial_port}{compact_baudrate} | Ctrl+P=pause | ^L=login"
+    if len(short_header) <= width:
+        return short_header
+    return f"{serial_port} | Ctrl+P=pause"
+
+
+def _wrap_watch_tui_line(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return [""]
+    cleaned = text.replace("\r", " ").replace("\n", " ")
+    if not cleaned:
+        return [""]
+    return [cleaned[index : index + width] for index in range(0, len(cleaned), width)]
+
+
+def _watch_log_line_count(state: _WatchStdinShellState) -> int:
+    if state.paused and state.pause_log_end_index is not None:
+        return max(min(state.pause_log_end_index, len(state.recent_lines)), 0)
+    return len(state.recent_lines)
+
+
+def _watch_pause_status_message(state: _WatchStdinShellState, base_status: str) -> str:
+    if not state.paused:
+        return base_status
+    paused_text = "PAUSED"
+    if state.paused_new_lines:
+        paused_text += f" +{state.paused_new_lines} line(s)"
+    default_status = _default_watch_status()
+    if base_status and base_status != default_status:
+        return f"{paused_text} | {base_status}"
+    return f"{paused_text} | Ctrl+P=resume | PgUp/PgDn=history | Ctrl+C=exit"
+
+
+def _toggle_watch_pause(state: _WatchStdinShellState) -> str:
+    if state.paused:
+        released_lines = state.paused_new_lines
+        state.paused = False
+        state.paused_new_lines = 0
+        state.pause_log_end_index = None
+        state.scroll_offset = 0
+        state.screen_dirty = True
+        if released_lines:
+            return f"Live output resumed; {released_lines} buffered line(s) are visible."
+        return "Live output resumed."
+    state.paused = True
+    state.paused_new_lines = 0
+    state.pause_log_end_index = len(state.recent_lines)
+    state.screen_dirty = True
+    return "Live output paused; incoming lines are still captured."
+
+
 def _append_watch_recent_line(state: _WatchStdinShellState, line: str) -> None:
     state.recent_lines.append(line)
-    if state.scroll_offset > 0:
+    if state.paused:
+        state.paused_new_lines += 1
+    elif state.scroll_offset > 0:
         state.scroll_offset += 1
     overflow = len(state.recent_lines) - _WATCH_TUI_SCROLLBACK_LIMIT
     if overflow > 0:
         del state.recent_lines[:overflow]
+        if state.pause_log_end_index is not None:
+            state.pause_log_end_index = max(state.pause_log_end_index - overflow, 0)
         state.scroll_offset = max(state.scroll_offset - overflow, 0)
 
 
@@ -299,7 +373,7 @@ def _watch_tui_log_rows(height: int) -> int:
 
 
 def _clamp_watch_scroll_offset(state: _WatchStdinShellState, *, log_rows: int) -> int:
-    max_offset = max(len(state.recent_lines) - log_rows, 0)
+    max_offset = max(_watch_log_line_count(state) - log_rows, 0)
     if state.scroll_offset > max_offset:
         state.scroll_offset = max_offset
     elif state.scroll_offset < 0:
@@ -316,7 +390,7 @@ def _page_watch_history(
     log_rows = _watch_tui_log_rows(height)
     page_step = max((log_rows * 3 + 3) // 4, 1)
     current_offset = _clamp_watch_scroll_offset(state, log_rows=log_rows)
-    max_offset = max(len(state.recent_lines) - log_rows, 0)
+    max_offset = max(_watch_log_line_count(state) - log_rows, 0)
     if direction == "page_up":
         next_offset = min(current_offset + page_step, max_offset)
     elif direction == "page_down":
@@ -350,19 +424,23 @@ def _build_watch_tui_rows(
     effective_status = status_message if status_message is not None else state.status_message
     if not effective_status:
         effective_status = _default_watch_status()
+    effective_status = _watch_pause_status_message(state, effective_status)
     effective_input_label = input_label or f"[INPUT {serial_port}]"
     effective_input_value = state.buffer if input_value is None else input_value
-    baudrate_text = f" @ {baudrate}" if baudrate else ""
-    header = (
-        f"[AUTO-DEBUG SERIAL TUI] {serial_port}{baudrate_text} | "
-        "Ctrl+L=login | PgUp/PgDn=history | Ctrl+C=exit"
-    )
+    header = _build_watch_tui_header(serial_port, baudrate, safe_width)
     separator = "-" * safe_width
     log_rows = _watch_tui_log_rows(safe_height)
     scroll_offset = _clamp_watch_scroll_offset(state, log_rows=log_rows)
-    end_index = len(state.recent_lines) - scroll_offset if scroll_offset > 0 else len(state.recent_lines)
-    start_index = max(end_index - log_rows, 0)
-    visible_lines = state.recent_lines[start_index:end_index]
+    line_count = _watch_log_line_count(state)
+    end_index = line_count - scroll_offset if scroll_offset > 0 else line_count
+    end_index = max(min(end_index, line_count), 0)
+    visible_lines: list[str] = []
+    for line in reversed(state.recent_lines[:end_index]):
+        wrapped = _wrap_watch_tui_line(line, safe_width)
+        visible_lines[0:0] = wrapped
+        if len(visible_lines) >= log_rows:
+            visible_lines = visible_lines[-log_rows:]
+            break
     history_prefix = f"[history +{scroll_offset}] " if scroll_offset > 0 else ""
     rows = [_fit_watch_tui_text(header, safe_width)]
     for index in range(log_rows):
@@ -670,9 +748,14 @@ def _watch_shell_read_chars() -> list[str]:
                 chars.append("__SCROLL_TOP__")
             elif extended == "O":
                 chars.append("__SCROLL_BOTTOM__")
+            elif extended == "<":
+                chars.append("__TOGGLE_PAUSE__")
             continue
         if char == "\x0c":
             chars.append("__AUTO_LOGIN__")
+            continue
+        if char == "\x10":
+            chars.append("__TOGGLE_PAUSE__")
             continue
         chars.append(char)
     return chars
@@ -737,6 +820,16 @@ def _consume_watch_stdin_shell(
     for char in chars:
         if char == "\x03":
             raise KeyboardInterrupt
+        if char == "__TOGGLE_PAUSE__":
+            message = _toggle_watch_pause(state)
+            _set_watch_status_message(
+                state,
+                message,
+                transient_seconds=None if state.paused else _WATCH_TUI_TRANSIENT_STATUS_SECONDS,
+            )
+            _render_watch_shell_screen(state, serial_port=serial_port, baudrate=baudrate, writer=writer)
+            state.prompt_visible = True
+            continue
         if char in {"__PAGE_UP__", "__PAGE_DOWN__", "__SCROLL_TOP__", "__SCROLL_BOTTOM__"}:
             direction_map = {
                 "__PAGE_UP__": "page_up",
@@ -911,12 +1004,18 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
         return 1
     if args.raw_live:
         if existing_broker is None:
-            broker = cli_main.SerialBroker(
-                serial_port=serial_port,
-                baudrate=baudrate,
-            )
+            protect_human_session = bool(getattr(args, "protect_human_session", False))
+            broker_kwargs: dict[str, Any] = {
+                "serial_port": serial_port,
+                "baudrate": baudrate,
+            }
+            if protect_human_session:
+                broker_kwargs.update({"owner": "human-observe", "protected": True})
+            broker = cli_main.SerialBroker(**broker_kwargs)
             broker.start()
             print(f"[DONE] Raw serial broker started on {serial_port} @ {baudrate}")
+            if protect_human_session:
+                print("[DONE] Human observation guard enabled; serial-broker stop now requires --force.")
             print(f"[DONE] {serial_port} connected successfully @ {baudrate}")
         else:
             print(
@@ -1010,9 +1109,11 @@ def _command_serial_broker(args: argparse.Namespace) -> int:
         print("[ oooo. ] 4/5 steps")
         print(f"[DONE] Active raw serial brokers: {len(registries)}")
         for registry in registries:
+            guard = " protected" if registry.protected else ""
+            owner = f" owner={registry.owner}" if registry.owner else ""
             print(
                 f"[DONE] {registry.serial_port}: pid={registry.pid} "
-                f"tcp={registry.host}:{registry.tcp_port} baudrate={registry.baudrate}"
+                f"tcp={registry.host}:{registry.tcp_port} baudrate={registry.baudrate}{guard}{owner}"
             )
         return 0
 
@@ -1028,9 +1129,16 @@ def _command_serial_broker(args: argparse.Namespace) -> int:
             print("[TODO] No active raw serial brokers found.")
             return 0
         stopped = 0
+        protected_skipped = 0
         for port in target_ports:
             try:
-                registry = cli_main.stop_serial_broker(port)
+                registry = cli_main.stop_serial_broker(port, allow_protected=bool(getattr(args, "force", False)))
+            except SerialBrokerProtectedError as exc:
+                protected_skipped += 1
+                print("[ERROR] Protected human observation broker was not stopped.")
+                print(f"[TODO] {exc}")
+                print("[TODO] Close the observe-serial window yourself, or rerun with --force after confirming no one is watching.")
+                continue
             except Exception as exc:
                 print("[ oxx.. ] 2/5 steps")
                 print(f"[ERROR] Failed to stop raw serial broker on {port}: {exc}")
@@ -1043,6 +1151,9 @@ def _command_serial_broker(args: argparse.Namespace) -> int:
             print(f"[DONE] Stopped raw serial broker on {port} (pid {registry.pid})")
         print("[ oooo. ] 4/5 steps")
         print(f"[DONE] Raw serial brokers stopped: {stopped}/{len(target_ports)}")
+        if protected_skipped:
+            print(f"[TODO] Protected human observation brokers skipped: {protected_skipped}")
+            return 1
         return 0
 
     raise ValueError(f"Unsupported serial broker subcommand: {args.broker_command}")

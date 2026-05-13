@@ -391,10 +391,10 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
     },
     "serial-broker-stop": {
         "category": "serial",
-        "summary": "Stop one or more raw serial brokers and release the physical COM port.",
+        "summary": "Stop one or more raw serial brokers and release the physical COM port; protected human observer brokers require force=true.",
         "required_connection": [],
         "recommended_connection": ["serial_port"],
-        "common_options": ["serial_port", "all"],
+        "common_options": ["serial_port", "all", "force"],
         "creates_session": False,
     },
     "report": {

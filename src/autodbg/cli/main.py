@@ -770,6 +770,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="When following a live broker, type shell commands in this window and press Enter to send them over serial",
     )
     watch_parser.add_argument(
+        "--protect-human-session",
+        action="store_true",
+        help="Mark a newly started raw-live broker as a human observation session; serial-broker stop then requires --force",
+    )
+    watch_parser.add_argument(
         "--settings",
         type=Path,
         default=_default_settings_path(),
@@ -787,6 +792,11 @@ def _build_parser() -> argparse.ArgumentParser:
     broker_stop_target = broker_stop_parser.add_mutually_exclusive_group(required=True)
     broker_stop_target.add_argument("--serial-port", help="Serial port name, for example COM19")
     broker_stop_target.add_argument("--all", action="store_true", help="Stop every active raw serial broker")
+    broker_stop_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow stopping a broker marked as a protected human observation session",
+    )
 
     agent_parser = subparsers.add_parser(
         "agent-call",

@@ -455,6 +455,7 @@ $arguments = @(
     "--raw-live",
     "--follow",
     "--stdin-shell",
+    "--protect-human-session",
     "--tail", "$Tail",
     "--serial-port", "$SerialPort",
     "--baudrate", "$Baudrate"

@@ -39,6 +39,10 @@ class SerialPortBusyError(RuntimeError):
     """Raised when this tool already holds the same serial port lock."""
 
 
+class SerialBrokerProtectedError(RuntimeError):
+    """Raised when a protected human observer broker would be stopped."""
+
+
 @dataclass(slots=True)
 class SerialTraceEntry:
     timestamp: str
@@ -75,6 +79,8 @@ class SerialBrokerRegistry:
     pid: int
     serial_port: str
     baudrate: int
+    owner: str | None = None
+    protected: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -83,6 +89,8 @@ class SerialBrokerRegistry:
             "pid": self.pid,
             "serial_port": self.serial_port,
             "baudrate": self.baudrate,
+            "owner": self.owner,
+            "protected": self.protected,
         }
 
     @classmethod
@@ -98,6 +106,8 @@ class SerialBrokerRegistry:
                 pid=int(payload["pid"]),
                 serial_port=str(payload["serial_port"]),
                 baudrate=int(payload["baudrate"]),
+                owner=str(payload["owner"]) if payload.get("owner") else None,
+                protected=bool(payload.get("protected", False)),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -355,13 +365,23 @@ def serial_broker_registry_path(port: str) -> Path:
     return _serial_broker_dir() / f"{_normalize_port_name(port)}.json"
 
 
-def write_serial_broker_registry(port: str, *, host: str, tcp_port: int, baudrate: int) -> Path:
+def write_serial_broker_registry(
+    port: str,
+    *,
+    host: str,
+    tcp_port: int,
+    baudrate: int,
+    owner: str | None = None,
+    protected: bool = False,
+) -> Path:
     registry = SerialBrokerRegistry(
         host=host,
         tcp_port=tcp_port,
         pid=os.getpid(),
         serial_port=port,
         baudrate=baudrate,
+        owner=owner,
+        protected=protected,
     )
     path = serial_broker_registry_path(port)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,7 +438,12 @@ def list_serial_broker_registries(*, serial_port: str | None = None) -> list[Ser
     return registries
 
 
-def stop_serial_broker(port: str, *, wait_timeout: float = 2.0) -> SerialBrokerRegistry | None:
+def stop_serial_broker(
+    port: str,
+    *,
+    wait_timeout: float = 2.0,
+    allow_protected: bool = False,
+) -> SerialBrokerRegistry | None:
     registry = load_serial_broker_registry(port)
     if registry is None:
         _cleanup_serial_broker_artifacts(port)
@@ -427,6 +452,13 @@ def stop_serial_broker(port: str, *, wait_timeout: float = 2.0) -> SerialBrokerR
     if not _pid_is_running(registry.pid):
         _cleanup_serial_broker_artifacts(port)
         return registry
+
+    if registry.protected and not allow_protected:
+        owner = f" owner={registry.owner}" if registry.owner else ""
+        raise SerialBrokerProtectedError(
+            f"Refusing to stop protected raw serial broker on {registry.serial_port}"
+            f" (pid {registry.pid}{owner}). Use --force only after confirming the human observer can be disconnected."
+        )
 
     _terminate_pid(registry.pid)
     deadline = time.monotonic() + max(wait_timeout, 0.1)
