@@ -122,12 +122,14 @@
 
 1. 从 `AUTO_DBG_PROJECT_ROOT` 读取独立工具根目录
 2. 默认值应当指向本地安装目录，例如 `%LOCALAPPDATA%\Programs\auto-debug`
-3. 再从 `${AUTO_DBG_PROJECT_ROOT}\.venv\Scripts\python.exe` 启动 MCP server
+3. 从 `AUTO_DBG_MCP_LOG_DIR` 或 `-LogDir` 读取 MCP 启动日志目录；未指定时默认 `${AUTO_DBG_PROJECT_ROOT}\.autodbg`
+4. 再从 `${AUTO_DBG_PROJECT_ROOT}\.venv\Scripts\python.exe` 启动 MCP server
 
 这意味着：
 
 - 任意工作区都可以装同一个 home-local 插件
 - 独立工具项目如果将来迁移路径，只需要改 `AUTO_DBG_PROJECT_ROOT`
+- MCP stderr 不会写进 stdio，而是进入日志目录下的 `mcp-stderr-*.log`
 - 但前提仍然是该根目录下要有本地安装版 `auto-debug` 和对应 `.venv`；`install-local-tool.ps1` 会自动创建这份运行时
 
 ### 自动安装 / 升级
@@ -150,7 +152,21 @@ cd <repo-root>
 5. 安装或更新 `~\.agents\plugins\marketplace.json`
 6. 将 `.mcp.json` 的默认 `AUTO_DBG_PROJECT_ROOT` 指向本地安装目录
 
-如果只想单独刷新 home plugin：
+已经部署过 MCP 后，更新本地安装版时必须显式指定源码路径和安装路径，避免当前 shell 里的旧 `AUTO_DBG_PROJECT_ROOT` / `AUTO_DBG_HOME` 影响刷新结果：
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\auto-debug"
+.\install-local-tool.ps1 -ProjectRoot (Resolve-Path .).Path -InstallRoot $installRoot -ForceCloseInUseProcesses
+```
+
+如果只刷新已部署的 home-local MCP plugin，也必须显式指定安装版根目录和 home 目录：
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\auto-debug"
+& (Join-Path $installRoot "install-home-plugin.ps1") -ProjectRoot $installRoot -HomeRoot $HOME
+```
+
+`install-home-plugin` 仍可在确认环境变量已经刷新后的新 shell 里使用；排查路径问题或更新已部署 MCP 时，优先使用上面的显式路径命令：
 
 ```powershell
 install-home-plugin
@@ -193,6 +209,7 @@ MCP server 本身是通用的 stdio JSON-RPC 服务，Codex 和 Claude Code 都�
       ],
       "env": {
         "AUTO_DBG_PROJECT_ROOT": "C:\\Users\\<YourName>\\AppData\\Local\\Programs\\auto-debug",
+        "AUTO_DBG_MCP_LOG_DIR": "C:\\Users\\<YourName>\\AppData\\Local\\Programs\\auto-debug\\.autodbg",
         "PYTHONUTF8": "1"
       }
     }
@@ -213,6 +230,7 @@ claude mcp add autodbg --scope user -- powershell.exe -NoProfile -ExecutionPolic
 ```json
 "env": {
   "AUTO_DBG_PROJECT_ROOT": "C:\\Users\\<YourName>\\AppData\\Local\\Programs\\auto-debug",
+  "AUTO_DBG_MCP_LOG_DIR": "C:\\Users\\<YourName>\\AppData\\Local\\Programs\\auto-debug\\.autodbg",
   "PYTHONUTF8": "1"
 }
 ```

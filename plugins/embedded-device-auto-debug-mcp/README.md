@@ -13,6 +13,14 @@
 - `${AUTO_DBG_PROJECT_ROOT}\.venv\Scripts\python.exe`
 - `scripts\autodbg_mcp_server.py`
 
+MCP 启动日志目录：
+
+1. `launch-autodbg-mcp.ps1 -LogDir <path>`
+2. `AUTO_DBG_MCP_LOG_DIR`
+3. `${AUTO_DBG_PROJECT_ROOT}\.autodbg`
+
+相对日志路径会按 `AUTO_DBG_PROJECT_ROOT` 解析。launcher 只把 stderr 写入日志文件，避免污染 MCP stdio。
+
 项目根解析顺序：
 
 1. `AUTO_DBG_PROJECT_ROOT`
@@ -20,6 +28,14 @@
 3. 从插件脚本位置向上回推到仓库根目录
 
 推荐先执行仓库根目录下的 `.\install-local-tool.ps1`，让脚本生成独立安装版和 home-local MCP 插件。
+
+已经部署过 MCP 后，更新时需要显式指定路径，避免旧环境变量把插件刷新到错误目录：
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\auto-debug"
+.\install-local-tool.ps1 -ProjectRoot (Resolve-Path .).Path -InstallRoot $installRoot -ForceCloseInUseProcesses
+& (Join-Path $installRoot "install-home-plugin.ps1") -ProjectRoot $installRoot -HomeRoot $HOME
+```
 
 详细说明见：
 

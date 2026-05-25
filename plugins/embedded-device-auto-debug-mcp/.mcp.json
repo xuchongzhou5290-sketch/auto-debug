@@ -10,6 +10,7 @@
         ".\\scripts\\launch-autodbg-mcp.ps1"
       ],
       "env": {
+        "AUTO_DBG_MCP_LOG_DIR": ".autodbg",
         "PYTHONUTF8": "1"
       }
     }

@@ -134,6 +134,20 @@ cd <repo-root>
 .\install-local-tool.ps1 -ForceCloseInUseProcesses
 ```
 
+已经部署过 MCP 后，更新本地安装版时建议显式指定源码路径和安装路径，避免旧环境变量把 home-local MCP 刷到错误位置：
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\auto-debug"
+.\install-local-tool.ps1 -ProjectRoot (Resolve-Path .).Path -InstallRoot $installRoot -ForceCloseInUseProcesses
+```
+
+如果只刷新已部署的 MCP 插件，也要显式指定安装版根目录：
+
+```powershell
+$installRoot = Join-Path $env:LOCALAPPDATA "Programs\auto-debug"
+& (Join-Path $installRoot "install-home-plugin.ps1") -ProjectRoot $installRoot -HomeRoot $HOME
+```
+
 它会自动：
 
 - 复制独立运行所需内容到 `%LOCALAPPDATA%\Programs\auto-debug`

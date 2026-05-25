@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 artifacts/
 retrieved/
+.autodbg/
 _req_*.json
 _reboot_req.json
 config/user-settings.toml
