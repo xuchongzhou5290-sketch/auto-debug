@@ -66,15 +66,19 @@ from autodbg.profiles.loader import (
     resolve_run_profile_paths,
 )
 from autodbg.serial.broker import SerialBroker
+from autodbg.serial.cases import begin_serial_case, capture_serial_case, end_serial_case
 from autodbg.serial.observer import MarkerHit, SerialObserver
 from autodbg.serial.runtime import (
     SerialSupportError,
     SerialTraceStreamClient,
     SerialTraceEntry,
+    ensure_observe_serial_broker,
+    is_observe_serial_broker,
     list_serial_ports,
     list_serial_broker_registries,
     load_serial_broker_registry,
     open_serial_port,
+    protect_serial_broker_registry,
     serial_trace_log_path,
     stop_serial_broker,
 )
@@ -94,6 +98,7 @@ _DEFAULT_SD_HTTP_HELPER_DEVICE_PATH = "/mnt/sdcard/autodbg/autodbg-http-pull"
 _DEFAULT_SD_HTTP_HELPER_TARGET_SUBDIR = "autodbg"
 _DEFAULT_SD_HTTP_HELPER_DEST_NAME = "autodbg-http-pull"
 _DEBUG_FIRMWARE_METHOD_CHOICES = ("firmware_command", "sd_http_helper")
+_DEBUG_MODE_CHOICES = ("test", "development")
 
 
 def _project_root() -> Path:
@@ -449,6 +454,11 @@ def _build_parser() -> argparse.ArgumentParser:
     quickstart_parser.add_argument("--sdcard-drive", help="Known host SD card drive, for example E:")
     quickstart_parser.add_argument("--helper-cc", help="Known target cross compiler for build-sd-http-helper")
     quickstart_parser.add_argument(
+        "--debug-mode",
+        choices=list(_DEBUG_MODE_CHOICES),
+        help="Debug intent: test keeps firmware untouched and slices case evidence; development requires firmware/pull metadata.",
+    )
+    quickstart_parser.add_argument(
         "--debug-firmware-method",
         choices=list(_DEBUG_FIRMWARE_METHOD_CHOICES),
         help=(
@@ -456,6 +466,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "has an integrated pull command; sd_http_helper means build a Linux helper and stage it on SD."
         ),
     )
+    quickstart_parser.add_argument("--firmware-build-time", help="Firmware build time running in development mode")
+    quickstart_parser.add_argument("--case-id", help="Stable case identifier used for serial evidence slicing")
+    quickstart_parser.add_argument("--case-title", help="Human-readable case title used in evidence patches")
     quickstart_parser.add_argument("--artifact", type=Path, help="Known local artifact path for deploy or transfer guidance")
 
     device_pull_parser = subparsers.add_parser(
@@ -526,6 +539,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Prefer HTTP pull, SD-card HTTP helper, force serial bundle transfer, or auto-select based on device capabilities",
     )
+    device_pull_parser.add_argument(
+        "--debug-mode",
+        choices=list(_DEBUG_MODE_CHOICES),
+        help="Record whether this pull belongs to test or development mode",
+    )
+    device_pull_parser.add_argument(
+        "--debug-firmware-method",
+        choices=list(_DEBUG_FIRMWARE_METHOD_CHOICES),
+        help="Development-mode firmware pull method used for this transfer",
+    )
+    device_pull_parser.add_argument("--firmware-build-time", help="Development-mode firmware build time annotation")
     device_pull_parser.add_argument(
         "--sd-http-helper-path",
         default=_DEFAULT_SD_HTTP_HELPER_DEVICE_PATH,
@@ -604,6 +628,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_loop_arguments(deploy_verify_parser)
     deploy_verify_parser.add_argument("--build-command", help="Host-side build command to run before deploying")
     deploy_verify_parser.add_argument("--artifact", type=Path, help="Local artifact produced by the build or selected for deployment")
+    deploy_verify_parser.add_argument(
+        "--debug-mode",
+        choices=list(_DEBUG_MODE_CHOICES),
+        help="Record whether this deploy/verify loop is test or development mode",
+    )
+    deploy_verify_parser.add_argument(
+        "--debug-firmware-method",
+        choices=list(_DEBUG_FIRMWARE_METHOD_CHOICES),
+        help="Development-mode firmware flashing or package pull method",
+    )
+    deploy_verify_parser.add_argument("--firmware-build-time", help="Build time of the firmware running in this development cycle")
     deploy_verify_parser.add_argument(
         "--post-pull-command",
         action="append",
@@ -719,6 +754,25 @@ def _build_parser() -> argparse.ArgumentParser:
     intervention_parser.add_argument("--expected-effect", help="Expected effect before the next debug iteration")
     intervention_parser.add_argument("--related-session", help="Optional related session id or path")
     intervention_parser.add_argument("--metadata-json", help="Optional JSON object with extra machine-readable metadata")
+
+    case_begin_parser = subparsers.add_parser("case-begin", help="Start a serial evidence slice for one test case")
+    case_begin_parser.add_argument("--serial-port", required=True, help="Serial port name, for example COM19")
+    case_begin_parser.add_argument("--case-id", required=True, help="Stable case identifier")
+    case_begin_parser.add_argument("--title", help="Human-readable case title")
+    case_begin_parser.add_argument("--note", help="Optional note stored in case metadata")
+
+    case_end_parser = subparsers.add_parser("case-end", help="End a serial evidence slice and write evidence_patch.md")
+    case_end_parser.add_argument("--serial-port", required=True, help="Serial port name, for example COM19")
+    case_end_parser.add_argument("--case-id", required=True, help="Stable case identifier")
+    case_end_parser.add_argument("--result", choices=["pass", "fail", "unknown"], default="unknown", help="Case result")
+    case_end_parser.add_argument("--note", help="Optional note stored in case metadata")
+
+    case_capture_parser = subparsers.add_parser("case-capture", help="Capture focused evidence from an active or ended serial case")
+    case_capture_parser.add_argument("--serial-port", required=True, help="Serial port name, for example COM19")
+    case_capture_parser.add_argument("--case-id", required=True, help="Stable case identifier")
+    case_capture_parser.add_argument("--focus", action="append", default=[], metavar="TEXT", help="Focus text to include with context")
+    case_capture_parser.add_argument("--before", type=int, default=20, help="Lines before a focus hit")
+    case_capture_parser.add_argument("--after", type=int, default=40, help="Lines after a focus hit")
 
     resume_parser = subparsers.add_parser("resume", help="Show the stored session summary")
     resume_parser.add_argument("--session-dir", type=Path, required=True, help="Path to the session directory")
@@ -1237,6 +1291,12 @@ def _build_intervention_context(
         context["changed_files"] = [str(item) for item in changed_files]
     if getattr(args, "expected_effect", None):
         context["expected_effect"] = args.expected_effect
+    if getattr(args, "debug_mode", None):
+        context["debug_mode"] = args.debug_mode
+    if getattr(args, "debug_firmware_method", None):
+        context["debug_firmware_method"] = args.debug_firmware_method
+    if getattr(args, "firmware_build_time", None):
+        context["firmware_build_time"] = args.firmware_build_time
     if artifact is not None:
         context["artifact"] = str(artifact)
     if artifact_sha256:
@@ -2801,6 +2861,8 @@ def _normalize_quickstart_goal(goal: str | None) -> str:
         return "quickstart"
     if any(token in text for token in ["helper", "curl", "wget", "交叉编译", "sd http"]):
         return "sd_http_helper"
+    if any(token in text for token in ["case", "用例", "测试", "复测", "证据", "截取", "贴片", "复现"]):
+        return "test_case"
     if any(token in text for token in ["下发", "拉取", "拉包", "新包", "升级包", "传输", "device-pull", "artifact", "程序"]):
         return "device_pull"
     if any(token in text for token in ["闭环", "升级", "验证", "deploy", "刷机"]):
@@ -2810,6 +2872,42 @@ def _normalize_quickstart_goal(goal: str | None) -> str:
     if any(token in text for token in ["串口", "日志", "observe", "watch", "serial"]):
         return "watch_serial"
     return "unknown"
+
+
+def _infer_debug_mode_from_goal(goal: str | None) -> str | None:
+    text = (goal or "").strip().lower()
+    if not text:
+        return None
+    if any(token in text for token in ["case", "用例", "测试", "复测", "证据", "截取", "贴片", "复现"]):
+        return "test"
+    if any(token in text for token in ["开发", "刷固件", "刷机", "拉包", "拉取新包", "新包", "升级包", "升级", "编译", "构建", "deploy"]):
+        return "development"
+    return None
+
+
+def _normalize_debug_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in _DEBUG_MODE_CHOICES:
+        return cleaned
+    return None
+
+
+def _validate_development_debug_context(args: argparse.Namespace, *, action_name: str) -> bool:
+    if getattr(args, "debug_mode", None) != "development":
+        return True
+    missing = []
+    if not getattr(args, "debug_firmware_method", None):
+        missing.append("debug_firmware_method")
+    if not getattr(args, "firmware_build_time", None):
+        missing.append("firmware_build_time")
+    if not missing:
+        return True
+    print("[ ●○○○○ ] 1/5 steps")
+    print(f"[ERROR] {action_name} development mode is missing: {', '.join(missing)}")
+    print("[TODO] Pass --debug-firmware-method and --firmware-build-time before running development-mode firmware work.")
+    return False
 
 
 def _build_sd_http_helper_quickstart_requests(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -2851,6 +2949,12 @@ def _build_firmware_command_quickstart_request(
     }
     if args.artifact is not None:
         options["root"] = str(args.artifact.parent)
+    if getattr(args, "debug_mode", None):
+        options["debug_mode"] = args.debug_mode
+    if getattr(args, "debug_firmware_method", None):
+        options["debug_firmware_method"] = args.debug_firmware_method
+    if getattr(args, "firmware_build_time", None):
+        options["firmware_build_time"] = args.firmware_build_time
     return {
         "schema_version": 1,
         "action": "device-pull",
@@ -2863,28 +2967,40 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
     goal = _normalize_quickstart_goal(args.goal)
     serial_port = args.serial_port or (ports[0]["device"] if len(ports) == 1 else None)
     password_known = bool(args.device_password_known or os.environ.get("AUTO_DBG_DEVICE_PASSWORD"))
+    debug_mode = _normalize_debug_mode(getattr(args, "debug_mode", None)) or _infer_debug_mode_from_goal(args.goal)
     debug_firmware_method = getattr(args, "debug_firmware_method", None)
+    firmware_build_time = getattr(args, "firmware_build_time", None)
+    case_id = getattr(args, "case_id", None)
+    case_title = getattr(args, "case_title", None)
+    if debug_mode and getattr(args, "debug_mode", None) is None:
+        setattr(args, "debug_mode", debug_mode)
 
     questions: list[str] = []
-    if goal == "device_pull" and debug_firmware_method is None:
+    if goal in {"test_case", "device_pull", "deploy_verify"} and debug_mode is None:
+        questions.append("请选择调试模式：test=不刷固件、按 case 切串口证据；development=刷固件/拉包并保持上电周期日志连续。")
+    if debug_mode == "development" and goal in {"device_pull", "deploy_verify"} and debug_firmware_method is None:
         questions.append(
             "请选择调试固件拉取新包方式：firmware_command=固件内置指令拉取；"
             "sd_http_helper=生成 Linux 可执行文件放 SD 卡拉取。"
         )
-    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify"}:
+    if debug_mode == "development" and goal in {"device_pull", "deploy_verify"} and not firmware_build_time:
+        questions.append("请提供本轮运行固件的编译时间；如果无法自动识别，必须由用户明确提供。")
+    if debug_mode == "test" and goal == "test_case" and not case_id:
+        questions.append("请提供 case_id，用于生成 cases/<timestamp-case_id>/ 下的串口证据贴片。")
+    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify", "test_case"}:
         questions.append("请提供目标设备串口号；如果不确定，先运行 ports 或从 detected_ports 里选择。")
     if goal in {"health", "device_pull", "deploy_verify"} and not password_known:
         questions.append("请提供设备 shell 登录密码；该密码只放 connection.device_password，不要写进普通日志。")
-    if goal == "device_pull" and args.artifact is None:
+    if debug_mode != "test" and goal == "device_pull" and args.artifact is None:
         questions.append("请提供要让设备拉取的新包或本地产物路径，例如 payloads/APP.bin。")
-    if goal == "deploy_verify" and args.artifact is None:
+    if debug_mode != "test" and goal == "deploy_verify" and args.artifact is None:
         questions.append("请提供要部署验证的本地产物路径，例如 payloads/APP.bin。")
-    if (goal == "sd_http_helper" or (goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.helper_cc:
+    if (goal == "sd_http_helper" or (debug_mode == "development" and goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.helper_cc:
         questions.append("请提供目标设备交叉编译器命令或完整路径，用于构建 SD HTTP helper，例如 arm-linux-gnueabihf-gcc。")
-    if (goal == "sd_http_helper" or (goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.sdcard_drive:
+    if (goal == "sd_http_helper" or (debug_mode == "development" and goal == "device_pull" and debug_firmware_method == "sd_http_helper")) and not args.sdcard_drive:
         questions.append("请提供本机 SD 卡盘符，用于把编译出的 helper 放入 SD 卡，例如 E:。")
     if goal in {"unknown", "quickstart"}:
-        questions.append("请说明你想做什么：观察串口、健康检查、下发程序、升级验证，或编译 SD HTTP helper。")
+        questions.append("请说明你想做什么：观察串口、执行测试 case、健康检查、下发程序、升级验证，或编译 SD HTTP helper。")
 
     connection: dict[str, Any] = {}
     if serial_port:
@@ -2895,7 +3011,7 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
         connection["sdcard_drive"] = args.sdcard_drive
 
     next_requests: list[dict[str, Any]] = []
-    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify"}:
+    if serial_port is None and goal in {"unknown", "quickstart", "watch_serial", "health", "device_pull", "deploy_verify", "test_case"}:
         next_requests.append({"schema_version": 1, "action": "ports"})
     if goal == "watch_serial":
         next_requests.append(
@@ -2906,6 +3022,38 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
                 "options": {"tail": 40, "follow": True},
             }
         )
+    elif goal == "test_case":
+        next_requests.append(
+            {
+                "schema_version": 1,
+                "action": "watch-serial",
+                "connection": connection,
+                "options": {"tail": 40, "follow": False},
+            }
+        )
+        if case_id:
+            next_requests.append(
+                {
+                    "schema_version": 1,
+                    "action": "case-begin",
+                    "connection": connection,
+                    "options": {
+                        "case_id": case_id,
+                        "title": case_title or case_id,
+                    },
+                }
+            )
+            next_requests.append(
+                {
+                    "schema_version": 1,
+                    "action": "case-end",
+                    "connection": connection,
+                    "options": {
+                        "case_id": case_id,
+                        "result": "unknown",
+                    },
+                }
+            )
     elif goal == "health":
         next_requests.append(
             {
@@ -2925,6 +3073,12 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
             }
             if args.artifact is not None:
                 options["root"] = str(args.artifact.parent)
+            if debug_mode:
+                options["debug_mode"] = debug_mode
+            if debug_firmware_method:
+                options["debug_firmware_method"] = debug_firmware_method
+            if firmware_build_time:
+                options["firmware_build_time"] = firmware_build_time
             next_requests.append(
                 {
                     "schema_version": 1,
@@ -2944,6 +3098,9 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
                 "options": {
                     "artifact": str(args.artifact) if args.artifact else "<local-artifact-path>",
                     "observe_seconds": 10.0,
+                    **({"debug_mode": debug_mode} if debug_mode else {}),
+                    **({"debug_firmware_method": debug_firmware_method} if debug_firmware_method else {}),
+                    **({"firmware_build_time": firmware_build_time} if firmware_build_time else {}),
                 },
             }
         )
@@ -2960,7 +3117,11 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
             "device_password_known": password_known,
             "sdcard_drive": args.sdcard_drive,
             "helper_cc": args.helper_cc,
+            "debug_mode": debug_mode,
             "debug_firmware_method": debug_firmware_method,
+            "firmware_build_time": firmware_build_time,
+            "case_id": case_id,
+            "case_title": case_title,
             "artifact": str(args.artifact) if args.artifact else None,
         },
         "questions": questions[:3],
@@ -2968,7 +3129,8 @@ def _build_quickstart_action_plan(args: argparse.Namespace, ports: list[dict[str
         "agent_instructions": [
             "Call autodbg_prepare on the selected next_request before autodbg_action.",
             "Ask the questions list first, at most three questions at a time.",
-            "For package pull goals, do not continue until debug_firmware_method is chosen: firmware_command or sd_http_helper.",
+            "If debug_mode=test, do not require firmware flashing or package pull; wrap the case with case-begin and case-end, then use evidence_patch.md.",
+            "If debug_mode=development, do not continue until debug_firmware_method and firmware_build_time are known.",
             "If debug_firmware_method=sd_http_helper, treat next_requests as ordered: build-sd-http-helper, stage-sd, then device-pull with transfer_mode=auto and sd_http_helper_path.",
             "If debug_firmware_method=firmware_command, use the firmware/downloader pull path and do not build or stage the SD helper.",
             "Do not print device_password; pass it only through connection.device_password.",
@@ -2997,6 +3159,8 @@ def _command_quickstart(args: argparse.Namespace) -> int:
 
 
 def _command_device_pull(args: argparse.Namespace) -> int:
+    if not _validate_development_debug_context(args, action_name="device-pull"):
+        return 2
     profiles = _load_profiles_from_args(args)
     session, loop_context = _create_session_with_loop(
         args,
@@ -3058,6 +3222,9 @@ def _command_device_pull(args: argparse.Namespace) -> int:
             "sd_http_helper_path",
             "sd_http_list_name",
             "serial_bundle_chunk_size",
+            "debug_mode",
+            "debug_firmware_method",
+            "firmware_build_time",
             "timeout",
             "wifi_ssid",
             "wifi_password",
@@ -3089,6 +3256,11 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "sd_http_list_name": args.sd_http_list_name,
                 "requested_transfer_mode": args.transfer_mode,
                 "serial_bundle_chunk_size": args.serial_bundle_chunk_size,
+                "debug": {
+                    "mode": args.debug_mode,
+                    "firmware_method": args.debug_firmware_method,
+                    "firmware_build_time": args.firmware_build_time,
+                },
                 "list_command": list_command,
                 "post_pull_commands": list(args.post_pull_command),
                 "reboot_command": args.reboot_command,
@@ -3966,6 +4138,8 @@ def _command_build_sd_http_helper(args: argparse.Namespace) -> int:
 
 
 def _command_deploy_verify(args: argparse.Namespace) -> int:
+    if not _validate_development_debug_context(args, action_name="deploy-verify"):
+        return 2
     profiles = _load_profiles_from_args(args)
     session, loop_context = _create_session_with_loop(
         args,
@@ -3992,6 +4166,9 @@ def _command_deploy_verify(args: argparse.Namespace) -> int:
             "git_commit",
             "changed_file",
             "expected_effect",
+            "debug_mode",
+            "debug_firmware_method",
+            "firmware_build_time",
         ],
     )
     collector.bootstrap(
@@ -4012,6 +4189,12 @@ def _command_deploy_verify(args: argparse.Namespace) -> int:
                 "expect_markers": list(args.expect_marker),
                 "reject_markers": list(args.reject_marker),
                 "expected_version": args.expected_version,
+                "debug": {
+                    "mode": args.debug_mode,
+                    "firmware_method": args.debug_firmware_method,
+                    "firmware_build_time": args.firmware_build_time,
+                    "cycle_boundary": "first_power_on_to_next_power_on",
+                },
             }
         },
     )
@@ -4065,6 +4248,9 @@ def _command_deploy_verify(args: argparse.Namespace) -> int:
                         "path": str(artifact_path),
                         "size_bytes": artifact_path.stat().st_size,
                         "sha256": artifact_sha256,
+                        "debug_mode": args.debug_mode,
+                        "firmware_method": args.debug_firmware_method,
+                        "firmware_build_time": args.firmware_build_time,
                     },
                     indent=2,
                     ensure_ascii=False,
@@ -5308,6 +5494,50 @@ def _command_record_intervention(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_case_begin(args: argparse.Namespace) -> int:
+    result = begin_serial_case(
+        args.serial_port,
+        args.case_id,
+        title=args.title,
+        note=args.note,
+    )
+    print("[ ●●○○○ ] 2/5 steps")
+    print(f"[DONE] Serial case started: {result.case_id}")
+    print(f"[DONE] Metadata: {result.metadata_path}")
+    print(f"[ACTIVE] Case directory: {result.case_dir}")
+    return 0
+
+
+def _command_case_end(args: argparse.Namespace) -> int:
+    result = end_serial_case(
+        args.serial_port,
+        args.case_id,
+        result=args.result,
+        note=args.note,
+    )
+    print("[ ●●●●○ ] 4/5 steps")
+    print(f"[DONE] Serial case ended: {result.case_id}")
+    print(f"[DONE] Lines sliced: {result.selected_lines}")
+    print(f"[DONE] Trace text: {result.trace_text_path}")
+    print(f"[ACTIVE] Evidence patch: {result.evidence_patch_path}")
+    return 0
+
+
+def _command_case_capture(args: argparse.Namespace) -> int:
+    result = capture_serial_case(
+        args.serial_port,
+        args.case_id,
+        focus=list(args.focus),
+        before=args.before,
+        after=args.after,
+    )
+    print("[ ●●●○○ ] 3/5 steps")
+    print(f"[DONE] Serial case captured: {result.case_id}")
+    print(f"[DONE] Selected lines: {result.selected_lines}")
+    print(f"[ACTIVE] Evidence patch: {result.evidence_patch_path}")
+    return 0
+
+
 def _command_summary(args: argparse.Namespace) -> int:
     summary_path = args.session_dir / "summary.json"
     data = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -5448,6 +5678,12 @@ def _dispatch_command(args: argparse.Namespace) -> int:
         return _command_health(args)
     if args.command == "record-intervention":
         return _command_record_intervention(args)
+    if args.command == "case-begin":
+        return _command_case_begin(args)
+    if args.command == "case-end":
+        return _command_case_end(args)
+    if args.command == "case-capture":
+        return _command_case_capture(args)
     if args.command == "resume":
         return _command_summary(args)
     if args.command == "summary":

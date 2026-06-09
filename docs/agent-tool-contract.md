@@ -153,14 +153,15 @@ AI 想先拿自描述清单时，可以直接调用：
 
 ### 人工 + AI 串口协同规则
 
-如果用户自己也要实时看串口，不要默认让 AI 单独占着串口跑。
+默认不要让 AI 单独占着串口跑；物理 COM 口应由 `observe-serial` 人工观察窗口持有。
 
-- AI 应先明确引导用户在独立终端打开 `observe-serial` 或源码模式下的 `.\observe-serial.ps1`
-- 人工观察窗口启动后，AI 侧优先使用 `watch-serial` 跟随共享 trace，或直接执行会复用 broker 的 `run / exec / health / collect-evidence`
-- 如果已经有人工观察窗口，AI 不应再默认加 `raw_live=true` 去重新抢物理串口
-- 只在需要启动或接管共享 broker 时才使用 `watch-serial --raw-live`
+- 如果目标串口还没有 `observe-serial` 会话，AI 串口动作应先自动唤醒系统默认终端打开 `observe-serial`
+- AI 侧优先使用 `watch-serial` 跟随共享 trace，或直接执行会复用 broker 的 `run / exec / health / collect-evidence`
+- AI 不应默认加 `raw_live=true` 去重新抢物理串口
+- 只在 `observe-serial` 或明确人工接管时才使用 `watch-serial --raw-live`
 - 只要用户还在看串口，AI 就不应主动执行 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
 
 ## 4. `options` 字段
 
@@ -305,12 +306,17 @@ SD helper 的 C 源码在 `src/autodbg/assets/autodbg_http_pull.c`，AI 作为 M
 
 编译成功后再通过 `stage-sd` 放入 SD 卡。若目标 toolchain 不支持静态链接，传 `options.static=false`。
 
-当用户目标是“拉取/下发新包”时，默认先引导用户选择 `debug_firmware_method`，不能静默替用户决定路径：
+先判断 `debug_mode`：
+
+- `test`：测试模式，不要求刷设备固件，不要求 `debug_firmware_method`；AI 应使用 `case-begin -> 执行 case -> case-end` 生成可贴的串口证据，产物在 `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\`
+- `development`：开发模式，优先保证从第一次上电到下次重新上电的串口日志连续；涉及拉包/升级/部署时必须明确 `debug_firmware_method` 和 `firmware_build_time`
+
+当用户目标是“拉取/下发新包”且 `debug_mode=development` 时，默认先引导用户选择 `debug_firmware_method`，不能静默替用户决定路径：
 
 - `firmware_command`：调试固件已集成拉取新包指令或 downloader，`quickstart` 返回 `device-pull`
 - `sd_http_helper`：生成 Linux 可执行文件放入 SD 卡执行拉取，`quickstart` 返回 `build-sd-http-helper -> stage-sd -> device-pull`
 
-如果 `quickstart` 缺少 `debug_firmware_method`，会把该选择放进 `questions`；上层 AI 必须先追问。选择 `sd_http_helper` 后若缺少 `cc` 或 `sdcard_drive`，再对对应 request 调 `autodbg_prepare` 追问。
+如果 `quickstart` 缺少 `debug_mode / debug_firmware_method / firmware_build_time`，会把缺失项放进 `questions`；上层 AI 必须先追问。选择 `sd_http_helper` 后若缺少 `cc` 或 `sdcard_drive`，再对对应 request 调 `autodbg_prepare` 追问。
 
 ### 6.4 多轮继续跑 `run`
 
@@ -417,9 +423,10 @@ python -m autodbg agent-call --request -
 
 如果当前场景是“AI 在后台调试，用户也要直接看串口”，推荐顺序固定为：
 
-1. 先让用户执行 `observe-serial`
-2. AI 再调 `watch-serial` 或直接调 `run / exec / health`
-3. 结束前不要擅自停 broker，除非用户明确表示不再需要观察窗口
+1. AI 确认目标串口
+2. 如果该串口没有 `observe-serial`，工具自动打开系统默认终端运行 `observe-serial`
+3. AI 再调 `watch-serial` 或直接调 `run / exec / health`
+4. 结束前不要擅自停 broker，除非用户明确表示不再需要观察窗口
 
 ## 9. MCP 封装
 

@@ -235,8 +235,9 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - 请求里的相对路径会按 `project_root` 解析；走 MCP / 已安装插件时，这个根目录就是 `AUTO_DBG_PROJECT_ROOT`
 - 如果要做自动多轮调试，使用顶层 `loop` 字段传 `prev_session / iteration / goal`
 - 每轮代码或配置修改后，可以用 `record-intervention` 追加结构化干预记录
-- 串口主入口现在默认 broker-first：AI 执行 `run / exec / health / collect-evidence / device-pull / observe` 时会优先启动或复用 raw-live broker，再通过 broker 控制串口
-- 如果 AI 已经在后台执行串口动作，用户可以再开 `observe-serial` 或 `watch-serial --follow` 连接同一个 broker，而不是直接抢物理 COM 口
+- 串口协同默认以 `observe-serial` 为物理 COM 口拥有者；如果目标串口还没有 `observe-serial` 人工观察会话，AI 侧串口动作会先唤醒系统默认终端打开 `observe-serial`
+- AI 后续使用 `watch-serial` 或控制命令连接这个受保护 broker，不直接抢物理 COM 口
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
 
 详细约定见：
 
@@ -304,10 +305,11 @@ install-home-plugin
 
 ```powershell
 .\.venv\Scripts\python -m autodbg quickstart --goal "观察设备启动日志"
-.\.venv\Scripts\python -m autodbg quickstart --goal "升级后验证" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
+.\.venv\Scripts\python -m autodbg quickstart --goal "执行 case 后截取日志证据" --debug-mode test --case-id wifi_case_001 --serial-port COM19
+.\.venv\Scripts\python -m autodbg quickstart --goal "升级后验证" --debug-mode development --debug-firmware-method firmware_command --firmware-build-time "2026-06-09 10:32:18" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
 .\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
-.\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --debug-firmware-method sd_http_helper --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin --helper-cc arm-linux-gnueabihf-gcc --sdcard-drive E:
-.\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --debug-firmware-method firmware_command --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
+.\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --debug-mode development --debug-firmware-method sd_http_helper --firmware-build-time "2026-06-09 10:32:18" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin --helper-cc arm-linux-gnueabihf-gcc --sdcard-drive E:
+.\.venv\Scripts\python -m autodbg quickstart --goal "拉取新包" --debug-mode development --debug-firmware-method firmware_command --firmware-build-time "2026-06-09 10:32:18" --serial-port COM19 --device-password-known --artifact .\payloads\APP.bin
 ```
 
 MCP Agent 可以直接调用：
@@ -324,7 +326,29 @@ MCP Agent 可以直接调用：
 
 `quickstart` 会返回检测到的串口、最多 3 个待询问问题，以及下一步建议的 MCP request。AI 拿到 `next_requests` 后应先对选中的请求调用 `autodbg_prepare`，确认参数齐全后再执行 `autodbg_action`。
 
-当目标是“拉取/下发新包”时，`quickstart` 会强制先选择 `debug_firmware_method`：
+`quickstart` 会先判断 `debug_mode`：
+
+- `test`：测试模式，不要求刷设备固件，不要求 `debug_firmware_method`；重点是用 `case-begin -> 执行 case -> case-end` 切出串口证据贴片
+- `development`：开发模式，优先保证从第一次上电到下次重新上电的日志连续性；涉及拉包/升级/部署时必须指定 `debug_firmware_method` 和 `firmware_build_time`
+
+测试模式的串口证据默认落在：
+
+```text
+<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\
+```
+
+常用命令：
+
+```powershell
+.\.venv\Scripts\python -m autodbg case-begin --serial-port COM19 --case-id wifi_case_001 --title "WiFi reconnect"
+# 执行测试 case
+.\.venv\Scripts\python -m autodbg case-end --serial-port COM19 --case-id wifi_case_001 --result fail
+.\.venv\Scripts\python -m autodbg case-capture --serial-port COM19 --case-id wifi_case_001 --focus panic --before 20 --after 40
+```
+
+`case-end` 会生成 `metadata.json / trace.jsonl / trace.txt / evidence_patch.md`。
+
+当目标是“拉取/下发新包”且处于开发模式时，`quickstart` 会强制先选择 `debug_firmware_method`：
 
 - `firmware_command`：调试固件已集成拉取新包指令或 downloader，直接走固件/下载器拉取路径，不构建 SD helper
 - `sd_http_helper`：设备端没有可靠拉取指令时，先 `build-sd-http-helper -> stage-sd`，把 Linux 可执行文件放入 SD 卡，再 `device-pull`
@@ -350,11 +374,12 @@ MCP Agent 可以直接调用：
 它会：
 
 - 在命令行里显示一个类窗口选择界面，先选当前串口和常用波特率
-- 启动或复用 `COM19` 的 raw-live broker
+- 启动或复用 `COM19` 的受保护 raw-live broker
 - 将 `observe-serial` 启动的新 broker 标记为人工观察会话，普通 `serial-broker stop` 不会直接踢掉这个窗口
 - 打开持续观察窗口
 - 让后续 `autodbg run / exec / health / collect-evidence` 自动复用同一个 broker
 - `watch-serial` 会优先直连 broker 的实时 trace 推流，不再只靠轮询 trace 文件
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\COM19\trace.jsonl`
 - 在观察窗口里可以直接输入 shell 命令，按回车发送到串口
 - 空回车会先尝试重连串口，再发送一个换行探针，并直接显示连接/发送结果
 - `Ctrl+L` 会按当前 device profile 走一遍自动登录流程
@@ -376,10 +401,10 @@ MCP Agent 可以直接调用：
 
 这一步是“每次调试会话开始前做一次”，不是每条调试命令前都做一次。
 
-如果场景是“AI 在后台跑工具，人工也要同步看串口”，顺序固定为：
+如果场景是“AI 在后台跑工具，人工也要同步看串口”，默认规则是：
 
-1. 人工先开 `observe-serial`
-2. AI 再调 `watch-serial` 或 `run / exec / health`
+1. 如果 `COM19` 没有 `observe-serial` 会话，AI 会先唤醒系统默认终端打开 `observe-serial`
+2. AI 再调 `watch-serial` 或 `run / exec / health` 复用该 broker
 3. 人工窗口还开着时，不要主动 `serial-broker stop`
 4. 如果确实要强制释放人工观察 broker，先确认窗口可以断开，再执行 `serial-broker stop --serial-port COM19 --force`
 

@@ -128,6 +128,31 @@ _FIELD_PROMPTS: dict[str, dict[str, Any]] = {
         "question": "请选择调试固件拉取新包方式：firmware_command=固件内置指令拉取；sd_http_helper=生成 Linux helper 放 SD 卡拉取。",
         "example": "sd_http_helper",
     },
+    "debug_mode": {
+        "target": "options",
+        "question": "请选择调试模式：test=不刷固件、按 case 切串口证据；development=刷固件/拉包并保持上电周期日志连续。",
+        "example": "test",
+    },
+    "firmware_build_time": {
+        "target": "options",
+        "question": "请提供本轮运行固件的编译时间；开发模式必须明确该字段或从产物中可靠识别。",
+        "example": "2026-06-09 10:32:18",
+    },
+    "case_id": {
+        "target": "options",
+        "question": "请提供 case_id，用于切分串口日志证据。",
+        "example": "wifi_reconnect_001",
+    },
+    "case_title": {
+        "target": "options",
+        "question": "请提供 case 标题；如果没有，可以复用 case_id。",
+        "example": "WiFi reconnect evidence",
+    },
+    "title": {
+        "target": "options",
+        "question": "请提供 case 标题；如果没有，可以复用 case_id。",
+        "example": "WiFi reconnect evidence",
+    },
     "artifact": {
         "target": "options",
         "question": "请提供本轮要部署或验证的本地产物路径。",
@@ -175,6 +200,9 @@ _REQUIRED_ACTION_OPTIONS: dict[str, list[str]] = {
     "resume": ["session_dir"],
     "record-intervention": ["session_dir", "kind", "summary"],
     "artifact-server-stop": ["port"],
+    "case-begin": ["case_id"],
+    "case-end": ["case_id"],
+    "case-capture": ["case_id"],
 }
 
 _ONE_OF_ACTION_OPTIONS: dict[str, list[dict[str, Any]]] = {
@@ -184,6 +212,8 @@ _ONE_OF_ACTION_OPTIONS: dict[str, list[dict[str, Any]]] = {
 
 _DEFAULT_ACTION_SUGGESTIONS = [
     {"action": "watch-serial", "when": "用户想实时看串口或确认设备是否在刷日志"},
+    {"action": "case-begin", "when": "测试模式下开始一个 case 的串口证据切片"},
+    {"action": "case-end", "when": "测试模式下结束 case 并生成 evidence_patch.md"},
     {"action": "quickstart", "when": "用户刚开始使用 MCP，需要 AI 逐步引导选择下一步动作"},
     {"action": "run", "when": "用户想跑一轮启动观察、检查和结构化 verdict"},
     {"action": "health", "when": "用户想审计设备进程、SD、网络等健康状态"},
@@ -213,7 +243,7 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
     },
     "watch-serial": {
         "category": "serial",
-        "summary": "Follow the shared serial trace or broker-backed raw-live TUI without reopening the physical COM port.",
+        "summary": "Follow the observe-serial shared trace; by default the AI does not take the physical COM port.",
         "required_connection": ["serial_port"],
         "recommended_connection": [],
         "common_options": ["tail", "follow", "show_system", "raw_live", "baudrate", "stdin_probe", "stdin_shell"],
@@ -224,7 +254,43 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "summary": "Guide a first-time user by detecting serial ports, asking for missing inputs, and returning suggested MCP requests.",
         "required_connection": [],
         "recommended_connection": [],
-        "common_options": ["goal", "serial_port", "baudrate", "sdcard_drive", "helper_cc", "debug_firmware_method", "artifact"],
+        "common_options": [
+            "goal",
+            "serial_port",
+            "baudrate",
+            "debug_mode",
+            "case_id",
+            "case_title",
+            "sdcard_drive",
+            "helper_cc",
+            "debug_firmware_method",
+            "firmware_build_time",
+            "artifact",
+        ],
+        "creates_session": False,
+    },
+    "case-begin": {
+        "category": "serial-evidence",
+        "summary": "Start a test-mode serial evidence slice without flashing firmware.",
+        "required_connection": ["serial_port"],
+        "recommended_connection": [],
+        "common_options": ["case_id", "title", "note"],
+        "creates_session": False,
+    },
+    "case-end": {
+        "category": "serial-evidence",
+        "summary": "End a test-mode serial evidence slice and write trace.jsonl, trace.txt, and evidence_patch.md.",
+        "required_connection": ["serial_port"],
+        "recommended_connection": [],
+        "common_options": ["case_id", "result", "note"],
+        "creates_session": False,
+    },
+    "case-capture": {
+        "category": "serial-evidence",
+        "summary": "Capture focused evidence lines from an active or ended serial case.",
+        "required_connection": ["serial_port"],
+        "recommended_connection": [],
+        "common_options": ["case_id", "focus", "before", "after"],
         "creates_session": False,
     },
     "exec": {
@@ -302,6 +368,9 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
         "common_options": [
             "mode",
             "transfer_mode",
+            "debug_mode",
+            "debug_firmware_method",
+            "firmware_build_time",
             "workspace",
             "port",
             "bind",
@@ -345,6 +414,9 @@ _ACTION_METADATA: dict[str, dict[str, Any]] = {
             "git_commit",
             "changed_file",
             "expected_effect",
+            "debug_mode",
+            "debug_firmware_method",
+            "firmware_build_time",
             "timeout",
         ],
         "creates_session": True,
@@ -537,6 +609,8 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
         if _is_present(connection.get("device_password")):
             argv.append("--device-password-known")
         _append_option(argv, "--sdcard-drive", options.get("sdcard_drive", connection.get("sdcard_drive")))
+    elif command_name in {"case-begin", "case-end", "case-capture"}:
+        _append_option(argv, "--serial-port", options.get("serial_port", connection.get("serial_port")))
     elif command_name == "serial-broker":
         if len(action_tokens) < 2:
             raise AgentCallError("serial-broker action must include list or stop.")
@@ -550,6 +624,8 @@ def build_agent_invocation(request: dict[str, Any], *, project_root: Path) -> Ag
         if command_name == "watch-serial" and key in {"serial_port", "baudrate"}:
             continue
         if command_name == "quickstart" and key in {"serial_port", "baudrate", "sdcard_drive", "device_password_known"}:
+            continue
+        if command_name in {"case-begin", "case-end", "case-capture"} and key == "serial_port":
             continue
         if command_name == "serial-broker" and key == "serial_port":
             continue
@@ -852,9 +928,12 @@ def build_agent_intake_plan(request: dict[str, Any] | None, *, project_root: Pat
     loop = _ensure_mapping(payload.get("loop"), label="loop")
 
     explicit_action = str(payload.get("action", "")).strip()
-    inferred_action = None if explicit_action else _infer_action_from_goal(str(payload.get("goal") or loop.get("goal") or ""))
+    goal_text = str(payload.get("goal") or loop.get("goal") or options.get("goal") or "")
+    inferred_action = None if explicit_action else _infer_action_from_goal(goal_text)
     action = explicit_action or inferred_action
     action = _canonical_action_name(action) if action else ""
+    inferred_debug_mode = _infer_debug_mode_from_goal(goal_text)
+    debug_mode = str(options.get("debug_mode") or inferred_debug_mode or "").strip()
 
     missing_required: list[dict[str, Any]] = []
     recommended: list[dict[str, Any]] = []
@@ -914,6 +993,19 @@ def build_agent_intake_plan(request: dict[str, Any] | None, *, project_root: Pat
                     )
                 )
 
+        if action in {"device-pull", "deploy-verify"} and debug_mode == "development":
+            for field in ("debug_firmware_method", "firmware_build_time"):
+                if _is_present(options.get(field)):
+                    supplied.append({"target": "options", "field": field, "source": "request"})
+                else:
+                    missing_required.append(
+                        _build_intake_prompt(
+                            field,
+                            required=True,
+                            reason=f"{action} in development mode requires options.{field}.",
+                        )
+                    )
+
     ready = bool(action) and not missing_required
     user_questions = [item["question"] for item in missing_required[:3]]
     if not user_questions and recommended:
@@ -926,6 +1018,8 @@ def build_agent_intake_plan(request: dict[str, Any] | None, *, project_root: Pat
         "profiles": dict(profiles),
         "options": dict(options),
     }
+    if debug_mode and not suggested_request["options"].get("debug_mode"):
+        suggested_request["options"]["debug_mode"] = debug_mode
     if loop:
         suggested_request["loop"] = dict(loop)
     suggested_request = {key: value for key, value in suggested_request.items() if value not in ({}, None)}
@@ -986,12 +1080,25 @@ def _infer_action_from_goal(goal: str) -> str | None:
         return "build-sd-http-helper"
     if any(token in text for token in ["拉取新包", "下发新包", "拉包", "新包", "升级包"]):
         return "quickstart"
+    if any(token in text for token in ["case", "用例", "测试", "复测", "日志证据", "证据贴片", "截取"]):
+        return "quickstart"
     if any(token in text for token in ["下发", "拉取", "device pull", "lanupg", "artifact"]):
         return "device-pull"
     if any(token in text for token in ["报告", "report"]):
         return "report"
     if any(token in text for token in ["启动", "调试", "debug", "run"]):
         return "run"
+    return None
+
+
+def _infer_debug_mode_from_goal(goal: str) -> str | None:
+    text = goal.lower()
+    if not text:
+        return None
+    if any(token in text for token in ["case", "用例", "测试", "复测", "日志证据", "证据贴片", "截取", "复现"]):
+        return "test"
+    if any(token in text for token in ["开发", "刷固件", "刷机", "拉包", "拉取新包", "新包", "升级包", "升级", "编译", "构建", "deploy"]):
+        return "development"
     return None
 
 
@@ -1056,17 +1163,30 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             "recommended_first_actions": ["quickstart", "ports", "watch-serial", "run"],
         },
         "serial_collaboration": {
-            "goal": "Keep the human operator and the AI on the same serial session without fighting over the physical COM port.",
+            "goal": "Keep serial work human-visible by default while preventing AI actions from taking over the physical COM port.",
             "human_entrypoints": ["observe-serial", ".\\observe-serial.ps1"],
             "ai_entrypoint": "watch-serial",
-            "shared_owner": "raw-live broker",
+            "shared_owner": "observe-serial protected raw-live broker",
+            "default_log_root": str(project_root / "autodbg" / "serial-log" / "<COMXX>"),
             "rules": [
-                "Serial control actions are broker-first: run, exec, health, collect-evidence, device-pull, and observe start or reuse a raw-live broker before controlling the device.",
-                "If the user also needs live serial visibility, guide them to open observe-serial in a separate terminal; this can attach even after the AI has started a broker-backed serial action.",
-                "When a human-facing observe window or broker-backed watcher is already running, prefer watch-serial without raw_live so the AI follows the shared trace instead of taking over the COM port again.",
-                "Use raw_live only when intentionally starting or attaching to the shared broker for both human and AI observers.",
-                "Do not stop serial-broker or close the broker-backed watcher until the human no longer needs the shared serial view.",
+                "Default serial control actions first require an observe-serial protected broker. If the selected port is not already owned by observe-serial, the tool opens a new system terminal running observe-serial for that port.",
+                "AI clients use watch-serial without raw_live by default so they follow the observe-serial trace instead of opening the COM port themselves.",
+                "observe-serial is the long-lived owner of the physical COM port; run, exec, health, collect-evidence, device-pull, and observe connect through that shared broker.",
+                "Serial trace logs default to <project_root>\\autodbg\\serial-log\\<COMXX>\\trace.jsonl.",
+                "Do not stop a protected observe-serial broker unless the user confirms the observation window can be closed; force is required for that case.",
             ],
+        },
+        "debug_modes": {
+            "field": "debug_mode",
+            "choices": ["test", "development"],
+            "rules": [
+                "If the goal mentions case execution, testing, retest, reproduction, log evidence, or evidence patching, infer debug_mode=test.",
+                "If the goal mentions firmware flashing, package pull, upgrade, build, deploy, or validating a code change, infer debug_mode=development.",
+                "In test mode, do not require firmware flashing or debug_firmware_method; prefer case-begin and case-end so each case gets metadata.json, trace.jsonl, trace.txt, and evidence_patch.md.",
+                "In development mode, require debug_firmware_method and firmware_build_time before device-pull or deploy-verify; logs should preserve the full power-cycle trace from first power-on to the next power-on.",
+            ],
+            "test_log_root": str(project_root / "autodbg" / "serial-log" / "<COMXX>" / "cases" / "<timestamp-case_id>"),
+            "development_cycle": "first_power_on_to_next_power_on",
         },
         "required_inputs": {
             "minimum": ["serial_port"],
@@ -1074,6 +1194,8 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
                 "device_password": ["run", "exec", "health", "collect-evidence", "fetch-file", "fetch-path", "bootstrap-network", "device-pull", "deploy-verify"],
                 "wifi_ssid,wifi_password,wifi_mode": ["bootstrap-network", "device-pull when mode is wlan_script"],
                 "sdcard_drive": ["stage-sd"],
+                "case_id": ["case-begin", "case-end", "case-capture"],
+                "debug_firmware_method,firmware_build_time": ["device-pull or deploy-verify when debug_mode is development"],
             },
         },
         "request_contract": {
@@ -1130,11 +1252,14 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
             ],
         },
         "operating_rules": [
-            "If the user also needs to watch serial live, first guide them to open observe-serial in a separate terminal, then let the AI reuse that broker-backed view.",
-            "Prefer watch-serial without raw_live when a human-facing observe window already owns the shared broker.",
-            "Raw-live broker mode is the single owner of the physical COM port; other autodbg commands should reuse the broker instead of opening the port directly.",
-            "Do not stop serial-broker while the operator still needs the shared serial view.",
-            "When the user wants to pull or deploy a new package, do not pick a path silently: first guide them to choose debug_firmware_method=firmware_command or debug_firmware_method=sd_http_helper.",
+            "For serial work, default to the observe-serial shared broker. If the selected serial port is not already observed, auto-launch observe-serial in a new system terminal before AI control or follow actions continue.",
+            "Prefer watch-serial without raw_live for AI-side viewing; raw_live is reserved for observe-serial or explicit manual takeover.",
+            "observe-serial owns the physical COM port; other autodbg commands should reuse its protected broker instead of opening the port directly.",
+            "Do not stop a protected observe-serial broker while the operator may still need the shared serial view.",
+            "Serial logs are stored under <project_root>\\autodbg\\serial-log\\<COMXX>\\trace.jsonl by default.",
+            "First decide debug_mode when the user goal is about a test case, evidence patch, firmware flashing, package pull, upgrade, build, or deploy.",
+            "If debug_mode=test, do not require firmware flashing or debug_firmware_method; start with case-begin, execute or observe the case, then run case-end to produce evidence_patch.md.",
+            "If debug_mode=development and the user wants to pull or deploy a new package, do not pick a path silently: first guide them to choose debug_firmware_method=firmware_command or debug_firmware_method=sd_http_helper and provide firmware_build_time.",
             "If debug_firmware_method=sd_http_helper, prepare the SD HTTP helper first: build-sd-http-helper with the target C toolchain, stage-sd it as /mnt/sdcard/autodbg/autodbg-http-pull, then run device-pull with transfer_mode=auto and sd_http_helper_path.",
             "If debug_firmware_method=firmware_command, use the firmware/downloader pull path and do not build or stage the SD helper.",
             "Use ok plus exit_code from the JSON response as the source of truth, not the outer shell exit code.",
@@ -1144,11 +1269,11 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
         "recommended_workflows": [
             {
                 "name": "startup_debug",
-                "steps": ["watch-serial", "run", "report"],
+                "steps": ["auto: observe-serial if missing", "watch-serial", "run", "report"],
             },
             {
                 "name": "health_audit",
-                "steps": ["watch-serial", "health", "collect-evidence", "summary"],
+                "steps": ["auto: observe-serial if missing", "watch-serial", "health", "collect-evidence", "summary"],
             },
             {
                 "name": "deploy_and_verify",
@@ -1159,8 +1284,12 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
                 "steps": ["build-sd-http-helper", "stage-sd", "device-pull", "watch-serial or report"],
             },
             {
+                "name": "test_case_evidence",
+                "steps": ["auto: observe-serial if missing", "case-begin", "execute case", "case-end", "case-capture if focus context is needed"],
+            },
+            {
                 "name": "human_ai_shared_serial",
-                "steps": ["human: observe-serial", "ai: watch-serial", "ai: run or exec", "report"],
+                "steps": ["auto: observe-serial if missing", "ai: watch-serial", "ai: run or exec", "report"],
             },
         ],
     }
@@ -1217,7 +1346,19 @@ def render_agent_tool_markdown(*, project_root: Path) -> str:
     lines.append(f"- Human entrypoints: {', '.join(f'`{item}`' for item in collaboration['human_entrypoints'])}")
     lines.append(f"- AI entrypoint: `{collaboration['ai_entrypoint']}`")
     lines.append(f"- Shared owner: `{collaboration['shared_owner']}`")
+    if collaboration.get("default_log_root"):
+        lines.append(f"- Default serial log root: `{collaboration['default_log_root']}`")
     for rule in collaboration["rules"]:
+        lines.append(f"- {rule}")
+    lines.append("")
+    lines.append("## Debug Modes")
+    lines.append("")
+    debug_modes = manifest["debug_modes"]
+    lines.append(f"- Field: `{debug_modes['field']}`")
+    lines.append(f"- Choices: {', '.join(f'`{item}`' for item in debug_modes['choices'])}")
+    lines.append(f"- Test log root: `{debug_modes['test_log_root']}`")
+    lines.append(f"- Development cycle: `{debug_modes['development_cycle']}`")
+    for rule in debug_modes["rules"]:
         lines.append(f"- {rule}")
     lines.append("")
     lines.append("## Operating Rules")

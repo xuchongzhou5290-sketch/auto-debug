@@ -18,6 +18,9 @@ from autodbg.cli.main import (
     _command_describe_agent_tool,
     _command_install_home_plugin,
     _command_install_local_tool,
+    _command_case_begin,
+    _command_case_capture,
+    _command_case_end,
     _command_record_intervention,
     _build_watch_tui_rows,
     _build_existing_network_check,
@@ -41,6 +44,7 @@ from autodbg.cli.main import (
     _consume_watch_stdin_probe,
     _consume_watch_stdin_shell,
     _default_watch_status,
+    _emit_watch_trace_entry,
     _page_watch_history,
     _refresh_watch_status_message,
     _run_watch_auto_login,
@@ -69,6 +73,7 @@ from autodbg.cli.main import (
     _resolve_pull_workspace,
     _select_transfer_mode,
     _shutdown_transient_artifact_server,
+    _validate_development_debug_context,
 )
 from autodbg.agent import build_agent_tool_manifest
 from autodbg.profiles.loader import load_run_profiles
@@ -186,6 +191,45 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(summary["interventions"]["count"], 1)
         self.assertEqual(summary["interventions"]["latest"]["metadata"]["author"], "codex")
         self.assertIn("Intervention recorded", buffer.getvalue())
+
+    def test_case_commands_call_serial_case_helpers(self) -> None:
+        fake_result = argparse.Namespace(
+            case_id="wifi_case_001",
+            case_dir=Path("C:/tmp/cases/20260609-wifi_case_001"),
+            metadata_path=Path("C:/tmp/cases/20260609-wifi_case_001/metadata.json"),
+            trace_text_path=Path("C:/tmp/cases/20260609-wifi_case_001/trace.txt"),
+            evidence_patch_path=Path("C:/tmp/cases/20260609-wifi_case_001/evidence_patch.md"),
+            selected_lines=12,
+        )
+
+        with patch("autodbg.cli.main.begin_serial_case", return_value=fake_result) as begin_mock:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = _command_case_begin(
+                    argparse.Namespace(serial_port="COM19", case_id="wifi_case_001", title="WiFi", note=None)
+                )
+
+        self.assertEqual(exit_code, 0)
+        begin_mock.assert_called_once_with("COM19", "wifi_case_001", title="WiFi", note=None)
+        self.assertIn("Serial case started", buffer.getvalue())
+
+        with patch("autodbg.cli.main.end_serial_case", return_value=fake_result) as end_mock:
+            self.assertEqual(
+                _command_case_end(argparse.Namespace(serial_port="COM19", case_id="wifi_case_001", result="pass", note=None)),
+                0,
+            )
+
+        end_mock.assert_called_once_with("COM19", "wifi_case_001", result="pass", note=None)
+
+        with patch("autodbg.cli.main.capture_serial_case", return_value=fake_result) as capture_mock:
+            self.assertEqual(
+                _command_case_capture(
+                    argparse.Namespace(serial_port="COM19", case_id="wifi_case_001", focus=["panic"], before=2, after=3)
+                ),
+                0,
+            )
+
+        capture_mock.assert_called_once_with("COM19", "wifi_case_001", focus=["panic"], before=2, after=3)
 
     def test_format_output_excerpt_truncates_and_counts_extra_lines(self) -> None:
         excerpt = _format_output_excerpt(
@@ -399,6 +443,21 @@ class CliMainTest(unittest.TestCase):
         self.assertTrue(capabilities["has_tar"])
         self.assertEqual(capabilities["sd_http_helper"], "yes")
 
+    def test_validate_development_debug_context_requires_method_and_build_time(self) -> None:
+        args = argparse.Namespace(
+            debug_mode="development",
+            debug_firmware_method=None,
+            firmware_build_time=None,
+        )
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            ok = _validate_development_debug_context(args, action_name="deploy-verify")
+
+        self.assertFalse(ok)
+        self.assertIn("debug_firmware_method", buffer.getvalue())
+        self.assertIn("firmware_build_time", buffer.getvalue())
+
     def test_select_transfer_mode_prefers_sd_helper_then_http_then_serial_bundle(self) -> None:
         self.assertEqual(
             _select_transfer_mode(
@@ -553,8 +612,14 @@ class CliMainTest(unittest.TestCase):
                 "--device-password-known",
                 "--sdcard-drive",
                 "E:",
+                "--debug-mode",
+                "test",
                 "--debug-firmware-method",
                 "sd_http_helper",
+                "--case-id",
+                "wifi_case_001",
+                "--case-title",
+                "WiFi reconnect",
             ]
         )
 
@@ -563,7 +628,10 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(args.serial_port, "COM19")
         self.assertTrue(args.device_password_known)
         self.assertEqual(args.sdcard_drive, "E:")
+        self.assertEqual(args.debug_mode, "test")
         self.assertEqual(args.debug_firmware_method, "sd_http_helper")
+        self.assertEqual(args.case_id, "wifi_case_001")
+        self.assertEqual(args.case_title, "WiFi reconnect")
 
     def test_build_quickstart_action_plan_guides_health_check(self) -> None:
         args = argparse.Namespace(
@@ -612,6 +680,7 @@ class CliMainTest(unittest.TestCase):
             sdcard_drive="E:",
             helper_cc="arm-linux-gnueabihf-gcc",
             debug_firmware_method="sd_http_helper",
+            firmware_build_time="2026-06-09 10:32:18",
             artifact=Path("payloads/APP.bin"),
         )
 
@@ -633,6 +702,8 @@ class CliMainTest(unittest.TestCase):
             "/mnt/sdcard/autodbg/autodbg-http-pull",
         )
         self.assertEqual(plan["next_requests"][2]["options"]["root"], "payloads")
+        self.assertEqual(plan["next_requests"][2]["options"]["debug_mode"], "development")
+        self.assertEqual(plan["next_requests"][2]["options"]["firmware_build_time"], "2026-06-09 10:32:18")
         self.assertTrue(
             any("build-sd-http-helper" in instruction and "device-pull" in instruction for instruction in plan["agent_instructions"])
         )
@@ -646,6 +717,7 @@ class CliMainTest(unittest.TestCase):
             sdcard_drive="E:",
             helper_cc="arm-linux-gnueabihf-gcc",
             debug_firmware_method=None,
+            firmware_build_time="2026-06-09 10:32:18",
             artifact=Path("payloads/APP.bin"),
         )
 
@@ -665,6 +737,7 @@ class CliMainTest(unittest.TestCase):
             sdcard_drive=None,
             helper_cc=None,
             debug_firmware_method="firmware_command",
+            firmware_build_time="2026-06-09 10:32:18",
             artifact=Path("payloads/APP.bin"),
         )
 
@@ -676,6 +749,32 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(plan["next_requests"][0]["options"]["transfer_mode"], "http")
         self.assertNotIn("sd_http_helper_path", plan["next_requests"][0]["options"])
         self.assertEqual(plan["next_requests"][0]["options"]["root"], "payloads")
+        self.assertEqual(plan["next_requests"][0]["options"]["debug_mode"], "development")
+        self.assertEqual(plan["next_requests"][0]["options"]["firmware_build_time"], "2026-06-09 10:32:18")
+
+    def test_build_quickstart_action_plan_guides_test_case_evidence(self) -> None:
+        args = argparse.Namespace(
+            goal="执行 case 后截取日志证据",
+            serial_port="COM19",
+            baudrate=115200,
+            device_password_known=False,
+            sdcard_drive=None,
+            helper_cc=None,
+            debug_firmware_method=None,
+            firmware_build_time=None,
+            case_id="wifi_case_001",
+            case_title="WiFi reconnect",
+            artifact=None,
+        )
+
+        plan = _build_quickstart_action_plan(args, ports=[])
+
+        self.assertTrue(plan["ready"])
+        self.assertEqual(plan["goal"], "test_case")
+        self.assertEqual(plan["supplied"]["debug_mode"], "test")
+        self.assertEqual([request["action"] for request in plan["next_requests"]], ["watch-serial", "case-begin", "case-end"])
+        self.assertEqual(plan["next_requests"][1]["options"]["case_id"], "wifi_case_001")
+        self.assertNotIn("debug_firmware_method", plan["next_requests"][1]["options"])
 
     def test_build_quickstart_action_plan_limits_questions_for_unknown_goal(self) -> None:
         args = argparse.Namespace(
@@ -1024,6 +1123,92 @@ class CliMainTest(unittest.TestCase):
         broker_mock.stop.assert_called_once()
         self.assertTrue(any("Human observation guard enabled" in call.args[0] for call in print_mock.call_args_list))
 
+    def test_command_watch_serial_upgrades_existing_broker_for_observe_window(self) -> None:
+        args = argparse.Namespace(
+            serial_port="COM19",
+            tail=0,
+            follow=False,
+            show_system=False,
+            raw_live=True,
+            baudrate=115200,
+            stdin_probe=False,
+            stdin_shell=False,
+            protect_human_session=True,
+            settings=Path(__file__).resolve().parents[2] / "config" / "user-settings.toml",
+        )
+        existing_registry = SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=4321,
+            serial_port="COM19",
+            baudrate=115200,
+        )
+        protected_registry = SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=4321,
+            serial_port="COM19",
+            baudrate=115200,
+            owner="human-observe",
+            protected=True,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace_path = Path(temp_dir) / "com19.jsonl"
+            with (
+                patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path),
+                patch("autodbg.cli.main._read_trace_entries", return_value=[]),
+                patch("autodbg.cli.main.load_serial_broker_registry", return_value=existing_registry),
+                patch("autodbg.cli.main.protect_serial_broker_registry", return_value=protected_registry) as protect_mock,
+                patch("autodbg.cli.main.SerialBroker") as broker_ctor,
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = _command_watch_serial(args)
+
+        self.assertEqual(exit_code, 0)
+        protect_mock.assert_called_once_with("COM19")
+        broker_ctor.assert_not_called()
+        self.assertTrue(any("upgraded to a protected observe-serial session" in call.args[0] for call in print_mock.call_args_list))
+
+    def test_command_watch_serial_follow_auto_launches_observe_serial_when_missing(self) -> None:
+        args = argparse.Namespace(
+            serial_port="COM19",
+            tail=0,
+            follow=True,
+            show_system=False,
+            raw_live=False,
+            baudrate=115200,
+            stdin_probe=False,
+            stdin_shell=False,
+            settings=Path(__file__).resolve().parents[2] / "config" / "user-settings.toml",
+        )
+        registry = SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=4321,
+            serial_port="COM19",
+            baudrate=115200,
+            owner="human-observe",
+            protected=True,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace_path = Path(temp_dir) / "com19.jsonl"
+            with (
+                patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path),
+                patch("autodbg.cli.main._read_trace_entries", return_value=[]),
+                patch("autodbg.cli.main.load_serial_broker_registry", side_effect=[None, registry]),
+                patch("autodbg.cli.main.ensure_observe_serial_broker", return_value=registry) as ensure_mock,
+                patch("autodbg.cli.main._follow_trace_via_broker", side_effect=KeyboardInterrupt) as follow_mock,
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = _command_watch_serial(args)
+
+        self.assertEqual(exit_code, 0)
+        ensure_mock.assert_called_once_with("COM19", baudrate=115200)
+        follow_mock.assert_called_once()
+        self.assertTrue(any("observe-serial is active for COM19" in call.args[0] for call in print_mock.call_args_list))
+
     def test_command_watch_serial_prefers_live_broker_stream_when_available(self) -> None:
         args = argparse.Namespace(
             serial_port="COM19",
@@ -1042,6 +1227,8 @@ class CliMainTest(unittest.TestCase):
             pid=4321,
             serial_port="COM19",
             baudrate=115200,
+            owner="human-observe",
+            protected=True,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1092,6 +1279,8 @@ class CliMainTest(unittest.TestCase):
             pid=4321,
             serial_port="COM19",
             baudrate=115200,
+            owner="human-observe",
+            protected=True,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1314,6 +1503,49 @@ class CliMainTest(unittest.TestCase):
             baudrate=115200,
         )
         self.assertIn("[RX 01:02:04.000] after", "\n".join(rows))
+
+    def test_paused_watch_does_not_redraw_when_new_lines_arrive_after_paging(self) -> None:
+        state = _WatchStdinShellState()
+        state.recent_lines = [f"[RX 01:02:03.{index:03d}] line-{index}" for index in range(12)]
+        state.paused = True
+        state.pause_log_end_index = len(state.recent_lines)
+        state.screen_dirty = False
+
+        self.assertTrue(_page_watch_history(state, height=8, direction="page_up"))
+        self.assertTrue(state.screen_dirty)
+        state.screen_dirty = False
+
+        entry = SerialTraceEntry(
+            timestamp="2026-05-13T01:02:04.000",
+            port="COM19",
+            direction="rx",
+            payload="after-page",
+            pid=1234,
+        )
+        with patch("autodbg.cli.watch._render_watch_shell_screen") as render_mock:
+            _emit_watch_trace_entry(
+                entry,
+                show_system=False,
+                stdin_shell_state=state,
+                serial_port="COM19",
+                baudrate=115200,
+            )
+
+        render_mock.assert_not_called()
+        self.assertTrue(state.paused)
+        self.assertEqual(state.paused_new_lines, 1)
+        self.assertFalse(state.screen_dirty)
+
+        rows, _cursor_col, _cursor_row = _build_watch_tui_rows(
+            state,
+            serial_port="COM19",
+            width=72,
+            height=8,
+            baudrate=115200,
+        )
+        rendered = "\n".join(rows)
+        self.assertNotIn("after-page", rendered)
+        self.assertIn("PAUSED +1 line(s)", rows[-2])
 
     def test_build_watch_tui_rows_marks_history_offset_in_status_line(self) -> None:
         state = _WatchStdinShellState()

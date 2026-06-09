@@ -901,10 +901,12 @@ def _apply_watch_trace_entry_to_tui_state(
             )
             return
         if not show_system:
-            state.screen_dirty = True
+            if not state.paused:
+                state.screen_dirty = True
             return
     _append_watch_recent_line(state, _format_trace_entry(entry))
-    state.screen_dirty = True
+    if not state.paused:
+        state.screen_dirty = True
 
 
 def _emit_watch_trace_entry(
@@ -917,8 +919,9 @@ def _emit_watch_trace_entry(
 ) -> None:
     if stdin_shell_state is not None:
         _apply_watch_trace_entry_to_tui_state(entry, show_system=show_system, state=stdin_shell_state)
-        _render_watch_shell_screen(stdin_shell_state, serial_port=serial_port, baudrate=baudrate)
-        stdin_shell_state.prompt_visible = True
+        if stdin_shell_state.screen_dirty:
+            _render_watch_shell_screen(stdin_shell_state, serial_port=serial_port, baudrate=baudrate)
+            stdin_shell_state.prompt_visible = True
         return
     printed = _print_watch_trace_entry(entry, show_system=show_system)
 
@@ -1000,7 +1003,7 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
     print(f"[TODO] Trace log: {trace_path}")
     if args.stdin_shell and not args.follow:
         print("[ERROR] --stdin-shell requires --follow.")
-        print("[TODO] Retry with watch-serial --follow --raw-live --stdin-shell.")
+        print("[TODO] Retry with watch-serial --follow --stdin-shell.")
         return 1
     if args.raw_live:
         if existing_broker is None:
@@ -1013,23 +1016,42 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
                 broker_kwargs.update({"owner": "human-observe", "protected": True})
             broker = cli_main.SerialBroker(**broker_kwargs)
             broker.start()
+            existing_broker = cli_main.load_serial_broker_registry(serial_port)
             print(f"[DONE] Raw serial broker started on {serial_port} @ {baudrate}")
             if protect_human_session:
                 print("[DONE] Human observation guard enabled; serial-broker stop now requires --force.")
             print(f"[DONE] {serial_port} connected successfully @ {baudrate}")
         else:
+            if bool(getattr(args, "protect_human_session", False)) and not cli_main.is_observe_serial_broker(existing_broker):
+                protected_broker = cli_main.protect_serial_broker_registry(serial_port)
+                if protected_broker is not None:
+                    existing_broker = protected_broker
+                    print("[DONE] Existing raw serial broker upgraded to a protected observe-serial session.")
             print(
                 f"[DONE] Attached to existing raw serial broker on {serial_port} "
                 f"via {existing_broker.host}:{existing_broker.tcp_port}"
             )
+            if cli_main.is_observe_serial_broker(existing_broker):
+                print("[DONE] Human observation guard enabled; serial-broker stop now requires --force.")
         if args.follow:
-            print("[TODO] Raw live follow keeps the physical serial port open until this watcher exits.")
-            print(
-                f"[TODO] Release it from another shell with: "
-                f"autodbg serial-broker stop --serial-port {serial_port}"
-            )
+            if cli_main.is_observe_serial_broker(existing_broker):
+                print("[TODO] observe-serial owns the physical COM port; AI clients should attach with watch-serial without --raw-live.")
+            else:
+                print("[TODO] Raw live follow keeps the physical serial port open until this watcher exits.")
+                print(
+                    f"[TODO] Release it from another shell with: "
+                    f"autodbg serial-broker stop --serial-port {serial_port}"
+                )
+    elif args.follow and not cli_main.is_observe_serial_broker(existing_broker):
+        try:
+            existing_broker = cli_main.ensure_observe_serial_broker(serial_port, baudrate=baudrate)
+        except Exception as exc:
+            print("[ERROR] Failed to open observe-serial for shared serial observation.")
+            print(f"[TODO] {exc}")
+            return 1
+        print(f"[DONE] observe-serial is active for {serial_port}; AI will attach without taking the COM port.")
     if not trace_path.exists():
-        print("[TODO] No shared trace file exists yet. Start a control command first, or keep following.")
+        print("[TODO] No shared trace file exists yet. observe-serial will create it after the first serial event.")
     elif args.follow and args.tail == 0:
         print("[TODO] Starting from the live edge; existing trace lines are hidden.")
     elif args.tail > 0 and initial_entries:
@@ -1060,7 +1082,7 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
         live_registry = cli_main.load_serial_broker_registry(serial_port)
         if args.stdin_shell and live_registry is None:
             print("[ERROR] --stdin-shell requires a live broker.")
-            print("[TODO] Retry with watch-serial --follow --raw-live --stdin-shell.")
+            print("[TODO] Open observe-serial for this port, then retry with watch-serial --follow --stdin-shell.")
             return 1
         if live_registry is not None:
             print(f"[DONE] Streaming live broker events from {live_registry.host}:{live_registry.tcp_port}")

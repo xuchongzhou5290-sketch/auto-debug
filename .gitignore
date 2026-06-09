@@ -9,3 +9,4 @@ _reboot_req.json
 config/user-settings.toml
 .pytest_cache/
 payloads/b200se-upgrade/*.tar
+autodbg/serial-log/

@@ -11,6 +11,7 @@ import queue
 import random
 import signal
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -249,23 +250,17 @@ def open_serial_port(port: str, baudrate: int, timeout: float = 0.2, *, broker_f
                 handle.close()
         return
     if broker_first:
-        broker = _start_local_serial_broker(port, baudrate=baudrate, timeout=timeout)
-        try:
-            broker_registry = load_serial_broker_registry(port)
-            if broker_registry is None:
-                raise RuntimeError(f"Failed to start raw serial broker for {port}.")
-            with _acquire_control_lock(port):
-                handle = _BrokerSerialPort(
-                    broker_registry=broker_registry,
-                    serial_port=port,
-                    timeout=timeout,
-                )
-                try:
-                    yield handle
-                finally:
-                    handle.close()
-        finally:
-            broker.stop()
+        broker_registry = ensure_observe_serial_broker(port, baudrate=baudrate)
+        with _acquire_control_lock(port):
+            handle = _BrokerSerialPort(
+                broker_registry=broker_registry,
+                serial_port=port,
+                timeout=timeout,
+            )
+            try:
+                yield handle
+            finally:
+                handle.close()
         return
     with _open_direct_serial_port(port, baudrate, timeout) as handle:
         yield handle
@@ -281,6 +276,105 @@ def _start_local_serial_broker(port: str, *, baudrate: int, timeout: float):
     )
     broker.start()
     return broker
+
+
+def ensure_observe_serial_broker(
+    port: str,
+    *,
+    baudrate: int,
+    wait_timeout: float = 8.0,
+) -> SerialBrokerRegistry:
+    registry = load_serial_broker_registry(port)
+    if is_observe_serial_broker(registry):
+        return registry
+
+    _launch_observe_serial_window(port, baudrate=baudrate)
+    deadline = time.monotonic() + max(wait_timeout, 0.1)
+    last_registry: SerialBrokerRegistry | None = registry
+    while time.monotonic() < deadline:
+        registry = load_serial_broker_registry(port)
+        if registry is not None:
+            last_registry = registry
+            if is_observe_serial_broker(registry):
+                return registry
+        time.sleep(0.1)
+
+    if last_registry is not None:
+        return protect_serial_broker_registry(port) or last_registry
+    raise RuntimeError(
+        f"observe-serial did not start a protected broker for {port}. "
+        "Open observe-serial manually and retry."
+    )
+
+
+def is_observe_serial_broker(registry: SerialBrokerRegistry | None) -> bool:
+    return bool(registry and registry.owner == "human-observe" and registry.protected)
+
+
+def protect_serial_broker_registry(
+    port: str,
+    *,
+    owner: str = "human-observe",
+) -> SerialBrokerRegistry | None:
+    registry = load_serial_broker_registry(port)
+    if registry is None:
+        return None
+    path = write_serial_broker_registry(
+        registry.serial_port,
+        host=registry.host,
+        tcp_port=registry.tcp_port,
+        baudrate=registry.baudrate,
+        owner=owner,
+        protected=True,
+        pid=registry.pid,
+    )
+    return SerialBrokerRegistry.from_path(path)
+
+
+def _launch_observe_serial_window(port: str, *, baudrate: int) -> None:
+    if os.name != "nt":
+        raise RuntimeError("Auto-launching observe-serial is currently supported only on Windows.")
+    project_root = _default_project_root()
+    script_path = project_root / "observe-serial.ps1"
+    if not script_path.exists():
+        raise RuntimeError(f"observe-serial.ps1 was not found under project root: {project_root}")
+    env = os.environ.copy()
+    env["AUTO_DBG_PROJECT_ROOT"] = str(project_root)
+    env["AUTO_DBG_SERIAL_PORT"] = port
+    env["AUTO_DBG_SERIAL_BAUDRATE"] = str(baudrate)
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script_path),
+        "-NoUi",
+        "-SerialPort",
+        port,
+        "-Baudrate",
+        str(baudrate),
+        "-Tail",
+        "0",
+    ]
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    subprocess.Popen(args, cwd=str(project_root), env=env, creationflags=creationflags)
+
+
+def _default_project_root() -> Path:
+    for env_name in ("AUTO_DBG_PROJECT_ROOT", "AUTO_DBG_HOME"):
+        raw = os.getenv(env_name)
+        if raw:
+            return Path(raw).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / "observe-serial.ps1").exists() or (candidate / "pyproject.toml").exists():
+            return candidate
+    module_path = Path(__file__).resolve()
+    for candidate in module_path.parents:
+        if (candidate / "observe-serial.ps1").exists() or (candidate / "pyproject.toml").exists():
+            return candidate
+    return cwd
 
 
 @contextmanager
@@ -358,7 +452,17 @@ def _serial_control_lock_path(port: str) -> Path:
 
 
 def serial_trace_log_path(port: str) -> Path:
-    return _serial_trace_dir() / f"{_normalize_port_name(port)}.jsonl"
+    return serial_trace_log_dir(port) / "trace.jsonl"
+
+
+def serial_trace_log_dir(port: str) -> Path:
+    path = _serial_trace_dir() / _serial_log_port_dir_name(port)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def append_serial_trace_marker(port: str, marker: str) -> SerialTraceEntry:
+    return _append_trace_entry(port, "sys", marker)
 
 
 def serial_broker_registry_path(port: str) -> Path:
@@ -373,11 +477,12 @@ def write_serial_broker_registry(
     baudrate: int,
     owner: str | None = None,
     protected: bool = False,
+    pid: int | None = None,
 ) -> Path:
     registry = SerialBrokerRegistry(
         host=host,
         tcp_port=tcp_port,
-        pid=os.getpid(),
+        pid=os.getpid() if pid is None else pid,
         serial_port=port,
         baudrate=baudrate,
         owner=owner,
@@ -529,7 +634,8 @@ def _release_pid_lock(lock_path: Path) -> None:
 
 
 def _serial_trace_dir() -> Path:
-    path = Path(tempfile.gettempdir()) / "autodbg-serial-trace"
+    override = os.getenv("AUTO_DBG_SERIAL_LOG_ROOT")
+    path = Path(override).expanduser() if override else _default_project_root() / "autodbg" / "serial-log"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -542,6 +648,10 @@ def _serial_broker_dir() -> Path:
 
 def _normalize_port_name(port: str) -> str:
     return port.lower().replace(":", "_").replace("\\", "_").replace("/", "_")
+
+
+def _serial_log_port_dir_name(port: str) -> str:
+    return port.upper().replace(":", "_").replace("\\", "_").replace("/", "_")
 
 
 def _append_trace_entry(port: str, direction: str, payload: str) -> SerialTraceEntry:

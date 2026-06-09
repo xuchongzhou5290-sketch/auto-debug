@@ -220,6 +220,22 @@ class AgentContractTest(unittest.TestCase):
 
         self.assertEqual(invocation.argv, ["serial-broker", "stop", "--serial-port", "COM19", "--force"])
 
+    def test_build_agent_invocation_supports_serial_case_from_connection(self) -> None:
+        project_root = Path("C:/repo/auto-debug")
+        invocation = build_agent_invocation(
+            {
+                "action": "case-begin",
+                "connection": {"serial_port": "COM19"},
+                "options": {"case_id": "wifi_case_001", "title": "WiFi reconnect"},
+            },
+            project_root=project_root,
+        )
+
+        self.assertEqual(invocation.argv[0], "case-begin")
+        self.assertEqual(invocation.argv[invocation.argv.index("--serial-port") + 1], "COM19")
+        self.assertEqual(invocation.argv[invocation.argv.index("--case-id") + 1], "wifi_case_001")
+        self.assertEqual(invocation.argv[invocation.argv.index("--title") + 1], "WiFi reconnect")
+
     def test_agent_manifest_includes_serial_collaboration_guidance(self) -> None:
         manifest = build_agent_tool_manifest(project_root=Path("C:/repo/auto-debug"))
 
@@ -228,18 +244,25 @@ class AgentContractTest(unittest.TestCase):
         collaboration = manifest["serial_collaboration"]
         self.assertEqual(collaboration["ai_entrypoint"], "watch-serial")
         self.assertIn("observe-serial", collaboration["human_entrypoints"])
-        self.assertEqual(collaboration["shared_owner"], "raw-live broker")
+        self.assertEqual(collaboration["shared_owner"], "observe-serial protected raw-live broker")
+        self.assertIn("autodbg", collaboration["default_log_root"])
         self.assertTrue(
-            any("live serial visibility" in rule for rule in collaboration["rules"])
+            any("opens a new system terminal running observe-serial" in rule for rule in collaboration["rules"])
         )
         self.assertTrue(
-            any("operator still needs the shared serial view" in rule for rule in manifest["operating_rules"])
+            any("auto-launch observe-serial" in rule for rule in manifest["operating_rules"])
         )
         action_names = {action["name"] for action in manifest["actions"]}
         self.assertIn("deploy-verify", action_names)
         self.assertIn("build-sd-http-helper", action_names)
         self.assertIn("quickstart", action_names)
+        self.assertIn("case-begin", action_names)
+        self.assertIn("case-end", action_names)
+        self.assertEqual(manifest["debug_modes"]["choices"], ["test", "development"])
         self.assertIn("deploy-verify", manifest["required_inputs"]["conditional"]["device_password"])
+        self.assertTrue(
+            any("debug_mode=test" in rule for rule in manifest["operating_rules"])
+        )
         self.assertTrue(
             any("debug_firmware_method=firmware_command" in rule for rule in manifest["operating_rules"])
         )
@@ -284,7 +307,16 @@ class AgentContractTest(unittest.TestCase):
         self.assertEqual(plan["action"], "deploy-verify")
         self.assertEqual(plan["inferred_action"], "deploy-verify")
         missing_fields = [item["field"] for item in plan["missing_required"]]
-        self.assertEqual(missing_fields, ["serial_port", "device_password"])
+        self.assertEqual(missing_fields, ["serial_port", "device_password", "debug_firmware_method", "firmware_build_time"])
+        self.assertEqual(plan["suggested_request"]["options"]["debug_mode"], "development")
+
+    def test_build_agent_intake_plan_requires_case_id_for_serial_case(self) -> None:
+        with patch.dict(os.environ, {"AUTO_DBG_SERIAL_PORT": ""}):
+            plan = build_agent_intake_plan({"action": "case-end"}, project_root=Path("C:/repo/auto-debug"))
+
+        self.assertFalse(plan["ready"])
+        missing_fields = [item["field"] for item in plan["missing_required"]]
+        self.assertEqual(missing_fields, ["serial_port", "case_id"])
 
     def test_build_agent_intake_plan_infers_sd_http_helper_build_goal(self) -> None:
         plan = build_agent_intake_plan({"goal": "交叉编译 autodbg-http-pull"}, project_root=Path("C:/repo/auto-debug"))

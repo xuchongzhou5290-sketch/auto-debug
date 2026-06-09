@@ -305,12 +305,17 @@ cd <repo-root>
 
 `transfer_mode=auto` 的优先级是 `sd_http_helper -> http -> serial_bundle`。SD helper 只有在设备端路径存在且可执行时才会被选中；auto 模式下 helper 运行失败，会在设备存在 downloader 时回退到 `http`。`device-pull` 临时启动的 PC 端 HTTP 服务会在设备拉取命令返回后立即关闭，后续验证/部署/观察阶段不继续暴露该服务。SD helper 的源码随包放在 `src/autodbg/assets/autodbg_http_pull.c`，MCP Agent 可以调用 `build-sd-http-helper` 使用目标设备 C toolchain 交叉编译，再通过 `stage-sd` 放到默认路径 `/mnt/sdcard/autodbg/autodbg-http-pull`；需要自定义路径时传 `options.sd_http_helper_path`。
 
-当用户目标是“拉取/下发新包”时，AI 不应静默选择路径，必须先让用户选择 `debug_firmware_method`：
+先判断 `debug_mode`：
+
+- `test`：测试模式，不要求刷设备固件，不要求 `debug_firmware_method`；AI 应用 `case-begin -> 执行 case -> case-end` 切出串口证据。`case-end` 会在 `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\` 生成 `metadata.json / trace.jsonl / trace.txt / evidence_patch.md`
+- `development`：开发模式，优先保持从第一次上电到下次重新上电的串口主 trace 连续；涉及拉包、升级、部署时必须提供 `debug_firmware_method` 和 `firmware_build_time`
+
+当用户目标是“拉取/下发新包”且 `debug_mode=development` 时，AI 不应静默选择路径，必须先让用户选择 `debug_firmware_method`：
 
 - `firmware_command`：调试固件已集成拉取新包指令或 downloader，quickstart 只返回 `device-pull`，不构建 SD helper
 - `sd_http_helper`：设备端没有可靠拉取指令时，quickstart 返回有序流水线 `build-sd-http-helper -> stage-sd -> device-pull`
 
-`quickstart --goal "拉取新包"` 若未传 `debug_firmware_method`，会把该选择放进 `questions`，上层 AI 必须先追问，不能默认跳到 SD helper 或固件命令路径。
+`quickstart --goal "拉取新包"` 若未传 `debug_mode / debug_firmware_method / firmware_build_time`，会把缺失项放进 `questions`，上层 AI 必须先追问，不能默认跳到 SD helper 或固件命令路径。
 
 示例：
 
@@ -339,20 +344,21 @@ cd <repo-root>
 
 这是当前 MCP 接入最容易踩坑的地方：
 
-- AI 调 `watch-serial` 只能保证 AI 自己拿到共享 trace，不等于用户眼前自动出现一个串口窗口
-- 串口主入口默认 broker-first，`run / exec / health / collect-evidence / device-pull / observe` 会优先启动或复用 raw-live broker
-- 如果用户自己也要实时看串口，引导用户在独立终端执行 `observe-serial`；即使 AI 已经在跑串口命令，也可以再连到同一个 broker
-- 人工观察窗口起来后，AI 侧优先使用 `watch-serial`，但不要默认加 `raw_live`
-- 后续串口动作应复用同一个 broker，不要重新抢物理串口
+- 默认串口协同以 `observe-serial` 为物理 COM 口拥有者，AI 不默认直接抢串口
+- 如果目标串口还没有 `observe-serial` 人工观察会话，AI 的 `watch-serial --follow` 或串口控制动作会先唤醒系统默认终端打开 `observe-serial`
+- AI 侧优先使用不带 `raw_live` 的 `watch-serial`，跟随共享 trace
+- 后续串口动作应复用同一个受保护 broker，不要重新抢物理串口
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
 - 只要用户还在看串口，AI 就不应主动调 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `options.force=true`
 
 推荐顺序：
 
-1. 用户本机执行 `observe-serial`
+1. MCP Agent 确认目标串口
 2. MCP Agent 读取 `autodbg_describe`
-3. MCP Agent 调 `watch-serial` 或直接调 `run / exec / health`
-4. 调试结束后，再由用户或 AI 明确决定是否释放 broker
+3. 若该串口没有 `observe-serial`，工具自动打开系统默认终端运行 `observe-serial`
+4. MCP Agent 调 `watch-serial` 或直接调 `run / exec / health`
+5. 调试结束后，再由用户或 AI 明确决定是否释放 broker
 
 ### 7.3 多轮调试建议
 

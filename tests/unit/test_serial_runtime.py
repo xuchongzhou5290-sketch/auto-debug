@@ -13,14 +13,7 @@ def _null_context():
 
 
 class SerialRuntimeTest(unittest.TestCase):
-    def test_open_serial_port_starts_local_broker_when_missing(self) -> None:
-        class FakeBroker:
-            def __init__(self) -> None:
-                self.stopped = False
-
-            def stop(self) -> None:
-                self.stopped = True
-
+    def test_open_serial_port_launches_observe_serial_when_missing(self) -> None:
         class FakeBrokerSerialPort:
             def __init__(self, *, broker_registry, serial_port: str, timeout: float) -> None:
                 self.broker_registry = broker_registry
@@ -31,7 +24,6 @@ class SerialRuntimeTest(unittest.TestCase):
             def close(self) -> None:
                 self.closed = True
 
-        broker = FakeBroker()
         registry = runtime.SerialBrokerRegistry(
             host="127.0.0.1",
             tcp_port=9001,
@@ -41,8 +33,9 @@ class SerialRuntimeTest(unittest.TestCase):
         )
 
         with (
-            patch.object(runtime, "load_serial_broker_registry", side_effect=[None, registry]),
-            patch.object(runtime, "_start_local_serial_broker", return_value=broker) as start_mock,
+            patch.object(runtime, "load_serial_broker_registry", return_value=None),
+            patch.object(runtime, "ensure_observe_serial_broker", return_value=registry) as ensure_mock,
+            patch.object(runtime, "_start_local_serial_broker") as start_mock,
             patch.object(runtime, "_BrokerSerialPort", FakeBrokerSerialPort),
             patch.object(runtime, "_acquire_control_lock", return_value=_null_context()),
         ):
@@ -50,9 +43,9 @@ class SerialRuntimeTest(unittest.TestCase):
                 self.assertEqual(handle.serial_port, "COM19")
                 self.assertEqual(handle.broker_registry.tcp_port, 9001)
 
-        start_mock.assert_called_once_with("COM19", baudrate=115200, timeout=0.2)
+        ensure_mock.assert_called_once_with("COM19", baudrate=115200)
+        start_mock.assert_not_called()
         self.assertTrue(handle.closed)
-        self.assertTrue(broker.stopped)
 
     def test_open_serial_port_can_disable_broker_first_for_direct_access(self) -> None:
         fake_handle = object()
@@ -181,6 +174,55 @@ class SerialRuntimeTest(unittest.TestCase):
         self.assertIn('"port": "COM19"', payload)
         self.assertIn('"direction": "tx"', payload)
         self.assertIn('"payload": "root"', payload)
+        self.assertEqual(trace_path.parent.name, "COM19")
+        self.assertEqual(trace_path.name, "trace.jsonl")
+
+    def test_serial_trace_log_path_defaults_under_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            with patch.dict(runtime.os.environ, {"AUTO_DBG_PROJECT_ROOT": str(project_root)}, clear=False):
+                trace_path = runtime.serial_trace_log_path("COM22")
+
+        self.assertEqual(trace_path, project_root / "autodbg" / "serial-log" / "COM22" / "trace.jsonl")
+
+    def test_ensure_observe_serial_broker_launches_terminal_until_protected(self) -> None:
+        registry = runtime.SerialBrokerRegistry(
+            host="127.0.0.1",
+            tcp_port=9001,
+            pid=1234,
+            serial_port="COM19",
+            baudrate=115200,
+            owner="human-observe",
+            protected=True,
+        )
+
+        with (
+            patch.object(runtime, "load_serial_broker_registry", side_effect=[None, registry]),
+            patch.object(runtime, "_launch_observe_serial_window") as launch_mock,
+            patch.object(runtime.time, "sleep"),
+        ):
+            observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200, wait_timeout=0.5)
+
+        self.assertEqual(observed, registry)
+        launch_mock.assert_called_once_with("COM19", baudrate=115200)
+
+    def test_protect_serial_broker_registry_updates_existing_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as broker_dir:
+            broker_root = Path(broker_dir)
+            broker_path = broker_root / "com19.json"
+            broker_path.write_text(
+                '{"host":"127.0.0.1","tcp_port":9001,"pid":1111,"serial_port":"COM19","baudrate":115200}\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            with patch.object(runtime, "_serial_broker_dir", return_value=broker_root):
+                with patch.object(runtime, "_pid_is_running", return_value=True):
+                    registry = runtime.protect_serial_broker_registry("COM19")
+
+        self.assertIsNotNone(registry)
+        self.assertEqual(registry.pid, 1111)
+        self.assertEqual(registry.owner, "human-observe")
+        self.assertTrue(registry.protected)
 
     def test_load_serial_broker_registry_returns_live_registry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

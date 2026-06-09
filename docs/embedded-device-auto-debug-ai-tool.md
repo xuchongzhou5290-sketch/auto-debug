@@ -64,7 +64,7 @@
 
 推荐动作链：
 
-1. 人工先开 `observe-serial`
+1. 如果目标串口缺少观察会话，工具自动拉起 `observe-serial`
 2. AI 再用 `watch-serial`
 3. `run`
 4. `report`
@@ -78,7 +78,7 @@
 
 推荐动作链：
 
-1. 人工先开 `observe-serial`
+1. 如果目标串口缺少观察会话，工具自动拉起 `observe-serial`
 2. AI 再用 `watch-serial`
 3. `health`
 4. `collect-evidence`
@@ -103,24 +103,53 @@
 - 修改后验证
 - 文件/包下发后回归
 
+### 4.4 Test Case Evidence
+
+推荐动作链：
+
+1. 如果目标串口缺少观察会话，工具自动拉起 `observe-serial`
+2. `case-begin`
+3. 执行目标 case
+4. `case-end`
+5. 必要时 `case-capture`
+
+适用：
+
+- 测试模式
+- 不刷固件
+- 需要给 AI 或提测记录提供串口证据贴片
+
+产物：
+
+- `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\metadata.json`
+- `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\trace.jsonl`
+- `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\trace.txt`
+- `<project_root>\autodbg\serial-log\<COMXX>\cases\<timestamp-case_id>\evidence_patch.md`
+
+### 4.5 Debug Mode Rule
+
+- `debug_mode=test`：不要求刷设备固件，不要求 `debug_firmware_method`，重点是 case 级串口日志分片
+- `debug_mode=development`：涉及拉包/升级/部署时必须明确 `debug_firmware_method` 和 `firmware_build_time`
+- 开发模式的日志边界按嵌入式上电周期处理：第一次上电到下次重新上电为一个周期
+
 ## 5. Serial Ownership Rule
 
 这是关键规则：
 
-- AI 不能假设自己调用 `watch-serial` 就等于用户也看到了串口
-- 串口主入口默认 broker-first，AI 执行串口控制动作时会优先启动或复用 raw-live broker
-- 如果用户也要实时看串口，引导用户在独立终端打开 `observe-serial` 或 `.\observe-serial.ps1`；AI 已经在使用串口时也可以再连到同一个 broker
-- AI 自己随后优先使用 `watch-serial`
-- `raw-live broker` 是物理串口的单一拥有者
+- 物理 COM 口默认由 `observe-serial` 人工观察窗口持有
+- 如果目标串口还没有 `observe-serial` 会话，AI 串口动作应先唤醒系统默认终端打开 `observe-serial`
+- AI 自己随后优先使用不带 `raw_live` 的 `watch-serial` 跟随共享 trace
+- `observe-serial` 的受保护 raw-live broker 是物理串口的单一拥有者
 - 其他 `autodbg` 命令应该复用 broker，而不是重新直接抢串口
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
 
 对 AI 的实际含义：
 
-- 如果用户要求“我也想同步看串口”，先给出 `observe-serial` 命令，再继续工具调用
-- 如果人工观察窗口已经存在，优先使用不带 `raw_live` 的 `watch-serial`
+- 如果用户要求“我也想同步看串口”，确认串口后直接让工具自动拉起或复用 `observe-serial`
+- AI 侧优先使用不带 `raw_live` 的 `watch-serial`
 - 不要在用户还在看串口时调用 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
-- 如果用户要求“观察串口不要被调试打断”，先启动 broker，再做后续控制动作
+- 如果用户要求“观察串口不要被调试打断”，先确保 `observe-serial` 已启动，再做后续控制动作
 
 ## 6. Response Rule
 
@@ -148,6 +177,8 @@
 3. MCP 场景先调 `autodbg_prepare`
 4. 如果 `missing_required` 非空，先向用户提问，不要直接猜参数
 5. 先判断用户目标属于：
+   - test case evidence
+   - development deploy/package pull
    - startup debug
    - health audit
    - deploy and verify
@@ -204,15 +235,12 @@
   },
   "options": {
     "follow": true,
-    "tail": 0,
-    "raw_live": true,
-    "stdin_shell": true
+    "tail": 0
   }
 }
 ```
 
-这个请求只保证 AI 自己跟随共享 trace。
-如果人也要直接看到串口，先让用户单独执行：
+这个请求会跟随共享 trace；如果该串口还没有 `observe-serial` 会话，工具会先唤醒系统默认终端打开：
 
 ```powershell
 observe-serial
