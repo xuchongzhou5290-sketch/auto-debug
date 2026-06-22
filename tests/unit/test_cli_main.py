@@ -1048,6 +1048,44 @@ class CliMainTest(unittest.TestCase):
             any("serial-broker stop --serial-port COM19" in call.args[0] for call in print_mock.call_args_list)
         )
 
+    def test_command_watch_serial_raw_live_open_failure_is_actionable(self) -> None:
+        args = argparse.Namespace(
+            serial_port="COM4",
+            tail=0,
+            follow=True,
+            show_system=False,
+            raw_live=True,
+            baudrate=115200,
+            stdin_probe=False,
+            stdin_shell=False,
+            settings=Path(__file__).resolve().parents[2] / "config" / "user-settings.toml",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace_path = Path(temp_dir) / "com4.jsonl"
+            broker_mock = unittest.mock.Mock()
+            broker_mock.start.side_effect = RuntimeError(
+                "Failed to open COM4: Cannot configure port, something went wrong. "
+                "Original message: PermissionError(13, '连接到系统上的设备没有发挥作用。', None, 31)"
+            )
+            with (
+                patch("autodbg.cli.main.serial_trace_log_path", return_value=trace_path),
+                patch("autodbg.cli.main._read_trace_entries", return_value=[]),
+                patch("autodbg.cli.main.load_serial_broker_registry", return_value=None),
+                patch("autodbg.cli.main.SerialBroker", return_value=broker_mock),
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = _command_watch_serial(args)
+
+        self.assertEqual(exit_code, 1)
+        broker_mock.start.assert_called_once()
+        broker_mock.stop.assert_called_once()
+        self.assertTrue(any("Failed to open raw serial broker on COM4" in call.args[0] for call in print_mock.call_args_list))
+        self.assertTrue(any("unplug/replug" in call.args[0] for call in print_mock.call_args_list))
+        self.assertTrue(
+            any("observe-serial -SerialPort COM4" in call.args[0] for call in print_mock.call_args_list)
+        )
+
     def test_command_watch_serial_can_use_serial_settings_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as settings_dir:
             settings_path = Path(settings_dir) / "user-settings.toml"

@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from autodbg.control.controller import LoginResult
-from autodbg.serial.broker import SerialBroker
+from autodbg.serial.broker import SerialBroker, serial_open_recovery_hints
 from autodbg.serial.observer import MarkerHit
 from autodbg.serial.runtime import (
     SerialBrokerProtectedError,
@@ -78,6 +78,12 @@ def _print_watch_trace_entry(entry: SerialTraceEntry, *, show_system: bool) -> b
             error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
             print(f"[ERROR] {entry.port} is unavailable: {error_summary}", flush=True)
             print(f"[TODO] Press Enter to retry reconnecting {entry.port}.", flush=True)
+            return True
+        if entry.payload.startswith("SERIAL_OPEN_FAILED"):
+            error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
+            print(f"[ERROR] Failed to open {entry.port}: {error_summary}", flush=True)
+            for hint in serial_open_recovery_hints(entry.port, error_summary):
+                print(f"[TODO] {hint}", flush=True)
             return True
         if not show_system:
             return False
@@ -1015,7 +1021,20 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
             if protect_human_session:
                 broker_kwargs.update({"owner": "human-observe", "protected": True})
             broker = cli_main.SerialBroker(**broker_kwargs)
-            broker.start()
+            try:
+                broker.start()
+            except Exception as exc:
+                try:
+                    broker.stop()
+                except Exception:
+                    pass
+                broker = None
+                print("[ xx... ] 2/5 steps")
+                print(f"[ERROR] Failed to open raw serial broker on {serial_port}.")
+                print(f"[TODO] {exc}")
+                for hint in serial_open_recovery_hints(serial_port, exc):
+                    print(f"[TODO] {hint}")
+                return 1
             existing_broker = cli_main.load_serial_broker_registry(serial_port)
             print(f"[DONE] Raw serial broker started on {serial_port} @ {baudrate}")
             if protect_human_session:

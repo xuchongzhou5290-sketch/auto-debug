@@ -18,6 +18,10 @@ from autodbg.serial.runtime import (
 )
 
 
+class SerialBrokerStartError(RuntimeError):
+    """Raised when a raw serial broker cannot open the physical COM port."""
+
+
 class SerialBroker:
     def __init__(
         self,
@@ -53,7 +57,15 @@ class SerialBroker:
         self._serial_module = _import_serial()
         self._lock_context = _acquire_port_lock(self.serial_port)
         self._lock_context.__enter__()
-        self._serial = self._open_serial_handle()
+        try:
+            self._serial = self._open_serial_handle()
+        except Exception as exc:
+            summary = _serial_error_summary(exc)
+            _append_trace_entry(self.serial_port, "sys", f"SERIAL_OPEN_FAILED error={summary}")
+            if self._lock_context is not None:
+                self._lock_context.__exit__(type(exc), exc, exc.__traceback__)
+                self._lock_context = None
+            raise SerialBrokerStartError(f"Failed to open {self.serial_port}: {summary}") from exc
         self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"BROKER_OPEN baudrate={self.baudrate}"))
         self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"SERIAL_CONNECTED baudrate={self.baudrate}"))
 
@@ -312,3 +324,34 @@ def _serial_error_summary(exc: BaseException) -> str:
     if not message:
         return exc.__class__.__name__
     return message.replace("\r", " ").replace("\n", " ")
+
+
+def serial_open_recovery_hints(serial_port: str, exc: BaseException | str) -> list[str]:
+    summary = _serial_error_summary(exc) if isinstance(exc, BaseException) else str(exc)
+    summary_lower = summary.lower()
+    hints: list[str] = []
+    if (
+        "permissionerror" in summary_lower
+        or "access is denied" in summary_lower
+        or "permission denied" in summary_lower
+        or "拒绝访问" in summary
+        or "权限" in summary
+    ):
+        hints.append(f"Close other tools or stale observe-serial windows that may still hold {serial_port}.")
+    if (
+        "cannot configure port" in summary_lower
+        or "winerror 31" in summary_lower
+        or ", 31)" in summary_lower
+        or "没有发挥作用" in summary
+        or "device attached to the system is not functioning" in summary_lower
+    ):
+        hints.append(
+            f"Windows reported the serial device is not functioning; unplug/replug the USB serial adapter for {serial_port} "
+            "or disable/enable it in Device Manager."
+        )
+    if "could not open port" in summary_lower or "file not found" in summary_lower or "找不到" in summary:
+        hints.append(f"Confirm {serial_port} still exists in Device Manager and retry with the actual COM number.")
+    if not hints:
+        hints.append(f"Confirm {serial_port} exists, is not held by another program, then retry observe-serial.")
+    hints.append(f"After the device is healthy, rerun: observe-serial -SerialPort {serial_port}")
+    return hints

@@ -65,6 +65,19 @@ class _FakeSerialHandle:
         self.closed = True
 
 
+class _FakeLockContext:
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.exited = True
+
+
 class SerialBrokerTest(unittest.TestCase):
     def test_is_benign_client_disconnect_accepts_expected_socket_abort_errors(self) -> None:
         self.assertTrue(broker._is_benign_client_disconnect(ConnectionAbortedError(10053, "aborted")))
@@ -140,6 +153,40 @@ class SerialBrokerTest(unittest.TestCase):
                 for call in broadcast_mock.call_args_list
             )
         )
+
+    def test_start_releases_lock_and_records_trace_when_open_fails(self) -> None:
+        lock_context = _FakeLockContext()
+        serial_error = PermissionError(13, "连接到系统上的设备没有发挥作用。")
+        broker_instance = broker.SerialBroker(serial_port="COM4", baudrate=115200)
+        with (
+            patch("autodbg.serial.broker._import_serial", return_value=SimpleNamespace(Serial=Mock(side_effect=serial_error))),
+            patch("autodbg.serial.broker._acquire_port_lock", return_value=lock_context),
+            patch("autodbg.serial.broker._append_trace_entry") as append_mock,
+        ):
+            with self.assertRaises(broker.SerialBrokerStartError) as exc_context:
+                broker_instance.start()
+
+        self.assertTrue(lock_context.entered)
+        self.assertTrue(lock_context.exited)
+        self.assertIsNone(broker_instance._lock_context)
+        self.assertIn("Failed to open COM4", str(exc_context.exception))
+        self.assertTrue(
+            any(
+                call.args[0] == "COM4"
+                and call.args[1] == "sys"
+                and call.args[2].startswith("SERIAL_OPEN_FAILED error=")
+                for call in append_mock.call_args_list
+            )
+        )
+
+    def test_serial_open_recovery_hints_explain_windows_device_error(self) -> None:
+        hints = broker.serial_open_recovery_hints(
+            "COM4",
+            "Cannot configure port. PermissionError(13, '连接到系统上的设备没有发挥作用。', None, 31)",
+        )
+
+        self.assertTrue(any("unplug/replug" in hint for hint in hints))
+        self.assertTrue(any("observe-serial -SerialPort COM4" in hint for hint in hints))
 
 
 if __name__ == "__main__":
