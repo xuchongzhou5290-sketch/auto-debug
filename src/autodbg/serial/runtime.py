@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Protocol
 
-from autodbg.utils.process import pid_is_running
+from autodbg.utils.process import PID_UNKNOWN, pid_is_running, pid_state
 
 
 class SerialPortProtocol(Protocol):
@@ -97,8 +97,18 @@ class SerialBrokerRegistry:
     @classmethod
     def from_path(cls, path: Path) -> "SerialBrokerRegistry | None":
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except (OSError, ValueError):  # ValueError: not UTF-8
+            return None
+        return cls.from_text(text)
+
+    @classmethod
+    def from_text(cls, text: str) -> "SerialBrokerRegistry | None":
+        try:
+            payload = json.loads(text)
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(payload, dict):
             return None
         try:
             return cls(
@@ -110,7 +120,7 @@ class SerialBrokerRegistry:
                 owner=str(payload["owner"]) if payload.get("owner") else None,
                 protected=bool(payload.get("protected", False)),
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):  # OverflowError: int(1e400)
             return None
 
 
@@ -328,7 +338,25 @@ def protect_serial_broker_registry(
         protected=True,
         pid=registry.pid,
     )
+    # tell the broker too: its registry self-heal rewrites from what it holds in memory and would otherwise roll the
+    # upgrade back if the file were deleted before it next looked at it (older brokers ignore the message)
+    _notify_broker_protection(registry, owner)
     return SerialBrokerRegistry.from_path(path)
+
+
+def _notify_broker_protection(registry: SerialBrokerRegistry, owner: str) -> None:
+    try:
+        with socket.create_connection((registry.host, int(registry.tcp_port)), timeout=_BROKER_PROBE_TIMEOUT) as sock:
+            sock.sendall(
+                json.dumps({"type": "hello", "role": "protect"}).encode("utf-8")
+                + b"\n"
+                + json.dumps({"type": "protect", "owner": owner}).encode("utf-8")
+                + b"\n"
+            )
+            sock.settimeout(_BROKER_PROBE_TIMEOUT)
+            sock.recv(4096)  # the hello reply: the broker has read our lines before we close
+    except (OSError, ValueError, OverflowError):
+        pass
 
 
 def _launch_observe_serial_window(port: str, *, baudrate: int) -> None:
@@ -490,31 +518,40 @@ def write_serial_broker_registry(
     )
     path = serial_broker_registry_path(port)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(registry.to_dict(), ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+    _write_text_atomic(path, json.dumps(registry.to_dict(), ensure_ascii=False) + "\n")
     return path
 
 
 def load_serial_broker_registry(port: str) -> SerialBrokerRegistry | None:
     path = serial_broker_registry_path(port)
-    registry = SerialBrokerRegistry.from_path(path)
-    if registry is None:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    status, registry = _read_serial_broker_registry(path)
+    if status == "invalid":
+        _unlink_registry_if_unchanged(path, None)
         return None
-    if not _pid_is_running(registry.pid):
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    if registry is None:
+        # missing, or unreadable right now (another process holding the file): never delete on that basis
+        return None
+    if _serial_broker_is_gone(registry):
+        _unlink_registry_if_unchanged(path, registry)
         return None
     return registry
 
 
-def remove_serial_broker_registry(port: str) -> None:
+def remove_serial_broker_registry(port: str, *, owner_pid: int | None = None) -> None:
+    """Delete the registry for port; with owner_pid, only when it still belongs to that pid.
+
+    A broker instance that failed to start (the port was already held by another broker) must not remove the
+    other broker's registry, so SerialBroker.stop() passes its own pid.
+    """
+    path = serial_broker_registry_path(port)
+    if owner_pid is not None:
+        status, registry = _read_serial_broker_registry(path)
+        if registry is None or registry.pid != owner_pid:
+            return
+        _unlink_registry_if_unchanged(path, registry)
+        return
     try:
-        serial_broker_registry_path(port).unlink()
+        path.unlink()
     except FileNotFoundError:
         pass
 
@@ -527,20 +564,180 @@ def list_serial_broker_registries(*, serial_port: str | None = None) -> list[Ser
     registries: list[SerialBrokerRegistry] = []
     normalized_filter = _normalize_port_name(serial_port) if serial_port else None
     for path in sorted(broker_dir.glob("*.json")):
-        registry = SerialBrokerRegistry.from_path(path)
-        if registry is None:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        status, registry = _read_serial_broker_registry(path)
+        if status == "invalid":
+            _unlink_registry_if_unchanged(path, None)
             continue
-        if not _pid_is_running(registry.pid):
-            _cleanup_serial_broker_artifacts(registry.serial_port)
+        if registry is None:
+            continue
+        if _serial_broker_is_gone(registry):
+            _cleanup_serial_broker_artifacts(registry.serial_port, expected=registry)
             continue
         if normalized_filter and _normalize_port_name(registry.serial_port) != normalized_filter:
             continue
         registries.append(registry)
     return registries
+
+
+_REGISTRY_READ_ATTEMPTS = 3
+_REGISTRY_READ_RETRY_DELAY = 0.05
+_BROKER_PROBE_TIMEOUT = 0.5
+_REGISTRY_REPLACE_ATTEMPTS = 20
+
+
+def _read_serial_broker_registry(path: Path) -> tuple[str, SerialBrokerRegistry | None]:
+    """Return ("ok", registry), ("missing", None), ("unreadable", None) or ("invalid", None).
+
+    Retries briefly before giving up: the file may be held by another process for a moment (antivirus, a reader
+    on Windows) or be mid-rewrite by an older autodbg that still writes in place, so one failed read or one
+    truncated JSON document is not proof that the registry is broken.
+    """
+    status = "missing"
+    for attempt in range(_REGISTRY_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(_REGISTRY_READ_RETRY_DELAY)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "missing", None
+        except OSError:
+            status = "unreadable"
+            continue
+        except ValueError:  # not UTF-8
+            status = "invalid"
+            continue
+        registry = SerialBrokerRegistry.from_text(text)
+        if registry is not None:
+            return "ok", registry
+        status = "invalid"
+    return status, None
+
+
+def _serial_broker_is_gone(registry: SerialBrokerRegistry) -> bool:
+    """True only when the broker is definitely gone.
+
+    A dead pid (no such process / exited) is conclusive. When the pid exists but may not be inspected
+    (PID_UNKNOWN, e.g. access denied from a sandboxed caller) the broker itself is asked, and only an answer that
+    identifies this port's broker counts: another port's broker may have taken over a dead registry's TCP port.
+    """
+    if not _pid_is_running(registry.pid):
+        return True
+    if PID_UNKNOWN != _pid_state(registry.pid):
+        return False
+    return not _probe_serial_broker(registry)
+
+
+_BROKER_MATCH = "match"  # answered and identified itself as this registry's broker
+_BROKER_MISMATCH = "mismatch"  # answered as another port's broker or another pid
+_BROKER_BARE = "bare"  # older broker: bare hello without identity
+_BROKER_SILENT = "silent"  # nothing answered like a broker
+
+
+def _broker_identity(registry: SerialBrokerRegistry, *, timeout: float = _BROKER_PROBE_TIMEOUT) -> str:
+    reply = _broker_hello(registry.host, registry.tcp_port, timeout=timeout)
+    if reply is None:
+        return _BROKER_SILENT
+    if "serial_port" not in reply and "pid" not in reply:
+        return _BROKER_BARE
+    if _normalize_port_name(str(reply.get("serial_port", ""))) != _normalize_port_name(registry.serial_port):
+        return _BROKER_MISMATCH
+    if "pid" in reply and reply.get("pid") != registry.pid:
+        return _BROKER_MISMATCH
+    return _BROKER_MATCH
+
+
+def _probe_serial_broker(registry: SerialBrokerRegistry, *, timeout: float = _BROKER_PROBE_TIMEOUT) -> bool:
+    """For a pid we may not inspect: is this registry's broker still there?"""
+    identity = _broker_identity(registry, timeout=timeout)
+    if _BROKER_MATCH == identity:
+        return True
+    if _BROKER_MISMATCH == identity:
+        return False
+    # an older broker (bare hello) or no answer at all (e.g. loopback blocked in a sandbox): fall back to the port
+    # lock, which a broker holds for its whole life. Better to keep an unreachable entry than to drop a live one.
+    return _read_lock_pid(_serial_lock_path(registry.serial_port)) == registry.pid
+
+
+def _broker_hello(host: str, tcp_port: int, *, timeout: float) -> dict | None:
+    """Send the broker handshake and return its hello reply, or None if nothing answers like a broker."""
+    deadline = time.monotonic() + timeout
+    try:
+        with socket.create_connection((host, int(tcp_port)), timeout=timeout) as sock:
+            sock.sendall(json.dumps({"type": "hello", "role": "probe"}).encode("utf-8") + b"\n")
+            buffer = b""
+            while len(buffer) < 65536:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                sock.settimeout(remaining)
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return None
+                buffer += chunk
+                # the broker may broadcast trace lines before the hello reply
+                *lines, buffer = buffer.split(b"\n")
+                for line in lines:
+                    try:
+                        payload = json.loads(line.decode("utf-8", errors="replace"))
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(payload, dict) and payload.get("type") == "hello" and payload.get("ok"):
+                        return payload
+    except (OSError, ValueError, OverflowError):
+        return None
+    return None
+
+
+def _unlink_registry_if_unchanged(path: Path, expected: SerialBrokerRegistry | None) -> None:
+    """Delete path unless it now holds a different, valid registry (a new broker may have just registered)."""
+    status, current = _read_serial_broker_registry(path)
+    if status == "missing":
+        return
+    if status == "unreadable":
+        return
+    if expected is None:
+        if status != "invalid":
+            return
+    elif current != expected:
+        return
+    for _ in range(_REGISTRY_REPLACE_ATTEMPTS):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            # Windows refuses to delete a file a reader has open for a moment; retry briefly
+            time.sleep(random.uniform(0.01, 0.05))
+        except OSError:
+            return
+    # still held open: leave it; a dead broker's entry is cleaned up by the next load/list
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write a registry so readers never see it half-written: temp file in the same directory, then os.replace."""
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for _ in range(_REGISTRY_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError:
+                # Windows refuses to replace a file another process has open; retry briefly
+                time.sleep(random.uniform(0.01, 0.05))
+        # still blocked: fall back to an in-place write (readers retry on a truncated document)
+        path.write_text(text, encoding="utf-8", newline="\n")
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def stop_serial_broker(
@@ -555,7 +752,8 @@ def stop_serial_broker(
         return None
 
     if not _pid_is_running(registry.pid):
-        _cleanup_serial_broker_artifacts(port)
+        # the broker exited between load() and here
+        _cleanup_serial_broker_artifacts(port, expected=registry)
         return registry
 
     if registry.protected and not allow_protected:
@@ -565,23 +763,30 @@ def stop_serial_broker(
             f" (pid {registry.pid}{owner}). Use --force only after confirming the human observer can be disconnected."
         )
 
+    if _BROKER_MISMATCH == _broker_identity(registry):
+        # the registered pid is alive but its TCP port answers as another broker: the entry is stale (pid reused),
+        # so clean it up instead of killing whatever process now owns that pid
+        _cleanup_serial_broker_artifacts(port, expected=registry)
+        return registry
+
     _terminate_pid(registry.pid)
     deadline = time.monotonic() + max(wait_timeout, 0.1)
     while time.monotonic() < deadline:
         if not _pid_is_running(registry.pid):
-            _cleanup_serial_broker_artifacts(port)
+            _cleanup_serial_broker_artifacts(port, expected=registry)
             return registry
         time.sleep(0.05)
 
     if _pid_is_running(registry.pid):
         raise RuntimeError(f"Timed out while stopping raw serial broker pid {registry.pid} on {port}.")
 
-    _cleanup_serial_broker_artifacts(port)
+    _cleanup_serial_broker_artifacts(port, expected=registry)
     return registry
 
 
-def _cleanup_serial_broker_artifacts(port: str) -> None:
-    remove_serial_broker_registry(port)
+def _cleanup_serial_broker_artifacts(port: str, *, expected: SerialBrokerRegistry | None = None) -> None:
+    """Remove the registry only if it is still the dead broker's (expected) or is corrupt, plus stale locks."""
+    _unlink_registry_if_unchanged(serial_broker_registry_path(port), expected)
     _remove_stale_lock(_serial_lock_path(port))
     _remove_stale_lock(_serial_control_lock_path(port))
 
@@ -602,6 +807,10 @@ def _remove_stale_lock(lock_path: Path) -> bool:
         lock_path.unlink()
     except FileNotFoundError:
         return True
+    except OSError:
+        # still held open (a just-killed process whose handle is not closed yet, or a new owner that just took it):
+        # not ours to remove now; the next one to acquire the lock reclaims it if it really is stale
+        return False
     return True
 
 
@@ -610,7 +819,7 @@ def _read_lock_pid(lock_path: Path) -> int | None:
         raw = lock_path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not raw:
         return None
@@ -622,6 +831,10 @@ def _read_lock_pid(lock_path: Path) -> int | None:
 
 def _pid_is_running(pid: int) -> bool:
     return pid_is_running(pid)
+
+
+def _pid_state(pid: int) -> str:
+    return pid_state(pid)
 
 
 def _release_pid_lock(lock_path: Path) -> None:

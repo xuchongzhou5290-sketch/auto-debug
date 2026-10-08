@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import socketserver
 import sys
 import threading
@@ -13,9 +14,14 @@ from autodbg.serial.runtime import (
     _acquire_port_lock,
     _append_trace_entry,
     _import_serial,
+    _normalize_port_name,
+    _read_serial_broker_registry,
     remove_serial_broker_registry,
+    serial_broker_registry_path,
     write_serial_broker_registry,
 )
+
+_REGISTRY_CHECK_INTERVAL = 2.0  # seconds between self-checks of our own registry entry
 
 
 class SerialBrokerStartError(RuntimeError):
@@ -52,11 +58,16 @@ class SerialBroker:
         self._server_thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._registered = False
+        self._registry_lock = threading.Lock()
+        self._registry_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._serial_module = _import_serial()
-        self._lock_context = _acquire_port_lock(self.serial_port)
-        self._lock_context.__enter__()
+        lock_context = _acquire_port_lock(self.serial_port)
+        # raises SerialPortBusyError when another broker already holds this port; keep nothing to undo then
+        lock_context.__enter__()
+        self._lock_context = lock_context
         try:
             self._serial = self._open_serial_handle()
         except Exception as exc:
@@ -91,22 +102,34 @@ class SerialBroker:
             owner=self.owner,
             protected=self.protected,
         )
+        self._registered = True
 
         self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._reader_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
+        self._registry_thread = threading.Thread(target=self._registry_keeper_loop, daemon=True)
         self._server_thread.start()
         self._reader_thread.start()
+        self._registry_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        remove_serial_broker_registry(self.serial_port)
+        with self._registry_lock:
+            if self._registered:
+                # only our own registration: a broker that failed to start (port already held by another broker)
+                # used to remove the running broker's registry here, leaving it unreachable for exec/watch-serial
+                remove_serial_broker_registry(self.serial_port, owner_pid=os.getpid())
+                self._registered = False
         if self._server is not None:
-            self._server.shutdown()
+            if self._server_thread is not None:
+                # shutdown() waits for serve_forever(); calling it when that never started hangs forever
+                self._server.shutdown()
             self._server.server_close()
         if self._server_thread is not None:
             self._server_thread.join(timeout=1.0)
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1.0)
+        if self._registry_thread is not None:
+            self._registry_thread.join(timeout=1.0)
         with self._clients_lock:
             clients = list(self._clients)
             self._clients.clear()
@@ -119,6 +142,55 @@ class SerialBroker:
         if self._lock_context is not None:
             self._lock_context.__exit__(None, None, None)
             self._lock_context = None
+
+    def _registry_keeper_loop(self) -> None:
+        while not self._stop_event.wait(_REGISTRY_CHECK_INTERVAL):
+            try:
+                self._ensure_registered()
+            except Exception:
+                continue
+
+    def _ensure_registered(self) -> bool:
+        """Rewrite our registry if something removed or overwrote it; return True when it was rewritten.
+
+        Older autodbg copies still running on the host delete registries they misjudge as stale, and a delete can
+        race with a rewrite. While this broker holds the port lock it is the port's only broker, so its entry wins.
+        owner/protected follow the last entry seen with our pid (protect_serial_broker_registry may have upgraded
+        them after start).
+        """
+        with self._registry_lock:
+            if not self._registered or self._stop_event.is_set():
+                return False
+            status, current = _read_serial_broker_registry(serial_broker_registry_path(self.serial_port))
+            if "unreadable" == status:
+                return False
+            if (
+                current is not None
+                and current.pid == os.getpid()
+                and current.tcp_port == self.tcp_port
+                and current.host == self.host
+                and current.baudrate == self.baudrate
+                and _normalize_port_name(current.serial_port) == _normalize_port_name(self.serial_port)
+            ):
+                self.owner = current.owner
+                self.protected = current.protected
+                return False
+            write_serial_broker_registry(
+                self.serial_port,
+                host=self.host,
+                tcp_port=self.tcp_port,
+                baudrate=self.baudrate,
+                owner=self.owner,
+                protected=self.protected,
+            )
+        self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"BROKER_REGISTRY_RESTORED was={status}"))
+        return True
+
+    def set_protection(self, owner: str) -> None:
+        """protect_serial_broker_registry upgraded us: keep it in memory so the registry self-heal does not undo it."""
+        with self._registry_lock:
+            self.owner = owner
+            self.protected = True
 
     def add_client(self, connection: "_BrokerConnection") -> None:
         with self._clients_lock:
@@ -279,7 +351,8 @@ class _BrokerRequestHandler(socketserver.BaseRequestHandler):
                 return
             connection = _BrokerConnection(self.request)
             broker.add_client(connection)
-            connection.send({"type": "hello", "ok": True})
+            # identify ourselves: liveness probes must not mistake another port's broker for this one
+            connection.send({"type": "hello", "ok": True, "serial_port": str(broker.serial_port), "pid": os.getpid()})
             try:
                 for raw_line in file_obj:
                     if not raw_line:
@@ -296,6 +369,8 @@ class _BrokerRequestHandler(socketserver.BaseRequestHandler):
                             broker.write(base64.b64decode(encoded))
                         except Exception:
                             continue
+                    elif payload.get("type") == "protect":
+                        broker.set_protection(str(payload.get("owner") or "human-observe"))
             except Exception as exc:
                 if not _is_benign_client_disconnect(exc):
                     raise
