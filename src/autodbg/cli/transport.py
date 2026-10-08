@@ -10,7 +10,7 @@ import socket
 from typing import Any
 from urllib.parse import urlparse
 
-from autodbg.control.controller import CommandResult, DeviceController
+from autodbg.control.controller import CommandResult, CommandTooLongError, DeviceController
 from autodbg.evidence.collector import EvidenceCollector
 from autodbg.host.bundle import split_base64_payload
 from autodbg.serial.runtime import _windows_safe_name
@@ -213,14 +213,16 @@ def _build_network_dir_resolver(network_dir: str | None) -> str:
         "/usr/local/wifi",
         "/system/network",
     ]
-    lines = ["NET_DIR=''"]
-    for candidate in candidates:
-        lines.append(
-            f'if [ -z "$NET_DIR" ] && [ -f "{candidate}/wifi_cmd.sh" ] && [ -f "{candidate}/wlan_run.sh" ]; then NET_DIR="{candidate}"; fi'
-        )
-    lines.append('if [ -z "$NET_DIR" ]; then NET_FILE=$(find / -path "*/network/wifi_cmd.sh" 2>/dev/null | head -n 1); [ -n "$NET_FILE" ] && NET_DIR=$(dirname "$NET_FILE"); fi')
-    lines.append('[ -n "$NET_DIR" ]')
-    return "; ".join(lines)
+    # One loop rather than an "if" per candidate: the whole bootstrap command has to fit the device shell's ~1 KB line
+    # (it used to be about 1.6 KB). "read" takes the first find hit because the V35S busybox has no "head".
+    return (
+        f"NET_DIR=''; for d in {' '.join(candidates)}; do "
+        '[ -f "$d/wifi_cmd.sh" ] && [ -f "$d/wlan_run.sh" ] && NET_DIR="$d" && break; done; '
+        'if [ -z "$NET_DIR" ]; then '
+        'NET_FILE=$(find / -path "*/network/wifi_cmd.sh" 2>/dev/null | { IFS= read -r f; printf "%s" "$f"; }); '
+        '[ -n "$NET_FILE" ] && NET_DIR=$(dirname "$NET_FILE"); fi; '
+        '[ -n "$NET_DIR" ]'
+    )
 
 
 def _normalize_focus_terms(focus_terms: list[str]) -> list[str]:
@@ -322,7 +324,8 @@ def _build_fetch_path_command(remote_path: str) -> str:
 # The device's login shell reads the command through busybox's line editor. It keeps about 1 KB of a line and drops the
 # rest, closing quote included, after which the shell waits at its continuation prompt for good; control characters
 # are editing keys there (TAB completes, DEL deletes, ^A moves the cursor), so a path holding one would fetch some
-# other path. Such a fetch is refused before anything is sent. The controller adds about 90 bytes around the command.
+# other path. Such a fetch is refused before anything is sent, with advice for fetches (the controller's own
+# serial.max_line_bytes check is the general backstop). The controller adds about 70 bytes around the command.
 _FETCH_COMMAND_MAX_BYTES = 900
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -400,11 +403,14 @@ def _fetch_remote_file_artifact(
     problem = _fetch_command_problem(remote_path, command, output_path)
     if problem is not None:
         return _refused_fetch_result(remote_path, problem)
-    result = controller.execute(
-        command,
-        timeout=timeout,
-        serial_port=serial_port,
-    )
+    try:
+        result = controller.execute(
+            command,
+            timeout=timeout,
+            serial_port=serial_port,
+        )
+    except CommandTooLongError as exc:  # a device profile with a lower serial.max_line_bytes
+        return _refused_fetch_result(remote_path, f"{exc} Fetch a shorter path, e.g. a parent directory with fetch-path.")
     return _finalize_fetch_result(
         collector=collector,
         remote_path=remote_path,
@@ -428,11 +434,14 @@ def _fetch_remote_path_artifact(
     problem = _fetch_command_problem(remote_path, command, output_path)
     if problem is not None:
         return _refused_fetch_result(remote_path, problem)
-    result = controller.execute(
-        command,
-        timeout=timeout,
-        serial_port=serial_port,
-    )
+    try:
+        result = controller.execute(
+            command,
+            timeout=timeout,
+            serial_port=serial_port,
+        )
+    except CommandTooLongError as exc:  # a device profile with a lower serial.max_line_bytes
+        return _refused_fetch_result(remote_path, f"{exc} Fetch a shorter path, e.g. a parent directory with fetch-path.")
     return _finalize_fetch_result(
         collector=collector,
         remote_path=remote_path,

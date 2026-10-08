@@ -7,6 +7,8 @@ port = "COM16"
 baudrate = 115200
 login_prompt = "closeli login:"
 shell_prompt = "[root@closeli:~]#"
+# Longest line (UTF-8 bytes) a command may have as typed into the device shell; 0 turns the check off.
+# max_line_bytes = 1000
 
 [credentials]
 username = "root"

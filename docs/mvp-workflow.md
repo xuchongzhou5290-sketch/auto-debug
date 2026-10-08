@@ -86,6 +86,7 @@ Common `failure_stage` breakpoints in the current implementation:
 - `fetch_path`
 - `deploy_artifacts`
 - `running_checks`
+- `validate_command`: a command was refused before anything was sent, because one of its lines is longer than the device shell takes (`serial.max_line_bytes`); `retryable` is false, change the request instead
 
 ## Closed Deploy/Verify Loop
 

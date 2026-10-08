@@ -31,7 +31,7 @@ from autodbg.agent import (
     temporary_agent_environment,
 )
 from autodbg.config import apply_user_settings, default_user_settings_path, load_user_settings
-from autodbg.control.controller import CommandResult, DeviceController, LoginRequiredError
+from autodbg.control.controller import CommandResult, CommandTooLongError, DeviceController, LoginRequiredError
 from autodbg.deploy.deployer import Deployer
 from autodbg.deploy import LOCAL_TOOL_NAME, install_local_tool
 from autodbg.evidence.collector import EvidenceCollector
@@ -1022,6 +1022,80 @@ def _default_collect_evidence_files(profiles) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+_SHORTEN_USER_COMMAND = "Shorten that command or put it in a script on the device."
+
+
+def _planned_command_refusal(
+    controller: DeviceController,
+    planned: list[tuple[str, str, bool, str]],
+) -> tuple[str, str] | None:
+    """(why, advice) for the first planned command too long for the device shell, or None if they all fit.
+
+    planned holds (label, command, structured, advice); structured means sent through _execute_structured_command,
+    which wraps it further. Flows check all their commands this way before sending any, so a refusal never leaves
+    the device half-way through (e.g. deployed but not rebooted).
+    """
+    for label, command, structured, advice in planned:
+        try:
+            controller.check_command_length(_build_structured_command(command) if structured else command)
+        except CommandTooLongError as exc:
+            return f"{label}: {exc}", advice
+    return None
+
+
+def _user_commands(label: str, commands: list[str]) -> list[tuple[str, str, bool, str]]:
+    return [(f"{label} #{index}", command, True, _SHORTEN_USER_COMMAND) for index, command in enumerate(commands, start=1)]
+
+
+def _bootstrap_commands(commands: list[str]) -> list[tuple[str, str, bool, str]]:
+    # The wlan_script bootstrap is built by autodbg; without a network dir it carries a search for the scripts.
+    wlan_advice = "Set --network-dir (or network.network_dir) so the built-in wlan_script bootstrap skips its search."
+    return [
+        (label, command, structured, wlan_advice if _build_network_dir_resolver(None) in command else advice)
+        for label, command, structured, advice in _user_commands("Bootstrap command", commands)
+    ]
+
+
+def _report_refused_command(
+    *,
+    action: str,
+    status: str,
+    error: str,
+    advice: str,
+    collector: EvidenceCollector,
+    session,
+    loop_context: dict[str, Any],
+    carry_forward_options: dict[str, Any],
+    intervention_context: dict[str, Any] | None = None,
+) -> int:
+    collector.append_event(event_type=status, source="device_controller", summary=error, severity="error")
+    collector.update_summary(
+        {
+            "status": status,
+            "error": error,
+            "intervention_context": intervention_context,
+            "result": build_result_contract(
+                action=action,
+                decision="continue",
+                failure_stage="validate_command",
+                retryable=False,
+                stop_reason=error,
+                key_excerpts=[build_excerpt(source="device_controller", label="command_too_long", text=error, severity="error")],
+                next_actions=[{"action": action, "reason": advice}],
+                loop_context=loop_context,
+                current_session_dir=session.session_paths.root,
+                carry_forward_options=carry_forward_options,
+                intervention_context=intervention_context,
+            ),
+        }
+    )
+    print("[ oxx.. ] 2/5 steps")
+    print(f"[ERROR] {error}")
+    # Last line: agents report it as the error, so it carries the reason as well.
+    print(f"[TODO] Nothing was sent to the device. {advice} ({error})")
+    return 1
+
+
 def _execute_named_command(
     *,
     name: str,
@@ -1034,12 +1108,19 @@ def _execute_named_command(
     timeout: float = 20.0,
     serial_port=None,
 ) -> dict[str, Any]:
-    result = _execute_structured_command(
-        controller=controller,
-        shell_command=shell_command,
-        timeout=timeout,
-        serial_port=serial_port,
-    )
+    try:
+        result = _execute_structured_command(
+            controller=controller,
+            shell_command=shell_command,
+            timeout=timeout,
+            serial_port=serial_port,
+        )
+    except CommandTooLongError as exc:
+        # Refused before sending: record it as this command's failure instead of ending the whole run.
+        result = CommandResult(command=shell_command, exit_code=None, output_lines=[], transcript=[f"[autodbg] {exc}"])
+        error: str | None = str(exc)
+    else:
+        error = None
     transcript = "\n".join(result.transcript) + ("\n" if result.transcript else "")
     output = "\n".join(result.output_lines) + ("\n" if result.output_lines else "")
     collector.write_text_artifact(f"logs/{artifact_prefix}-transcript.log", transcript)
@@ -1050,10 +1131,13 @@ def _execute_named_command(
         "exit_code": result.exit_code,
         "output_lines": result.output_lines,
     }
+    if error is not None:
+        payload["error"] = error
     collector.append_event(
         event_type=event_type,
         source="workflow_runner",
-        summary=event_summary,
+        summary=event_summary if error is None else f"Refused command {name}: {error}",
+        severity="info" if error is None else "error",
         payload=payload,
     )
     return payload
@@ -1135,6 +1219,13 @@ def _collect_evidence_bundle(
     return command_results, file_results
 
 
+def _result_excerpt(result: dict[str, Any]) -> str:
+    # A command refused before sending (too long for the device shell) has no output; show why instead.
+    if result.get("error"):
+        return str(result["error"])
+    return _format_output_excerpt(result.get("output_lines", []))
+
+
 def _format_output_excerpt(output_lines: list[str], *, max_length: int = 88) -> str:
     if not output_lines:
         return "(no output)"
@@ -1189,19 +1280,28 @@ def _run_validation_commands(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for index, command in enumerate(commands, start=1):
-        result = _execute_structured_command(
-            controller=controller,
-            shell_command=command,
-            timeout=timeout,
-            serial_port=serial_port,
-        )
+        try:
+            result = _execute_structured_command(
+                controller=controller,
+                shell_command=command,
+                timeout=timeout,
+                serial_port=serial_port,
+            )
+        except CommandTooLongError as exc:
+            # Refused before sending: a failed validation command, not the end of the run.
+            result = CommandResult(command=command, exit_code=None, output_lines=[], transcript=[f"[autodbg] {exc}"])
+            error: str | None = str(exc)
+        else:
+            error = None
         _write_command_artifacts(collector=collector, prefix=f"{prefix}-{index}", result=result)
         result_dict = result.to_dict()
+        if error is not None:
+            result_dict["error"] = error
         results.append(result_dict)
         collector.append_event(
             event_type="target_validation_command",
             source="device_controller",
-            summary=f"Executed target validation command #{index}",
+            summary=f"Executed target validation command #{index}" if error is None else f"Refused validation command #{index}: {error}",
             payload=result_dict,
             severity="error" if result.exit_code != 0 else "info",
         )
@@ -1232,7 +1332,8 @@ def _evaluate_validation_spec(
                 {
                     "level": "error",
                     "check_name": "validation_command",
-                    "message": f"Validation command failed: {command_result.get('command')}",
+                    "message": f"Validation command failed: {command_result.get('command')}"
+                    + (f" ({command_result['error']})" if command_result.get("error") else ""),
                 }
             )
     for marker in expect_markers or []:
@@ -1717,7 +1818,7 @@ def _print_health_report(summary: dict[str, Any]) -> None:
         print(f"[ACTIVE] {evaluation.get('summary', '')}")
     for check in checks:
         status = "DONE" if check.get("exit_code") == 0 else "ERROR"
-        excerpt = _format_output_excerpt(check.get("output_lines", []))
+        excerpt = _result_excerpt(check)
         print(f"[{status}] {check['name']}: exit={check.get('exit_code')} | {excerpt}")
     findings = evaluation.get("findings", []) if evaluation else []
     if findings:
@@ -1780,6 +1881,33 @@ def _command_run(args: argparse.Namespace) -> int:
         command_results=[],
     )
     intervention_context = _build_intervention_context(args)
+    refusal = _planned_command_refusal(controller, _user_commands("Validation command", list(args.validation_command)))
+    if refusal is not None:
+        return _report_refused_command(
+            action="run",
+            status="run_refused",
+            error=refusal[0],
+            advice=refusal[1],
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            intervention_context=intervention_context,
+            carry_forward_options=_collect_option_patch(
+                args,
+                [
+                    "observe_seconds",
+                    "skip_evidence",
+                    "evidence_timeout",
+                    "validation_command",
+                    "expect_marker",
+                    "reject_marker",
+                    "expected_version",
+                    "git_commit",
+                    "changed_file",
+                    "expected_effect",
+                ],
+            ),
+        )
     state.transition_task(TaskState.WAITING_BOOT, f"Observing serial for {args.observe_seconds:.1f}s.")
     collector.update_summary({"state": state.to_dict()})
 
@@ -2057,7 +2185,7 @@ def _command_run(args: argparse.Namespace) -> int:
             build_excerpt(
                 source="evidence_command",
                 label=str(first_failure.get("name", "command_failure")),
-                text=_format_output_excerpt(first_failure.get("output_lines", [])),
+                text=_result_excerpt(first_failure),
                 severity="error",
             )
         )
@@ -2454,6 +2582,24 @@ def _command_bootstrap_network(args: argparse.Namespace) -> int:
         return 1
 
     controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    refusal = _planned_command_refusal(
+        controller,
+        _bootstrap_commands(bootstrap_commands) + _user_commands("Check command", check_commands),
+    )
+    if refusal is not None:
+        return _report_refused_command(
+            action="bootstrap-network",
+            status="bootstrap_network_refused",
+            error=refusal[0],
+            advice=refusal[1],
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            carry_forward_options=_collect_option_patch(
+                args,
+                ["mode", "bootstrap_command", "check_command", "timeout", "wifi_ssid", "wifi_password", "wifi_mode", "network_dir"],
+            ),
+        )
     bootstrap_results: list[dict[str, Any]] = []
     check_results: list[dict[str, Any]] = []
     try:
@@ -3158,6 +3304,85 @@ def _command_quickstart(args: argparse.Namespace) -> int:
     return 0
 
 
+def _device_pull_transfer_commands(
+    args: argparse.Namespace,
+    mode: str,
+    base_url: str,
+    workspace: str,
+    profiles,
+) -> list[tuple[str, str, bool, str]]:
+    """The commands device-pull sends for one transfer mode, for _planned_command_refusal."""
+    planned: list[tuple[str, str, bool, str]] = []
+    if mode == "http":
+        # Not for the SD HTTP helper's fallback to this pull: that is checked when (and if) the fallback is needed.
+        pull_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
+        planned.append(("HTTP pull command", pull_command, False, "Use a shorter --workspace, --pull-script-name or base URL."))
+    if mode == "sd_http_helper" and args.sd_http_helper_path:
+        helper_command = _build_sd_http_helper_command(
+            base_url,
+            workspace=workspace,
+            helper_path=args.sd_http_helper_path,
+            list_name=args.sd_http_list_name,
+        )
+        advice = "Use a shorter --workspace, --sd-http-helper-path, --sd-http-list-name or base URL."
+        planned.insert(0, ("SD HTTP helper command", helper_command, False, advice))
+    if mode == "serial_bundle" and args.serial_bundle_chunk_size > 0:  # a bad size is reported by the transfer itself
+        # A chunk line's length is the workspace's plus the chunk size (base64 is ASCII). Capped so a silly size does
+        # not build a huge dummy; anything that big is refused either way.
+        chunk_size = args.serial_bundle_chunk_size
+        dummy_chunk = min(chunk_size, 1_000_000)
+        prepare, uploads, finalize = _build_serial_bundle_commands(
+            base64_payload="A" * dummy_chunk,
+            workspace=workspace,
+            chunk_size=chunk_size,
+            artifact_count=99999,
+        )
+        overhead = len(DeviceController._wrap_command(uploads[0], "__AUTODBG_00000000__").encode("utf-8")) - dummy_chunk
+        # Leave room for escaping that may grow a chunk line (e.g. a broken-up "fiq" for Rockchip's UART debugger).
+        largest_chunk = profiles.device.serial.max_line_bytes - overhead - 24
+        chunk_advice = (
+            f"Use --serial-bundle-chunk-size {largest_chunk} or less, or a shorter --workspace."
+            if largest_chunk >= 64
+            else "Use a shorter --workspace."
+        )
+        planned += [
+            ("Serial bundle prepare command", prepare, False, "Use a shorter --workspace."),
+            (f"Serial bundle upload command (--serial-bundle-chunk-size {chunk_size})", uploads[0], False, chunk_advice),
+            ("Serial bundle finalize command", finalize, False, "Use a shorter --workspace."),
+        ]
+    return planned
+
+
+def _device_pull_planned_commands(
+    args: argparse.Namespace,
+    bootstrap_commands: list[str],
+    check_commands: list[str],
+    list_command: str,
+    base_url: str,
+    workspace: str,
+    profiles,
+) -> list[tuple[str, str, bool, str]]:
+    """The commands device-pull may send, for _planned_command_refusal before the first one goes out.
+
+    The transfer commands are included when the mode is known up front; in auto mode they are checked once the probe
+    has picked the mode (_device_pull_transfer_commands), still before any of them is sent.
+    """
+    planned = _bootstrap_commands(bootstrap_commands) + _user_commands("Check command", check_commands)
+    planned.append(
+        ("Transfer probe", _build_transfer_probe_command(args.sd_http_helper_path), False, "Use a shorter --sd-http-helper-path.")
+    )
+    if args.transfer_mode != "auto":
+        planned += _device_pull_transfer_commands(args, args.transfer_mode, base_url, workspace, profiles)
+    elif args.mode == "offline":  # the only mode auto can pick offline
+        planned += _device_pull_transfer_commands(args, "serial_bundle", base_url, workspace, profiles)
+    planned.append(("List command", list_command, True, _SHORTEN_USER_COMMAND))
+    planned += _user_commands("Post-pull command", list(args.post_pull_command))
+    if args.reboot_command:
+        planned.append(("Reboot command", args.reboot_command, True, _SHORTEN_USER_COMMAND))
+    planned += _user_commands("Validation command", list(args.validation_command))
+    return planned
+
+
 def _command_device_pull(args: argparse.Namespace) -> int:
     if not _validate_development_debug_context(args, action_name="device-pull"):
         return 2
@@ -3427,9 +3652,26 @@ def _command_device_pull(args: argparse.Namespace) -> int:
     )
     manifest_path: Path | None = None
     pull_script_path: Path | None = None
+    refusal = _planned_command_refusal(
+        controller,
+        _device_pull_planned_commands(args, bootstrap_commands, check_commands, list_command, base_url, workspace, profiles),
+    )
+    if refusal is not None:
+        return _report_refused_command(
+            action="device-pull",
+            status="device_pull_refused",
+            error=refusal[0],
+            advice=refusal[1],
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            carry_forward_options=carry_forward_options,
+            intervention_context=intervention_context,
+        )
     device_pull_stage = "transfer_artifacts"
     server = None
     thread = None
+    refused_before_transfer = False
 
     try:
         state.transition_task(TaskState.RUNNING_CHECKS, "Executing bootstrap commands, checks, and device pull.")
@@ -3491,6 +3733,14 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 capabilities=transfer_probe["capabilities"],
                 network_mode=args.mode,
             )
+            # In auto mode only now is it known which transfer commands will go out; check them before the first.
+            refusal = _planned_command_refusal(
+                controller,
+                _device_pull_transfer_commands(args, selected_transfer_mode, base_url, workspace, profiles),
+            )
+            if refusal is not None:
+                refused_before_transfer = True
+                raise CommandTooLongError(f"{refusal[0]} {refusal[1]}")
 
             if selected_transfer_mode == "http":
                 manifest_path = write_manifest(
@@ -3555,10 +3805,19 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                     list_name=args.sd_http_list_name,
                 )
                 should_fallback_to_http = False
+                fallback_refusal = None
                 try:
                     helper_result = controller.execute(helper_command, timeout=args.timeout, serial_port=serial_port)
                     downloader = transfer_probe["capabilities"].get("downloader", "unknown")
                     should_fallback_to_http = args.transfer_mode == "auto" and helper_result.exit_code != 0 and downloader not in {"none", "unknown"}
+                    if should_fallback_to_http:
+                        # Checked only now: the fallback is rarely needed, and a long one must not block the helper.
+                        fallback_command = _build_remote_pull_command(base_url, workspace=workspace, script_name=args.pull_script_name)
+                        fallback_refusal = _planned_command_refusal(
+                            controller,
+                            [("HTTP fallback pull command", fallback_command, False, "")],
+                        )
+                        should_fallback_to_http = fallback_refusal is None
                 finally:
                     if not should_fallback_to_http:
                         server, thread = _shutdown_transient_artifact_server(
@@ -3582,6 +3841,8 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                         "list_name": args.sd_http_list_name,
                     },
                 }
+                if fallback_refusal is not None:  # the helper failed; its own result is reported
+                    transfer_details["http_fallback_skipped"] = fallback_refusal[0]
                 collector.append_event(
                     event_type="device_pull_sd_http_helper",
                     source="device_controller",
@@ -3816,10 +4077,12 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry device-pull.")
         return 1
     except Exception as exc:
+        # A transfer command too long for the device shell, refused once the probe had picked the transfer mode.
+        refused = isinstance(exc, CommandTooLongError)
         state.transition_task(TaskState.FAILED, "Device pull failed.")
         collector.update_summary(
             {
-                "status": "device_pull_failed",
+                "status": "device_pull_refused" if refused else "device_pull_failed",
                 "error": str(exc),
                 "bootstrap_results": bootstrap_results,
                 "check_results": check_results,
@@ -3837,11 +4100,13 @@ def _command_device_pull(args: argparse.Namespace) -> int:
                 "result": build_result_contract(
                     action="device-pull",
                     decision="continue",
-                    failure_stage=device_pull_stage,
-                    retryable=True,
+                    failure_stage="validate_command" if refused else device_pull_stage,
+                    retryable=not refused,
                     stop_reason=str(exc),
                     key_excerpts=[build_excerpt(source="workflow_runner", label="device_pull_failed", text=str(exc), severity="error")],
-                    next_actions=_build_device_pull_next_actions(
+                    next_actions=[{"action": "device-pull", "reason": str(exc)}]
+                    if refused
+                    else _build_device_pull_next_actions(
                         failed_checks=check_results,
                         pull_failed=True,
                         mode=args.mode,
@@ -3855,7 +4120,12 @@ def _command_device_pull(args: argparse.Namespace) -> int:
         )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] device-pull failed: {exc}")
-        print("[TODO] Check the latest session logs for bootstrap, pull, and list command transcripts.")
+        if refused_before_transfer:
+            print(f"[TODO] Stopped before the transfer; only the bootstrap, check and probe commands had run. {exc}")
+        elif refused:
+            print(f"[TODO] Stopped during the transfer; a partial upload may be left in the workspace. {exc}")
+        else:
+            print("[TODO] Check the latest session logs for bootstrap, pull, and list command transcripts.")
         return 1
     finally:
         if server is not None:
@@ -4213,6 +4483,26 @@ def _command_deploy_verify(args: argparse.Namespace) -> int:
         observation=None,
         command_results=[],
     )
+
+    # Before the build: a reboot command refused after the deploy commands ran would leave the device half-done.
+    refusal = _planned_command_refusal(
+        DeviceController(profiles.device, profiles.model, profiles.transport),
+        _user_commands("Post-pull command", list(args.post_pull_command))
+        + ([("Reboot command", args.reboot_command, True, _SHORTEN_USER_COMMAND)] if args.reboot_command else [])
+        + _user_commands("Validation command", list(args.validation_command)),
+    )
+    if refusal is not None:
+        return _report_refused_command(
+            action="deploy-verify",
+            status="deploy_verify_refused",
+            error=refusal[0],
+            advice=refusal[1],
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            carry_forward_options=carry_forward_options,
+            intervention_context=_build_intervention_context(args, artifact=artifact_path),
+        )
 
     try:
         if args.build_command:
@@ -4853,6 +5143,18 @@ def _command_exec(args: argparse.Namespace) -> int:
         print(f"[ERROR] {exc}")
         print("[TODO] Export AUTO_DBG_DEVICE_PASSWORD in this shell, then retry the exec command.")
         return 1
+    except CommandTooLongError as exc:
+        return _report_refused_command(
+            action="exec",
+            status="exec_refused",
+            error=str(exc),
+            # Not "split it into lines": output of multi-line commands is not captured reliably on the device shell.
+            advice="Shorten the command, run it as several exec calls, or put it in a script on the device.",
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            carry_forward_options=_collect_option_patch(args, ["shell_command", "timeout"]),
+        )
     except Exception as exc:
         collector.append_event(
             event_type="serial_exec_failed",
@@ -5324,6 +5626,18 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
     )
 
     controller = DeviceController(profiles.device, profiles.model, profiles.transport)
+    refusal = _planned_command_refusal(controller, _user_commands("Shell command", list(args.shell_command)))
+    if refusal is not None:
+        return _report_refused_command(
+            action="collect-evidence",
+            status="collect_evidence_refused",
+            error=refusal[0],
+            advice=refusal[1],
+            collector=collector,
+            session=session,
+            loop_context=loop_context,
+            carry_forward_options=_collect_option_patch(args, ["shell_command", "remote_file", "skip_defaults", "timeout"]),
+        )
     command_results: list[dict[str, Any]] = []
     file_results: list[dict[str, Any]] = []
 
@@ -5424,7 +5738,7 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
                         build_excerpt(
                             source="evidence_command",
                             label=str(item.get("name", "command_failure")),
-                            text=_format_output_excerpt(item.get("output_lines", [])),
+                            text=_result_excerpt(item),
                             severity="error",
                         )
                         for item in command_failures[:2]
@@ -5454,6 +5768,9 @@ def _command_collect_evidence(args: argparse.Namespace) -> int:
     print(f"[DONE] Remote files fetched: {sum(1 for item in file_results if item.get('status') == 'ok')}/{len(file_results)}")
     if command_failures:
         print(f"[ERROR] Command failures: {len(command_failures)}")
+        for item in command_failures:
+            if item.get("error"):  # refused before sending
+                print(f"[ERROR] {item.get('name')}: {item['error']}")
     if file_failures:
         print(f"[ERROR] File fetch failures: {len(file_failures)}")
     print(f"[ACTIVE] Session directory: {session.session_paths.root}")

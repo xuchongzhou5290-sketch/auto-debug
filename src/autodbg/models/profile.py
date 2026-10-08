@@ -5,12 +5,18 @@ from pathlib import Path
 from typing import Any
 
 
+# Longest line, in UTF-8 bytes, a command may have as typed into the device shell. busybox line editing keeps 1022
+# bytes of a line (measured on the V35S firmware's busybox 1.33.1); this leaves a little margin.
+DEFAULT_MAX_LINE_BYTES = 1000
+
+
 @dataclass(slots=True)
 class SerialSettings:
     port: str
     baudrate: int = 115200
     login_prompt: str = "login:"
     shell_prompt: str = "#"
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES  # 0 turns the check off
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SerialSettings":
@@ -19,6 +25,7 @@ class SerialSettings:
             baudrate=int(raw.get("baudrate", 115200)),
             login_prompt=str(raw.get("login_prompt", "login:")),
             shell_prompt=str(raw.get("shell_prompt", "#")),
+            max_line_bytes=int(raw.get("max_line_bytes", DEFAULT_MAX_LINE_BYTES)),
         )
 
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 import time
 from uuid import uuid4
 
-from autodbg.models.profile import DeviceProfile, ModelProfile, TransportProfile
+from autodbg.models.profile import DEFAULT_MAX_LINE_BYTES, DeviceProfile, ModelProfile, TransportProfile
 from autodbg.serial.runtime import SerialPortProtocol, open_serial_port
 from autodbg.utils.text import contains_shell_prompt, strip_ansi
 
@@ -62,6 +63,18 @@ class LoginRequiredError(RuntimeError):
     """Raised when a password-protected login cannot be completed."""
 
 
+class CommandTooLongError(RuntimeError):
+    """Raised, before anything is sent, for a command with a line the device shell would cut off."""
+
+
+# The terminal driver ends a typed line at either.
+_TYPED_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
+def _new_marker() -> str:
+    return f"__AUTODBG_{uuid4().hex[:8].upper()}__"
+
+
 class DeviceController:
     def __init__(
         self,
@@ -103,6 +116,7 @@ class DeviceController:
         *,
         serial_port: SerialPortProtocol | None = None,
     ) -> CommandResult:
+        self.check_command_length(command)
         if serial_port is None:
             with open_serial_port(
                 self.device_profile.serial.port,
@@ -119,6 +133,8 @@ class DeviceController:
         *,
         serial_port: SerialPortProtocol | None = None,
     ) -> MultiCommandResult:
+        for command in commands:  # all or nothing: refuse before the first one is sent
+            self.check_command_length(command)
         if serial_port is None:
             with open_serial_port(
                 self.device_profile.serial.port,
@@ -193,7 +209,8 @@ class DeviceController:
                 )
             raise RuntimeError("Unable to establish a root shell over serial.")
         transcript = list(login_result.transcript)
-        marker = f"__AUTODBG_{uuid4().hex[:8].upper()}__"
+        self.check_command_length(command)  # backstop for direct callers; execute() checks before opening the port
+        marker = _new_marker()
         begin_marker = f"{marker}_BEGIN"
         end_prefix = f"{marker}_END:"
         self._send_line(serial_port, self._wrap_command(command, marker))
@@ -228,6 +245,28 @@ class DeviceController:
             output_lines=output_lines,
             transcript=transcript,
         )
+
+    def check_command_length(self, command: str) -> None:
+        """Refuse a command any of whose typed lines the device shell would cut off.
+
+        busybox line editing keeps about 1 KB of a line and drops the rest, closing quotes included; the exit code is
+        lost or the shell sits at its continuation prompt, swallowing every later command until someone rescues it by
+        hand. The check is on the line as sent, i.e. wrapped with the begin/end markers, in UTF-8 bytes. Callers with
+        several commands to send check them all before sending the first. The message states the facts only; how to
+        get under the limit depends on the caller.
+        """
+        limit = getattr(self.device_profile.serial, "max_line_bytes", DEFAULT_MAX_LINE_BYTES)
+        if limit <= 0:
+            return
+        lines = _TYPED_LINE_END.split(self._wrap_command(command, _new_marker()))
+        for number, line in enumerate(lines, start=1):
+            size = len(line.encode("utf-8"))
+            if size > limit:
+                where = f"Line {number} of the command" if len(lines) > 1 else "The command"
+                raise CommandTooLongError(
+                    f"{where} would be {size} bytes as typed into the device shell, including what autodbg adds around "
+                    f"it, over the {limit}-byte line limit for the device shell (serial.max_line_bytes in the device profile)."
+                )
 
     @staticmethod
     def _wrap_command(command: str, marker: str) -> str:
