@@ -161,7 +161,7 @@ AI 想先拿自描述清单时，可以直接调用：
 - 只在 `observe-serial` 或明确人工接管时才使用 `watch-serial --raw-live`
 - 只要用户还在看串口，AI 就不应主动执行 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
-- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`（COM1~COM9 是 Windows 保留设备名，目录为 `<COMXX>_port`，如 `COM7_port`；注册与锁文件同理，如 `com7_port.json`）
 
 ## 4. `options` 字段
 

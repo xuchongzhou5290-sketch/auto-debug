@@ -9,6 +9,7 @@ from typing import Any
 
 from autodbg.serial.runtime import (
     SerialTraceEntry,
+    _windows_safe_name,
     append_serial_trace_marker,
     serial_trace_log_dir,
     serial_trace_log_path,
@@ -213,7 +214,8 @@ def _cases_root(port: str) -> Path:
 
 
 def _active_case_path(port: str, safe_case_id: str) -> Path:
-    path = _cases_root(port) / ".active" / f"{safe_case_id}.json"
+    # a case id such as "nul" or "com7" would otherwise name a Windows device (nul.json swallows the write)
+    path = _cases_root(port) / ".active" / f"{_windows_safe_name(safe_case_id)}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

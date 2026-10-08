@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import random
+import re
 import signal
 import socket
 import subprocess
@@ -434,7 +435,8 @@ def _serial_lock_dir() -> Path:
 
 
 def _serial_lock_path(port: str) -> Path:
-    return _serial_lock_dir() / f"{port.lower()}.lock"
+    # normalized like the registry: "\\.\COM7" or "/dev/ttyUSB0" used to escape the lock directory
+    return _serial_lock_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.lock"
 
 
 @contextmanager
@@ -476,7 +478,7 @@ def _serial_control_lock_dir() -> Path:
 
 
 def _serial_control_lock_path(port: str) -> Path:
-    return _serial_control_lock_dir() / f"{port.lower()}.lock"
+    return _serial_control_lock_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.lock"
 
 
 def serial_trace_log_path(port: str) -> Path:
@@ -484,7 +486,7 @@ def serial_trace_log_path(port: str) -> Path:
 
 
 def serial_trace_log_dir(port: str) -> Path:
-    path = _serial_trace_dir() / _serial_log_port_dir_name(port)
+    path = _serial_trace_dir() / _windows_safe_name(_serial_log_port_dir_name(port))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -494,7 +496,7 @@ def append_serial_trace_marker(port: str, marker: str) -> SerialTraceEntry:
 
 
 def serial_broker_registry_path(port: str) -> Path:
-    return _serial_broker_dir() / f"{_normalize_port_name(port)}.json"
+    return _serial_broker_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.json"
 
 
 def write_serial_broker_registry(
@@ -865,6 +867,31 @@ def _normalize_port_name(port: str) -> str:
 
 def _serial_log_port_dir_name(port: str) -> str:
     return port.upper().replace(":", "_").replace("\\", "_").replace("/", "_")
+
+
+# Windows treats these as device names even with an extension or as a directory: "com7.json" opens the COM7 device,
+# "COM7" cannot be a directory, and "nul.json" silently discards whatever is written. On COM1~COM9 that made the
+# broker's registry, port lock and trace directory impossible to create.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul", "conin$", "conout$"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+    + ["com¹", "com²", "com³", "lpt¹", "lpt²", "lpt³"]
+)
+_WINDOWS_NAME_STEM_END = re.compile(r"[.:]")
+
+
+def _windows_safe_name(name: str) -> str:
+    """name, with "_port" inserted after its stem when Windows would read it as a device (com7.json -> com7_port.json).
+
+    Windows decides by the part before the first "." or ":" (trailing spaces ignored), so the suffix goes there.
+    Every other name is returned unchanged, so ports that always worked keep their old file names.
+    """
+    match = _WINDOWS_NAME_STEM_END.search(name)
+    cut = match.start() if match else len(name)
+    if name[:cut].rstrip(" ").lower() not in _WINDOWS_RESERVED_NAMES:
+        return name
+    return f"{name[:cut].rstrip(' ')}_port{name[cut:]}"
 
 
 def _append_trace_entry(port: str, direction: str, payload: str) -> SerialTraceEntry:
