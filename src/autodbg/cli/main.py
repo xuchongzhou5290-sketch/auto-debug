@@ -4925,6 +4925,24 @@ def _command_exec(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fetch_failure_next_actions(action: str, fetch_result: dict[str, Any]) -> list[dict[str, str]] | None:
+    # A refused request or a missing path fails the same way again; the default next action would be a plain retry.
+    if fetch_result.get("retryable", True):
+        return None
+    return [{"action": action, "reason": "Retrying the same request fails the same way; change --remote-path or --output."}]
+
+
+def _print_fetch_failure_todo(action: str, fetch_result: dict[str, Any]) -> None:
+    # Agents report the last printed line as the error, so it carries the reason.
+    error = fetch_result.get("error", f"Unknown {action} error")
+    if fetch_result.get("sent") is False:
+        print(f"[TODO] Nothing was sent to the device: {error}")
+    elif fetch_result.get("retryable", True):
+        print(f"[TODO] See the {action} output/transcript in the session logs: {error}")
+    else:
+        print(f"[TODO] Retrying the same request will not help: {error}")
+
+
 def _command_fetch_file(args: argparse.Namespace) -> int:
     profiles = _load_profiles_from_args(args)
     session, loop_context = _create_session_with_loop(
@@ -4954,9 +4972,16 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
     )
 
     controller = DeviceController(profiles.device, profiles.model, profiles.transport)
-    fetch_command = _build_fetch_file_command(args.remote_path)
     try:
-        result = controller.execute(fetch_command, timeout=args.timeout)
+        # One transfer: this used to run the fetch command itself, drop the result, then fetch the file a second time.
+        fetch_result = _fetch_remote_file_artifact(
+            controller=controller,
+            collector=collector,
+            remote_path=args.remote_path,
+            timeout=args.timeout,
+            prefix="fetch-file",
+            output_path=args.output,
+        )
     except LoginRequiredError as exc:
         collector.append_event(
             event_type="fetch_file_blocked",
@@ -5016,14 +5041,6 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
         print("[TODO] Check whether the COM port is occupied or the device is not ready.")
         return 1
 
-    fetch_result = _fetch_remote_file_artifact(
-        controller=controller,
-        collector=collector,
-        remote_path=args.remote_path,
-        timeout=args.timeout,
-        prefix="fetch-file",
-        output_path=args.output,
-    )
     collector.append_event(
         event_type="fetch_file_command",
         source="device_controller",
@@ -5043,8 +5060,9 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
                     action="fetch-file",
                     decision="continue",
                     failure_stage="fetch_file",
-                    retryable=True,
+                    retryable=fetch_result.get("retryable", True),
                     stop_reason=fetch_result.get("error", "Unknown fetch-file error"),
+                    next_actions=_fetch_failure_next_actions("fetch-file", fetch_result),
                     key_excerpts=[
                         build_excerpt(
                             source="fetch_file",
@@ -5061,7 +5079,7 @@ def _command_fetch_file(args: argparse.Namespace) -> int:
         )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] {fetch_result.get('error', 'Unknown fetch-file error')}")
-        print("[TODO] Inspect the fetch-file output/transcript to see whether the file exists and base64 is available.")
+        _print_fetch_failure_todo("fetch-file", fetch_result)
         return 1
 
     state.transition_task(TaskState.COMPLETED, "Device file fetched successfully.")
@@ -5213,8 +5231,9 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
                     action="fetch-path",
                     decision="continue",
                     failure_stage="fetch_path",
-                    retryable=True,
+                    retryable=fetch_result.get("retryable", True),
                     stop_reason=fetch_result.get("error", "Unknown fetch-path error"),
+                    next_actions=_fetch_failure_next_actions("fetch-path", fetch_result),
                     key_excerpts=[
                         build_excerpt(
                             source="fetch_path",
@@ -5231,7 +5250,7 @@ def _command_fetch_path(args: argparse.Namespace) -> int:
         )
         print("[ oxx.. ] 2/5 steps")
         print(f"[ERROR] {fetch_result.get('error', 'Unknown fetch-path error')}")
-        print("[TODO] Inspect the fetch-path output/transcript to see whether the path exists and tar/base64 are available.")
+        _print_fetch_failure_todo("fetch-path", fetch_result)
         return 1
 
     state.transition_task(TaskState.COMPLETED, "Device path fetched successfully.")

@@ -196,12 +196,7 @@ class DeviceController:
         marker = f"__AUTODBG_{uuid4().hex[:8].upper()}__"
         begin_marker = f"{marker}_BEGIN"
         end_prefix = f"{marker}_END:"
-        wrapped_command = (
-            f"printf '{begin_marker}\\n'; "
-            f"{command}; "
-            f"printf '{end_prefix}%s\\n' $?"
-        )
-        self._send_line(serial_port, wrapped_command)
+        self._send_line(serial_port, self._wrap_command(command, marker))
 
         output_lines: list[str] = []
         exit_code: int | None = None
@@ -233,6 +228,14 @@ class DeviceController:
             output_lines=output_lines,
             transcript=transcript,
         )
+
+    @staticmethod
+    def _wrap_command(command: str, marker: str) -> str:
+        # The '' splits each marker as typed, so the shell's echo of this line never holds "<marker>_BEGIN" or
+        # "<marker>_END:". The device echoes the line wrapped at 80 columns; when a wrapped row began with the typed
+        # end marker it was taken for the real one (exit code None before the command had even run). echo also keeps
+        # the line shorter than printf did, which matters under the device line editor's ~1 KB limit.
+        return f"echo {marker}''_BEGIN; {command}; echo {marker}''_END:$?"
 
     @staticmethod
     def _read_line(serial_port: SerialPortProtocol) -> str | None:

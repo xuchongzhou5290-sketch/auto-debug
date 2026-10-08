@@ -881,8 +881,8 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 _WINDOWS_NAME_STEM_END = re.compile(r"[.:]")
 
 
-def _windows_safe_name(name: str) -> str:
-    """name, with "_port" inserted after its stem when Windows would read it as a device (com7.json -> com7_port.json).
+def _windows_safe_name(name: str, suffix: str = "_port") -> str:
+    """name, with suffix inserted after its stem when Windows would read it as a device (com7.json -> com7_port.json).
 
     Windows decides by the part before the first "." or ":" (trailing spaces ignored), so the suffix goes there.
     Every other name is returned unchanged, so ports that always worked keep their old file names.
@@ -891,7 +891,7 @@ def _windows_safe_name(name: str) -> str:
     cut = match.start() if match else len(name)
     if name[:cut].rstrip(" ").lower() not in _WINDOWS_RESERVED_NAMES:
         return name
-    return f"{name[:cut].rstrip(' ')}_port{name[cut:]}"
+    return f"{name[:cut].rstrip(' ')}{suffix}{name[cut:]}"
 
 
 def _append_trace_entry(port: str, direction: str, payload: str) -> SerialTraceEntry:

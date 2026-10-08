@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import socket
 from typing import Any
 from urllib.parse import urlparse
@@ -12,12 +13,15 @@ from urllib.parse import urlparse
 from autodbg.control.controller import CommandResult, DeviceController
 from autodbg.evidence.collector import EvidenceCollector
 from autodbg.host.bundle import split_base64_payload
+from autodbg.serial.runtime import _windows_safe_name
 
 
 _FETCH_META_PREFIX = "__AUTODBG_META__"
 _FETCH_B64_PREFIX = "__AUTODBG_B64__"
 _STRUCTURED_OUTPUT_PREFIX = "__AUTODBG_CMD__"
 _DEFAULT_PREFERRED_INTERFACES = ("eth0", "wlan0", "usb0", "wlan1", "ra0", "apcli0")
+# Characters Windows does not allow in a file name; a device-side (POSIX) name may contain all but "/" and NUL.
+_WINDOWS_INVALID_NAME_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
 
 
 def _cli_main_module():
@@ -282,46 +286,88 @@ def _build_transfer_probe_command(sd_http_helper_path: str | None = None) -> str
     )
 
 
+# The fetch commands run in a subshell: the controller types them into the device's login shell, where "exit 2" used
+# to log that shell out, so the end marker never came and the fetch waited out its timeout. The remote path is quoted
+# once into $p and only used as "$p" or a printf argument: a "'" in it used to leave a quote open (the shell then sat
+# at its ">" prompt), "%" and "\" were read as printf format, and the path was typed up to seven times.
+_FETCH_MISSING_COMMAND = "printf 'AUTODBG_FETCH_MISSING %s\\n' \"$p\" >&2; exit 2"
+_FETCH_B64_LINES_COMMAND = "while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done"
+
+
+def _build_fetch_meta_command(mode: str) -> str:
+    return f"printf '{_FETCH_META_PREFIX}MODE={mode}\\n{_FETCH_META_PREFIX}SOURCE=%s\\n' \"$p\""
+
+
 def _build_fetch_file_command(remote_path: str) -> str:
-    quoted_remote_path = _sh_single_quote(remote_path)
-    mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=file\n")
-    source_meta = _sh_single_quote(_FETCH_META_PREFIX + "SOURCE=" + remote_path + "\n")
     return (
-        f"if [ ! -f {quoted_remote_path} ]; then "
-        f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
-        "exit 2; "
-        "fi; "
-        f"printf {mode_meta}; "
-        f"printf {source_meta}; "
-        f"base64 < {quoted_remote_path} | "
-        "while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done"
+        f"(p={_sh_single_quote(remote_path)}; "
+        f"if [ ! -f \"$p\" ]; then {_FETCH_MISSING_COMMAND}; fi; "
+        f"{_build_fetch_meta_command('file')}; "
+        f"base64 < \"$p\" | {_FETCH_B64_LINES_COMMAND})"
     )
 
 
 def _build_fetch_path_command(remote_path: str) -> str:
-    quoted_remote_path = _sh_single_quote(remote_path)
-    file_mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=file\n")
-    tar_mode_meta = _sh_single_quote(_FETCH_META_PREFIX + "MODE=tar\n")
-    source_meta = _sh_single_quote(_FETCH_META_PREFIX + "SOURCE=" + remote_path + "\n")
     return (
-        f"if [ -f {quoted_remote_path} ]; then "
-        f"printf {file_mode_meta}; "
-        f"printf {source_meta}; "
-        f"base64 < {quoted_remote_path} | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
-        f"elif [ -d {quoted_remote_path} ]; then "
-        f"printf {tar_mode_meta}; "
-        f"printf {source_meta}; "
-        f"tar -cf - {quoted_remote_path} | base64 | while IFS= read -r line; do printf '__AUTODBG_B64__%s\\n' \"$line\"; done; "
-        "else "
-        f"echo 'AUTODBG_FETCH_MISSING {remote_path}' >&2; "
-        "exit 2; "
-        "fi"
+        f"(p={_sh_single_quote(remote_path)}; "
+        f"if [ -f \"$p\" ]; then {_build_fetch_meta_command('file')}; "
+        f"base64 < \"$p\" | {_FETCH_B64_LINES_COMMAND}; "
+        f"elif [ -d \"$p\" ]; then {_build_fetch_meta_command('tar')}; "
+        # "--": a relative directory such as "-n" is otherwise read as a tar option.
+        f"tar -cf - -- \"$p\" | base64 | {_FETCH_B64_LINES_COMMAND}; "
+        f"else {_FETCH_MISSING_COMMAND}; fi)"
     )
 
 
+# The device's login shell reads the command through busybox's line editor. It keeps about 1 KB of a line and drops the
+# rest, closing quote included, after which the shell waits at its continuation prompt for good; control characters
+# are editing keys there (TAB completes, DEL deletes, ^A moves the cursor), so a path holding one would fetch some
+# other path. Such a fetch is refused before anything is sent. The controller adds about 90 bytes around the command.
+_FETCH_COMMAND_MAX_BYTES = 900
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _fetch_command_problem(remote_path: str, command: str, output_path: Path | None = None) -> str | None:
+    if _CONTROL_CHARS.search(remote_path):
+        return f"Remote path {remote_path!r} contains control characters, which the device shell's line editor would act on."
+    size = len(command.encode("utf-8"))
+    if size > _FETCH_COMMAND_MAX_BYTES:
+        return (
+            f"Remote path is too long to type into the device shell: the fetch command would be {size} bytes, over the "
+            f"{_FETCH_COMMAND_MAX_BYTES}-byte limit. Fetch a parent directory with fetch-path instead."
+        )
+    if output_path is not None and os.name == "nt":
+        # Every component counts: Windows resolves a parent folder named COM5 to the COM5 port as well.
+        if str(output_path).startswith(("\\\\.\\", "\\\\?\\", "//./", "//?/")):
+            return f"Output {output_path} is in the Windows device namespace."
+        for part in output_path.parts:
+            if part != output_path.anchor and _windows_safe_name(part) != part:
+                return f"Output {output_path} names a Windows device ({part}), so it would be written to that device."
+    return None
+
+
+def _refused_fetch_result(remote_path: str, problem: str) -> dict[str, Any]:
+    return {"remote_path": remote_path, "status": "error", "error": problem, "sent": False, "retryable": False}
+
+
+def _local_safe_name(name: str) -> str:
+    """One device-side path component as a local file name that stays a plain file inside fetched/.
+
+    Characters Windows rejects (including "\\", which it would read as a separator) become "_"; a trailing "." or
+    " " gets "_" after it because Windows strips them ("a." would land on "a", and ".." would climb out of
+    fetched/); a device name such as con or com1.log gets "_" after its stem (com1_.log), or it would be opened
+    as that device.
+    """
+    safe = _WINDOWS_INVALID_NAME_CHARS.sub("_", name)
+    if safe.endswith((".", " ")):
+        safe += "_"
+    return _windows_safe_name(safe, suffix="_")
+
+
 def _fetch_artifact_relative_path(remote_path: str) -> str:
-    parts = [part for part in PurePosixPath(remote_path).parts if part not in {"", "/"}]
-    safe_parts = [part.replace(":", "_") for part in parts] or ["fetched-device-file.bin"]
+    # strip("/") also drops the "//" root, which would otherwise make this a UNC path to another machine.
+    parts = [part for part in PurePosixPath(remote_path).parts if part.strip("/")]
+    safe_parts = [_local_safe_name(part) for part in parts] or ["fetched-device-file.bin"]
     return str(Path("fetched").joinpath(*safe_parts))
 
 
@@ -350,8 +396,12 @@ def _fetch_remote_file_artifact(
     serial_port=None,
     output_path: Path | None = None,
 ) -> dict[str, Any]:
+    command = _build_fetch_file_command(remote_path)
+    problem = _fetch_command_problem(remote_path, command, output_path)
+    if problem is not None:
+        return _refused_fetch_result(remote_path, problem)
     result = controller.execute(
-        _build_fetch_file_command(remote_path),
+        command,
         timeout=timeout,
         serial_port=serial_port,
     )
@@ -374,8 +424,12 @@ def _fetch_remote_path_artifact(
     serial_port=None,
     output_path: Path | None = None,
 ) -> dict[str, Any]:
+    command = _build_fetch_path_command(remote_path)
+    problem = _fetch_command_problem(remote_path, command, output_path)
+    if problem is not None:
+        return _refused_fetch_result(remote_path, problem)
     result = controller.execute(
-        _build_fetch_path_command(remote_path),
+        command,
         timeout=timeout,
         serial_port=serial_port,
     )
@@ -396,12 +450,23 @@ def _finalize_fetch_result(
     result,
     output_path: Path | None = None,
 ) -> dict[str, Any]:
-    _write_command_artifacts(collector=collector, prefix=prefix, result=result)
+    _cli_main_module()._write_command_artifacts(
+        collector=collector,
+        prefix=prefix,
+        result=result,
+    )
     fetch_summary: dict[str, Any] = {
         "remote_path": remote_path,
         "command_result": result.to_dict(),
         "status": "error",
     }
+    if result.exit_code == 2 and any(line.startswith("AUTODBG_FETCH_MISSING ") for line in result.output_lines):
+        fetch_summary["error"] = (
+            "Remote path is missing on the device or is not a type this command fetches "
+            f"(fetch-file: regular file; fetch-path: file or directory): {remote_path}"
+        )
+        fetch_summary["retryable"] = False
+        return fetch_summary
     if result.exit_code != 0:
         fetch_summary["error"] = f"Remote fetch command returned exit code {result.exit_code}"
         return fetch_summary
@@ -418,30 +483,36 @@ def _finalize_fetch_result(
         fetch_summary["error"] = f"Failed to decode base64 output: {exc}"
         return fetch_summary
 
-    if output_path is None:
-        relative_path = _fetch_artifact_relative_path(remote_path)
-        if mode == "tar":
-            relative_path += ".tar"
-        local_path = collector.write_retrieved_artifact(
-            relative_path,
-            payload,
-            artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
-        )
-    else:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(payload)
-        collector.write_text_artifact("logs/fetched-external-output-path.txt", str(output_path) + "\n")
-        local_path = collector.register_artifact(
-            output_path,
-            artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
-        )
+    try:
+        if output_path is None:
+            relative_path = _fetch_artifact_relative_path(remote_path)
+            if mode == "tar":
+                relative_path += ".tar"
+            local_path = collector.write_retrieved_artifact(
+                relative_path,
+                payload,
+                artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
+            )
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(payload)
+            collector.write_text_artifact("logs/fetched-external-output-path.txt", str(output_path) + "\n")
+            local_path = collector.register_artifact(
+                output_path,
+                artifact_type="retrieved_tar" if mode == "tar" else "retrieved_file",
+            )
+    except OSError as exc:
+        # e.g. a 255-character device name that is one character too long for NTFS once made safe; report it
+        # instead of failing a whole collect-evidence run.
+        fetch_summary["error"] = f"Fetched {len(payload)} bytes but could not save them locally: {exc}"
+        return fetch_summary
 
     fetch_summary.update(
         {
             "status": "ok",
             "local_path": str(local_path),
             "size_bytes": len(payload),
-            "sha256": _sha256_bytes(payload),
+            "sha256": _cli_main_module()._sha256_bytes(payload),
         }
     )
     return fetch_summary

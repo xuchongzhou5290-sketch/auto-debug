@@ -392,16 +392,18 @@ class CliMainTest(unittest.TestCase):
 
     def test_build_fetch_file_command_wraps_file_check_and_base64(self) -> None:
         command = _build_fetch_file_command("/mnt/sdcard/autodbg/hello.txt")
-        self.assertIn("AUTODBG_FETCH_MISSING /mnt/sdcard/autodbg/hello.txt", command)
+        self.assertIn("p='/mnt/sdcard/autodbg/hello.txt'", command)
+        self.assertIn("AUTODBG_FETCH_MISSING %s", command)
         self.assertIn("AUTODBG_META__MODE=file", command)
         self.assertIn("AUTODBG_B64__", command)
-        self.assertIn("base64 < '/mnt/sdcard/autodbg/hello.txt'", command)
+        self.assertIn('base64 < "$p"', command)
 
     def test_build_fetch_path_command_supports_file_and_directory(self) -> None:
         command = _build_fetch_path_command("/mnt/sdcard/autodbg")
+        self.assertIn("p='/mnt/sdcard/autodbg'", command)
         self.assertIn("AUTODBG_META__MODE=file", command)
         self.assertIn("AUTODBG_META__MODE=tar", command)
-        self.assertIn("tar -cf - '/mnt/sdcard/autodbg'", command)
+        self.assertIn('tar -cf - -- "$p"', command)
 
     def test_parse_fetch_output_lines_extracts_metadata_and_payload(self) -> None:
         metadata, payload_lines = _parse_fetch_output_lines(
