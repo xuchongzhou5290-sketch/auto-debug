@@ -263,14 +263,14 @@ def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="TEXT",
-        help="Serial output text that must appear in the observation window (repeatable)",
+        help="Text that must appear in the serial observation window or --validation-command output (repeatable)",
     )
     parser.add_argument(
         "--reject-marker",
         action="append",
         default=[],
         metavar="TEXT",
-        help="Serial output text that must not appear in the observation window (repeatable)",
+        help="Text that must not appear in the serial observation window or --validation-command output (repeatable)",
     )
     parser.add_argument("--expected-version", help="Version text that must appear in appver or validation output")
 
@@ -1325,7 +1325,9 @@ def _evaluate_validation_spec(
         for result in (command_results or [])
         if isinstance(result, dict)
     )
-    search_text = "\n".join(value for value in [observed_text, command_text, app_version or ""] if value)
+    # Markers are checked against serial observation and validation command output, never the command text itself.
+    marker_text = "\n".join(value for value in [observed_text, command_text] if value)
+    search_text = "\n".join(value for value in [marker_text, app_version or ""] if value)
 
     for command_result in command_results or []:
         if command_result.get("exit_code") != 0:
@@ -1338,21 +1340,21 @@ def _evaluate_validation_spec(
                 }
             )
     for marker in expect_markers or []:
-        if marker not in observed_text:
+        if marker not in marker_text:
             findings.append(
                 {
                     "level": "error",
                     "check_name": "expect_marker",
-                    "message": f"Expected serial marker not observed: {marker}",
+                    "message": f"Expected marker not found in serial observation or validation command output: {marker}",
                 }
             )
     for marker in reject_markers or []:
-        if marker and marker in observed_text:
+        if marker and marker in marker_text:
             findings.append(
                 {
                     "level": "error",
                     "check_name": "reject_marker",
-                    "message": f"Rejected serial marker observed: {marker}",
+                    "message": f"Rejected marker found in serial observation or validation command output: {marker}",
                 }
             )
     if expected_version and expected_version not in search_text:

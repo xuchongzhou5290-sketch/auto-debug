@@ -867,6 +867,53 @@ class CliMainTest(unittest.TestCase):
         self.assertIn("reject_marker", check_names)
         self.assertIn("expected_version", check_names)
 
+    def test_evaluate_validation_spec_matches_markers_in_validation_command_output(self) -> None:
+        # device-pull --validation-command "md5sum <file>" --expect-marker <md5>, no --post-observe-seconds
+        md5_result = {
+            "command": "md5sum /mnt/sdcard/fw/update.tar",
+            "exit_code": 0,
+            "output_lines": ["13e66966e8d539e544d43ea192264f81  /mnt/sdcard/fw/update.tar"],
+        }
+        validation = _evaluate_validation_spec(
+            expect_markers=["13e66966e8d539e544d43ea192264f81"],
+            reject_markers=[],
+            expected_version=None,
+            observation=None,
+            command_results=[md5_result],
+        )
+        self.assertEqual(validation["verdict"], "pass", validation["findings"])
+
+        validation = _evaluate_validation_spec(
+            expect_markers=[],
+            reject_markers=["No such file"],
+            expected_version=None,
+            observation=None,
+            command_results=[
+                {
+                    "command": "md5sum /mnt/sdcard/fw/missing.tar",
+                    "exit_code": 0,
+                    "output_lines": ["md5sum: /mnt/sdcard/fw/missing.tar: No such file or directory"],
+                }
+            ],
+        )
+        self.assertEqual([finding["check_name"] for finding in validation["findings"]], ["reject_marker"])
+
+    def test_evaluate_validation_spec_does_not_match_markers_in_the_command_text(self) -> None:
+        validation = _evaluate_validation_spec(
+            expect_markers=["13e66966e8d539e544d43ea192264f81"],
+            reject_markers=[],
+            expected_version=None,
+            observation=None,
+            command_results=[
+                {
+                    "command": "md5sum /mnt/sdcard/fw/update.tar | grep 13e66966e8d539e544d43ea192264f81",
+                    "exit_code": 0,
+                    "output_lines": [],
+                }
+            ],
+        )
+        self.assertEqual([finding["check_name"] for finding in validation["findings"]], ["expect_marker"])
+
     def test_load_profiles_from_args_uses_defaults_manifest(self) -> None:
         root = Path(__file__).resolve().parents[2]
         args = argparse.Namespace(
