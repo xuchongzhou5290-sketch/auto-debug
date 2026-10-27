@@ -464,8 +464,38 @@ $arguments = @(
 Push-Location $projectRoot
 try {
     & $python @arguments
-    exit $LASTEXITCODE
+    $exitCode = $LASTEXITCODE
 }
 finally {
     Pop-Location
 }
+
+$statusFile = $env:AUTO_DBG_OBSERVE_STATUS_FILE
+if ($statusFile -and -not (Test-Path -LiteralPath $statusFile)) {
+    # launched by an autodbg call that waits for this window: report the exit before the pause below, because
+    # the window then stays open and that caller would otherwise wait it out (python records its own errors)
+    try {
+        Set-Content -LiteralPath $statusFile -Value ('{"exit_code": ' + [int]$exitCode + '}') -Encoding ASCII
+    }
+    catch {
+    }
+}
+
+if ($exitCode -ne 0 -and -not [Console]::IsInputRedirected) {
+    # keep a failed window open long enough to read why; a window launched for an AI client used to vanish at once
+    Write-Host ""
+    Write-Host "[TODO] observe-serial exited with code $exitCode. Press any key to close this window (closes by itself in 120 s)."
+    $closeAt = (Get-Date).AddSeconds(120)
+    try {
+        while ((Get-Date) -lt $closeAt) {
+            if ([Console]::KeyAvailable) {
+                [void][Console]::ReadKey($true)
+                break
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    catch {
+    }
+}
+exit $exitCode

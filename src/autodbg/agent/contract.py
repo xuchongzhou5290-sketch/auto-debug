@@ -1173,6 +1173,8 @@ def build_agent_tool_manifest(*, project_root: Path) -> dict[str, Any]:
                 "AI clients use watch-serial without raw_live by default so they follow the observe-serial trace instead of opening the COM port themselves.",
                 "observe-serial is the long-lived owner of the physical COM port; run, exec, health, collect-evidence, device-pull, and observe connect through that shared broker.",
                 "Serial trace logs default to <project_root>\\autodbg\\serial-log\\<COMXX>\\trace.jsonl (COM1~COM9 use <COMXX>_port, e.g. COM7_port, because Windows reserves those names).",
+                "The broker that owns the port rotates trace.jsonl to trace.<YYYYmmdd-HHMMSS>.jsonl in the same folder once it reaches AUTO_DBG_SERIAL_TRACE_MAX_BYTES (default 64 MiB), keeping the newest AUTO_DBG_SERIAL_TRACE_KEEP (default 30, 0 keeps all); older lines are in those files, and case-begin/case-end slices span them.",
+                "An auto-launched observe-serial window gets up to 60 s to open the port; while one is starting for a port, other calls wait for it instead of opening another, and if it cannot open the port the call fails at once with the window's reason. Do not retry by opening observe-serial again.",
                 "Do not stop a protected observe-serial broker unless the user confirms the observation window can be closed; force is required for that case.",
             ],
         },

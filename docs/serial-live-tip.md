@@ -33,7 +33,10 @@ $env:AUTO_DBG_DEVICE_PASSWORD = "your-root-password"
 - 将新启动的 broker 标记为人工观察会话，普通 `serial-broker stop` 不会直接踢掉这个窗口
 - 持续输出共享串口 trace
 - 优先直连 broker 的实时 trace 推流，不再只靠 0.3 秒轮询 trace 文件
-- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`，达到 64 MiB 时自动轮转为 `trace.<YYYYmmdd-HHMMSS>.jsonl`（默认保留最近 30 个）
+- 启动时不读取历史 trace（`-Tail N` 只从文件尾读 N 行），trace 再大窗口也是先打开串口、立即显示
+- 打开串口失败时窗口不会立刻关闭，会显示真实原因和处理建议
+- 串口断开（设备重启、USB 拔插）后会每 1–2 秒自动重连，状态栏一直显示断开原因，直到重连成功
 - 在观察窗口里可以直接输入 shell 命令，按回车发送到串口
 - 空回车会先尝试重连串口，再发送一个换行探针，并显示连接/发送结果
 - `Ctrl+L` 会按当前 device profile 走一遍自动登录流程

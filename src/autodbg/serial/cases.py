@@ -11,8 +11,12 @@ from autodbg.serial.runtime import (
     SerialTraceEntry,
     _windows_safe_name,
     append_serial_trace_marker,
+    serial_trace_file_id,
     serial_trace_log_dir,
     serial_trace_log_path,
+    serial_trace_rotated_paths,
+    serial_trace_rotation_stamp,
+    serial_trace_stat,
 )
 
 
@@ -62,8 +66,10 @@ def begin_serial_case(
             if active_metadata.get("status") == "active":
                 raise FileExistsError(f"Serial case already active for {port} case_id={case_id}.")
     trace_path = serial_trace_log_path(port)
-    start_line = _count_lines(trace_path)
     started_at = _now()
+    # a byte offset plus the file's identity: counting lines meant reading the whole (multi-GB) trace, and the
+    # broker may rotate trace.jsonl to trace.<stamp>.jsonl before the case ends
+    start_offset, trace_file_id = serial_trace_stat(trace_path)
     case_dir = _cases_root(port) / f"{_timestamp_slug(started_at)}-{safe_case_id}"
     case_dir.mkdir(parents=True, exist_ok=False)
 
@@ -77,8 +83,9 @@ def begin_serial_case(
         "result": None,
         "started_at": started_at,
         "ended_at": None,
-        "start_line": start_line,
-        "end_line": None,
+        "start_offset": start_offset,
+        "end_offset": None,
+        "trace_file_id": trace_file_id,
         "trace_path": str(trace_path),
         "case_dir": str(case_dir),
     }
@@ -108,10 +115,11 @@ def end_serial_case(
     metadata = _read_json(metadata_path)
     append_serial_trace_marker(port, _case_marker("CASE_END", case_id=case_id, result=result, note=note))
 
-    trace_path = Path(str(metadata.get("trace_path") or serial_trace_log_path(port)))
-    start_line = int(metadata.get("start_line", 0) or 0)
-    end_line = _count_lines(trace_path)
-    entries = _read_trace_entries(trace_path, start_line=start_line, end_line=end_line)
+    if not metadata.get("trace_path"):
+        metadata["trace_path"] = str(serial_trace_log_path(port))
+    # the end is a position in a particular file: the broker may rotate trace.jsonl before it is read
+    end_offset, end_file_id = serial_trace_stat(Path(str(metadata["trace_path"])))
+    entries = _case_trace_entries(metadata, end_offset=end_offset, end_file_id=end_file_id)
     trace_jsonl_path = case_dir / "trace.jsonl"
     trace_text_path = case_dir / "trace.txt"
     evidence_patch_path = case_dir / "evidence_patch.md"
@@ -123,7 +131,8 @@ def end_serial_case(
             "status": "ended",
             "result": result,
             "ended_at": _now(),
-            "end_line": end_line,
+            "end_offset": end_offset,
+            "end_file_id": end_file_id,
             "line_count": len(entries),
             "end_note": note,
             "trace_jsonl_path": str(trace_jsonl_path),
@@ -197,14 +206,72 @@ def _case_entries_from_metadata(metadata: dict[str, Any]) -> list[SerialTraceEnt
     trace_jsonl_path = metadata.get("trace_jsonl_path")
     if trace_jsonl_path and Path(str(trace_jsonl_path)).is_file():
         return _read_trace_entries(Path(str(trace_jsonl_path)))
-    trace_path = Path(str(metadata.get("trace_path")))
-    start_line = int(metadata.get("start_line", 0) or 0)
-    end_line = metadata.get("end_line")
-    return _read_trace_entries(
-        trace_path,
-        start_line=start_line,
-        end_line=int(end_line) if end_line is not None else None,
+    end_offset = metadata.get("end_offset")
+    return _case_trace_entries(
+        metadata,
+        end_offset=int(end_offset) if end_offset is not None else None,
+        end_file_id=metadata.get("end_file_id"),
     )
+
+
+def _case_trace_entries(
+    metadata: dict[str, Any],
+    *,
+    end_offset: int | None,
+    end_file_id: str | None = None,
+) -> list[SerialTraceEntry]:
+    """The case's slice of the trace: from where it began, across any rotations, to end_offset in the end file.
+
+    The end file is the one with end_file_id; without one it is trace.jsonl.
+    """
+    trace_path = Path(str(metadata.get("trace_path")))
+    segments = _case_trace_segments(trace_path, metadata)
+    if "start_offset" not in metadata:
+        # begun by an autodbg from before byte offsets: a line range within the file the case began in
+        end_line = metadata.get("end_line")
+        if end_line is not None:
+            return _read_trace_entries(segments[0], start_line=int(metadata.get("start_line") or 0), end_line=int(end_line))
+    end_index = len(segments) - 1
+    if end_file_id:
+        end_index = next(
+            (index for index, segment in enumerate(segments) if serial_trace_file_id(segment) == end_file_id),
+            end_index,
+        )
+    entries: list[SerialTraceEntry] = []
+    for index, segment in enumerate(segments[: end_index + 1]):
+        first = index == 0
+        entries.extend(
+            _read_trace_entries(
+                segment,
+                start_offset=int(metadata.get("start_offset") or 0) if first else 0,
+                start_line=int(metadata.get("start_line") or 0) if first and "start_offset" not in metadata else 0,
+                end_offset=end_offset if index == end_index else None,
+            )
+        )
+    return entries
+
+
+def _case_trace_segments(trace_path: Path, metadata: dict[str, Any]) -> list[Path]:
+    """The files holding the case, oldest first: the file trace.jsonl was when it began, then any newer ones."""
+    start_file_id = metadata.get("trace_file_id")
+    start_offset = int(metadata.get("start_offset") or 0)
+
+    def began_in(path: Path) -> bool:
+        size, file_id = serial_trace_stat(path)
+        # a file shorter than the start offset is not it, whatever its id says (FAT reuses ids after a rename)
+        return file_id == start_file_id and size >= start_offset
+
+    if start_file_id and began_in(trace_path):
+        return [trace_path]
+    rotated = serial_trace_rotated_paths(trace_path)
+    if start_file_id:
+        for index, path in enumerate(rotated):
+            if began_in(path):
+                return [*rotated[index:], trace_path]
+    # no usable file identity (or a legacy case): segments rotated since the case began
+    started_stamp = _timestamp_slug(str(metadata.get("started_at") or ""))
+    newer = [path for path in rotated if (serial_trace_rotation_stamp(path) or "") >= started_stamp]
+    return [*newer, trace_path]
 
 
 def _cases_root(port: str) -> Path:
@@ -273,37 +340,37 @@ def _case_marker(kind: str, **fields: str | None) -> str:
     return " ".join(chunks)
 
 
-def _count_lines(path: Path) -> int:
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return sum(1 for _line in handle)
-    except FileNotFoundError:
-        return 0
-
-
 def _read_trace_entries(
     path: Path,
     *,
+    start_offset: int = 0,
+    end_offset: int | None = None,
     start_line: int = 0,
     end_line: int | None = None,
 ) -> list[SerialTraceEntry]:
     entries: list[SerialTraceEntry] = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for index, line in enumerate(handle):
-                if index < start_line:
-                    continue
-                if end_line is not None and index >= end_line:
-                    break
-                cleaned = line.strip()
-                if not cleaned:
-                    continue
-                try:
-                    entries.append(SerialTraceEntry.from_json_line(cleaned))
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    continue
+        handle = path.open("rb")
     except FileNotFoundError:
         return []
+    with handle:
+        handle.seek(start_offset)
+        position = start_offset
+        for index, raw_line in enumerate(handle):
+            position += len(raw_line)
+            if end_offset is not None and position > end_offset:
+                break
+            if end_line is not None and index >= end_line:
+                break
+            if index < start_line:
+                continue
+            cleaned = raw_line.decode("utf-8", errors="replace").strip()
+            if not cleaned:
+                continue
+            try:
+                entries.append(SerialTraceEntry.from_json_line(cleaned))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
     return entries
 
 

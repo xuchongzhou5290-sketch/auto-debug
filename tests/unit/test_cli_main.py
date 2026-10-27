@@ -66,7 +66,6 @@ from autodbg.cli.main import (
     _evaluate_validation_spec,
     _load_profiles_from_args,
     _read_trace_entries,
-    _resolve_watch_start_index,
     _resolve_bootstrap_commands,
     _resolve_connectivity_checks,
     _resolve_pull_base_url,
@@ -995,24 +994,6 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(_format_trace_entry(entries[0]), "[TX 03:30:00] root")
 
-    def test_resolve_watch_start_index_skips_existing_lines_when_tail_zero(self) -> None:
-        self.assertEqual(
-            _resolve_watch_start_index(last_count=12, entry_count=15, tail=0, replay_existing=False),
-            12,
-        )
-        self.assertEqual(
-            _resolve_watch_start_index(last_count=0, entry_count=12, tail=3, replay_existing=True),
-            9,
-        )
-        self.assertEqual(
-            _resolve_watch_start_index(last_count=0, entry_count=1, tail=0, replay_existing=False),
-            0,
-        )
-        self.assertEqual(
-            _resolve_watch_start_index(last_count=7, entry_count=7, tail=0, replay_existing=False),
-            7,
-        )
-
     def test_command_watch_serial_raw_live_follow_warns_about_holding_port(self) -> None:
         args = argparse.Namespace(
             serial_port="COM19",
@@ -1802,7 +1783,7 @@ class CliMainTest(unittest.TestCase):
             _print_watch_trace_entry(entry, show_system=False)
 
         self.assertTrue(any("COM19 is unavailable: Permission denied" in call.args[0] for call in print_mock.call_args_list))
-        self.assertTrue(any("Press Enter to retry reconnecting COM19." in call.args[0] for call in print_mock.call_args_list))
+        self.assertTrue(any("keeps retrying COM19" in call.args[0] for call in print_mock.call_args_list))
 
     def test_command_serial_broker_list_and_stop(self) -> None:
         registry = SerialBrokerRegistry(

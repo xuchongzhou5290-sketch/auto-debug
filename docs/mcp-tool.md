@@ -348,7 +348,8 @@ cd <repo-root>
 - 如果目标串口还没有 `observe-serial` 人工观察会话，AI 的 `watch-serial --follow` 或串口控制动作会先唤醒系统默认终端打开 `observe-serial`
 - AI 侧优先使用不带 `raw_live` 的 `watch-serial`，跟随共享 trace
 - 后续串口动作应复用同一个受保护 broker，不要重新抢物理串口
-- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`，达到 64 MiB 时轮转为同目录的 `trace.<YYYYmmdd-HHMMSS>.jsonl`（默认保留最近 30 个）
+- 自动拉起的 `observe-serial` 最多等 60 秒；同一串口已有窗口在启动时不会再开新窗口；窗口打不开串口时立即返回真实原因，不要靠再开窗口重试
 - 只要用户还在看串口，AI 就不应主动调 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `options.force=true`
 

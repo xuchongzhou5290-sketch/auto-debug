@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Protocol
 
-from autodbg.utils.process import PID_UNKNOWN, pid_is_running, pid_state
+from autodbg.utils.process import PID_UNKNOWN, pid_is_running, pid_process_name, pid_state
 
 
 class SerialPortProtocol(Protocol):
@@ -246,10 +246,19 @@ def list_serial_ports() -> list[dict[str, str]]:
 
 
 @contextmanager
-def open_serial_port(port: str, baudrate: int, timeout: float = 0.2, *, broker_first: bool = True):
+def open_serial_port(
+    port: str,
+    baudrate: int,
+    timeout: float = 0.2,
+    *,
+    broker_first: bool = True,
+    control_wait: float | None = None,
+):
+    """control_wait: seconds to wait for another control session on this port (default _CONTROL_LOCK_WAIT_SECONDS)."""
+    lock_wait = _CONTROL_LOCK_WAIT_SECONDS if control_wait is None else control_wait
     broker_registry = load_serial_broker_registry(port)
     if broker_registry is not None:
-        with _acquire_control_lock(port):
+        with _acquire_control_lock(port, wait_timeout=lock_wait):
             handle = _BrokerSerialPort(
                 broker_registry=broker_registry,
                 serial_port=port,
@@ -262,7 +271,7 @@ def open_serial_port(port: str, baudrate: int, timeout: float = 0.2, *, broker_f
         return
     if broker_first:
         broker_registry = ensure_observe_serial_broker(port, baudrate=baudrate)
-        with _acquire_control_lock(port):
+        with _acquire_control_lock(port, wait_timeout=lock_wait):
             handle = _BrokerSerialPort(
                 broker_registry=broker_registry,
                 serial_port=port,
@@ -289,33 +298,290 @@ def _start_local_serial_broker(port: str, *, baudrate: int, timeout: float):
     return broker
 
 
+_OBSERVE_LAUNCH_WAIT_SECONDS = 60.0
+# a launch marker older than this no longer stops another launch, even if its window is still open
+_OBSERVE_LAUNCH_MARKER_MAX_AGE = 300.0
+_OBSERVE_LAUNCH_CLAIM_GRACE = 10.0
+_OBSERVE_LAUNCH_POLL_SECONDS = 0.2
+_OBSERVE_LAUNCH_LOCK_TIMEOUT = 10.0
+_OBSERVE_STATUS_MAX_AGE = 24 * 3600.0
+# set for a window launched by ensure_observe_serial_broker: where that window reports why it could not start
+OBSERVE_STATUS_FILE_ENV = "AUTO_DBG_OBSERVE_STATUS_FILE"
+
+
 def ensure_observe_serial_broker(
     port: str,
     *,
     baudrate: int,
-    wait_timeout: float = 8.0,
+    wait_timeout: float = _OBSERVE_LAUNCH_WAIT_SECONDS,
 ) -> SerialBrokerRegistry:
     registry = load_serial_broker_registry(port)
     if is_observe_serial_broker(registry):
         return registry
 
-    _launch_observe_serial_window(port, baudrate=baudrate)
+    # one window per port: a caller that finds another caller's window still starting waits for it, since every
+    # extra window used to start from scratch (and a slow start made each retry open one more)
+    launch, ours = _claim_observe_launch(port)
+    window = None
+    if ours:
+        try:
+            window = _launch_observe_serial_window(port, baudrate=baudrate, status_file=Path(launch["status_file"]))
+        except Exception:
+            _release_observe_launch(port, launch["token"])
+            raise
+        launch["window_pid"] = window.pid
+        _update_observe_launch(port, launch)
+    status_file = Path(launch["status_file"]) if launch.get("status_file") else None
+
     deadline = time.monotonic() + max(wait_timeout, 0.1)
     last_registry: SerialBrokerRegistry | None = registry
-    while time.monotonic() < deadline:
+    while True:
         registry = load_serial_broker_registry(port)
         if registry is not None:
             last_registry = registry
             if is_observe_serial_broker(registry):
+                if ours:
+                    _release_observe_launch(port, launch["token"])
+                    _remove_quietly(status_file)
                 return registry
-        time.sleep(0.1)
+        # the window reports through its own status file: python writes why it could not open the port,
+        # observe-serial.ps1 writes the exit code before it keeps a failed window open for the user to read
+        status = read_observe_launch_status(status_file) if status_file is not None else None
+        if status is not None:
+            if ours:
+                _release_observe_launch(port, launch["token"])
+            raise RuntimeError(_format_observe_launch_failure(port, status))
+        if ours:
+            exit_code = window.poll()
+            if exit_code is not None:
+                _release_observe_launch(port, launch["token"])
+                raise RuntimeError(_format_observe_launch_failure(port, {"exit_code": exit_code}))
+        elif _read_observe_launch_marker(port).get("token") != launch.get("token") or not _observe_launch_is_live(launch):
+            # its launcher clears the marker as soon as the broker registers: look once more before giving up
+            registry = load_serial_broker_registry(port)
+            if is_observe_serial_broker(registry):
+                return registry
+            status = read_observe_launch_status(status_file) if status_file is not None else None
+            if status is not None:
+                raise RuntimeError(_format_observe_launch_failure(port, status))
+            raise RuntimeError(
+                f"The observe-serial window another autodbg call opened for {port} closed before opening the port. "
+                f"Run observe-serial -SerialPort {port} in a terminal to see why."
+            )
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_OBSERVE_LAUNCH_POLL_SECONDS)
 
     if last_registry is not None:
         return protect_serial_broker_registry(port) or last_registry
+    window_pid = launch.get("window_pid")
+    window_text = f" (window pid {window_pid})" if window_pid else ""
     raise RuntimeError(
-        f"observe-serial did not start a protected broker for {port}. "
-        "Open observe-serial manually and retry."
+        f"observe-serial for {port} is still starting after {wait_timeout:.0f} s{window_text}. "
+        f"Its window was left open: wait until it shows {port} connected, then retry. "
+        f"Do not open another observe-serial for {port}."
     )
+
+
+def _format_observe_launch_failure(port: str, status: dict) -> str:
+    if status.get("error"):
+        lines = [f"observe-serial could not open {port}: {status['error']}"]
+        hints = status.get("hints")
+        if isinstance(hints, list):
+            lines.extend(f"Hint: {hint}" for hint in hints)
+        return "\n".join(lines)
+    return (
+        f"The observe-serial window for {port} exited with code {status.get('exit_code', 'unknown')} before opening "
+        f"the port. Run observe-serial -SerialPort {port} in a terminal to see why."
+    )
+
+
+def _observe_launch_marker_path(port: str) -> Path:
+    # no ".json" suffix: registry listings treat every *.json in this directory as a broker registry
+    return _serial_broker_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.launching"
+
+
+def _claim_observe_launch(port: str) -> tuple[dict, bool]:
+    """(launch, True) when this caller is to open the window, else (another caller's live launch, False)."""
+    safe_name = _windows_safe_name(_normalize_port_name(port))
+    with _observe_launch_lock(port):
+        current = _read_observe_launch_marker(port)
+        if _observe_launch_is_live(current):
+            return current, False
+        token = f"{os.getpid()}-{random.getrandbits(48):012x}"
+        launch = {
+            "token": token,
+            "launcher_pid": os.getpid(),
+            "window_pid": None,
+            "started_at": time.time(),
+            "status_file": str(_serial_broker_dir() / f"{safe_name}.launch-{token}.status"),
+        }
+        _write_text_atomic(_observe_launch_marker_path(port), json.dumps(launch) + "\n")
+    _remove_old_observe_status_files(safe_name)
+    return launch, True
+
+
+def _update_observe_launch(port: str, launch: dict) -> None:
+    with _observe_launch_lock(port):
+        if _read_observe_launch_marker(port).get("token") == launch["token"]:
+            _write_text_atomic(_observe_launch_marker_path(port), json.dumps(launch) + "\n")
+
+
+def _release_observe_launch(port: str, token: str) -> None:
+    """Remove the launch marker if it is still this launch's (a newer launch may have replaced a stale one)."""
+    try:
+        with _observe_launch_lock(port):
+            if _read_observe_launch_marker(port).get("token") == token:
+                _remove_quietly(_observe_launch_marker_path(port))
+    except RuntimeError:
+        pass
+
+
+@contextmanager
+def _observe_launch_lock(port: str):
+    """Serialize launch decisions for port across processes; the OS drops the lock if its holder dies."""
+    path = _serial_broker_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.launch-lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        deadline = time.monotonic() + _OBSERVE_LAUNCH_LOCK_TIMEOUT
+        while not _try_lock_fd(fd):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Timed out waiting for another autodbg call that is launching observe-serial for {port}.")
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _try_lock_fd(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_fd(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _read_observe_launch_marker(port: str) -> dict:
+    """The current launch marker for port, or {} when there is none."""
+    path = _observe_launch_marker_path(port)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    # unreadable content (an older autodbg's claim, or a crash mid-write): only its age is known
+    try:
+        return {"started_at": path.stat().st_mtime}
+    except OSError:
+        return {}
+
+
+def _observe_launch_is_live(marker: dict) -> bool:
+    if not marker:
+        return False
+    try:
+        started_at = float(marker.get("started_at") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    age = time.time() - started_at
+    if age > _OBSERVE_LAUNCH_MARKER_MAX_AGE:
+        return False
+    pid = marker.get("window_pid") or marker.get("launcher_pid")
+    if pid is None:
+        return age <= _OBSERVE_LAUNCH_CLAIM_GRACE
+    try:
+        return _pid_is_running(int(pid))
+    except (TypeError, ValueError):
+        return False
+
+
+def record_observe_start_error(port: str, error: str, hints: list[str]) -> None:
+    """Report to the autodbg call that launched this observe-serial window why it could not open the port."""
+    raw_path = os.getenv(OBSERVE_STATUS_FILE_ENV)
+    if not raw_path:
+        return  # opened by hand: nobody is waiting on it
+    payload = {
+        "serial_port": port,
+        "pid": os.getpid(),
+        "recorded_at": time.time(),
+        "error": error,
+        "hints": list(hints),
+    }
+    path = Path(raw_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text_atomic(path, json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_observe_launch_status(path: Path) -> dict | None:
+    """What a launched observe-serial window reported (an error, or the exit code), or None so far."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError):
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None  # being written
+    return payload if isinstance(payload, dict) else None
+
+
+def _remove_old_observe_status_files(safe_name: str) -> None:
+    # a window closed by the user after a successful start still writes its exit code; sweep those up now and then
+    try:
+        candidates = list(_serial_broker_dir().glob(f"{safe_name}.launch-*.status"))
+    except OSError:
+        return
+    now = time.time()
+    for path in candidates:
+        try:
+            if now - path.stat().st_mtime > _OBSERVE_STATUS_MAX_AGE:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _remove_quietly(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def is_observe_serial_broker(registry: SerialBrokerRegistry | None) -> bool:
@@ -360,7 +626,7 @@ def _notify_broker_protection(registry: SerialBrokerRegistry, owner: str) -> Non
         pass
 
 
-def _launch_observe_serial_window(port: str, *, baudrate: int) -> None:
+def _launch_observe_serial_window(port: str, *, baudrate: int, status_file: Path) -> subprocess.Popen:
     if os.name != "nt":
         raise RuntimeError("Auto-launching observe-serial is currently supported only on Windows.")
     project_root = _default_project_root()
@@ -371,6 +637,7 @@ def _launch_observe_serial_window(port: str, *, baudrate: int) -> None:
     env["AUTO_DBG_PROJECT_ROOT"] = str(project_root)
     env["AUTO_DBG_SERIAL_PORT"] = port
     env["AUTO_DBG_SERIAL_BAUDRATE"] = str(baudrate)
+    env[OBSERVE_STATUS_FILE_ENV] = str(status_file)
     args = [
         "powershell.exe",
         "-NoProfile",
@@ -387,7 +654,7 @@ def _launch_observe_serial_window(port: str, *, baudrate: int) -> None:
         "0",
     ]
     creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-    subprocess.Popen(args, cwd=str(project_root), env=env, creationflags=creationflags)
+    return subprocess.Popen(args, cwd=str(project_root), env=env, creationflags=creationflags)
 
 
 def _default_project_root() -> Path:
@@ -427,7 +694,13 @@ def _acquire_port_lock(port: str):
         lock_path,
         busy_message=f"Serial port {port} is already in use by another autodbg process.",
     ):
-        yield
+        # the port lock holder (a broker, or direct access) writes nearly every trace line: it alone rotates the trace
+        owner_key = _normalize_port_name(port)
+        _TRACE_ROTATION_OWNERS.add(owner_key)
+        try:
+            yield
+        finally:
+            _TRACE_ROTATION_OWNERS.discard(owner_key)
 
 
 def _serial_lock_dir() -> Path:
@@ -439,14 +712,29 @@ def _serial_lock_path(port: str) -> Path:
     return _serial_lock_dir() / f"{_windows_safe_name(_normalize_port_name(port))}.lock"
 
 
+_CONTROL_LOCK_WAIT_SECONDS = 20.0
+_CONTROL_LOCK_RETRY_SECONDS = 0.25
+
+
 @contextmanager
-def _acquire_control_lock(port: str):
+def _acquire_control_lock(port: str, *, wait_timeout: float = _CONTROL_LOCK_WAIT_SECONDS):
+    # two AI commands on one port used to fail at once; wait a while for the other one to finish instead
     lock_path = _serial_control_lock_path(port)
-    with _acquire_pid_lock(
-        lock_path,
-        busy_message=f"Serial port {port} is already in use by another autodbg control session.",
-    ):
-        yield
+    deadline = time.monotonic() + max(wait_timeout, 0.0)
+    while True:
+        acquired = False
+        try:
+            with _acquire_pid_lock(
+                lock_path,
+                busy_message=f"Serial port {port} is already in use by another autodbg control session.",
+            ):
+                acquired = True
+                yield
+            return
+        except SerialPortBusyError:
+            if acquired or time.monotonic() >= deadline:
+                raise
+        time.sleep(_CONTROL_LOCK_RETRY_SECONDS)
 
 
 @contextmanager
@@ -460,10 +748,10 @@ def _acquire_pid_lock(lock_path: Path, *, busy_message: str):
             break
         except FileExistsError as exc:
             if not _remove_stale_lock(lock_path):
-                raise SerialPortBusyError(busy_message) from exc
+                raise SerialPortBusyError(busy_message + _lock_holder_description(lock_path)) from exc
             time.sleep(random.uniform(0.01, 0.05) * (attempt + 1))
     else:
-        raise SerialPortBusyError(busy_message)
+        raise SerialPortBusyError(busy_message + _lock_holder_description(lock_path))
 
     try:
         yield
@@ -471,6 +759,14 @@ def _acquire_pid_lock(lock_path: Path, *, busy_message: str):
         if fd is not None:
             os.close(fd)
             _release_pid_lock(lock_path)
+
+
+def _lock_holder_description(lock_path: Path) -> str:
+    pid = _read_lock_pid(lock_path)
+    if pid is None:
+        return ""
+    name = pid_process_name(pid)
+    return f" Held by pid {pid}" + (f" ({name})." if name else ".")
 
 
 def _serial_control_lock_dir() -> Path:
@@ -894,6 +1190,15 @@ def _windows_safe_name(name: str, suffix: str = "_port") -> str:
     return f"{name[:cut].rstrip(' ')}{suffix}{name[cut:]}"
 
 
+_TRACE_MAX_BYTES_DEFAULT = 64 * 1024 * 1024
+_TRACE_KEEP_DEFAULT = 30
+_TRACE_ROTATION_RETRY_SECONDS = 2.0
+_ROTATED_TRACE_RE = re.compile(r"^trace\.(\d{8}-\d{6})(?:-(\d+))?\.jsonl$")
+_TRACE_ROTATION_OWNERS: set[str] = set()  # normalized ports whose port lock this process holds
+_TRACE_ROTATION_LOCK = threading.Lock()
+_TRACE_ROTATION_RETRY_AT: dict[Path, float] = {}
+
+
 def _append_trace_entry(port: str, direction: str, payload: str) -> SerialTraceEntry:
     entry = SerialTraceEntry(
         timestamp=datetime.now().isoformat(timespec="milliseconds"),
@@ -903,9 +1208,114 @@ def _append_trace_entry(port: str, direction: str, payload: str) -> SerialTraceE
         pid=os.getpid(),
     )
     log_path = serial_trace_log_path(port)
+    if _normalize_port_name(port) in _TRACE_ROTATION_OWNERS:
+        # rotate before writing, so trace.jsonl always exists and holds the newest line
+        max_bytes, keep = _trace_rotation_limits()
+        if max_bytes > 0:
+            _rotate_trace_log(log_path, max_bytes=max_bytes, keep=keep)
     with log_path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
     return entry
+
+
+def _trace_rotation_limits() -> tuple[int, int]:
+    """(rotate once the trace reaches this many bytes, rotated segments to keep); 0 disables either."""
+    return (
+        _env_int("AUTO_DBG_SERIAL_TRACE_MAX_BYTES", _TRACE_MAX_BYTES_DEFAULT),
+        _env_int("AUTO_DBG_SERIAL_TRACE_KEEP", _TRACE_KEEP_DEFAULT),
+    )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return default
+
+
+def _rotate_trace_log(log_path: Path, *, max_bytes: int, keep: int) -> Path | None:
+    """Rename trace.jsonl to trace.<YYYYmmdd-HHMMSS>[-n].jsonl so readers never face an ever-growing file."""
+    with _TRACE_ROTATION_LOCK:
+        if time.monotonic() < _TRACE_ROTATION_RETRY_AT.get(log_path, 0.0):
+            return None
+        try:
+            if log_path.stat().st_size < max_bytes:
+                return None
+        except OSError:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # above every segment of this second, even pruned ones' successors: reusing a freed name would sort the
+        # newest data first and get it pruned next
+        sequence = 1 + max(
+            (_rotation_sequence(path) for path in serial_trace_rotated_paths(log_path) if serial_trace_rotation_stamp(path) == stamp),
+            default=-1,
+        )
+        target = log_path.with_name(f"trace.{stamp}.jsonl" if sequence == 0 else f"trace.{stamp}-{sequence}.jsonl")
+        while target.exists():
+            sequence += 1
+            target = log_path.with_name(f"trace.{stamp}-{sequence}.jsonl")
+        try:
+            os.rename(log_path, target)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # Windows refuses to rename a file another process has open (a case marker being appended, a reader):
+            # keep appending to it and try again a little later
+            _TRACE_ROTATION_RETRY_AT[log_path] = time.monotonic() + _TRACE_ROTATION_RETRY_SECONDS
+            return None
+        _TRACE_ROTATION_RETRY_AT.pop(log_path, None)
+    if keep > 0:
+        for stale in serial_trace_rotated_paths(log_path)[:-keep]:
+            try:
+                stale.unlink()
+            except OSError:
+                continue
+    return target
+
+
+def serial_trace_rotated_paths(trace_path: Path) -> list[Path]:
+    """The rotated segments of trace_path, oldest first."""
+    try:
+        candidates = list(trace_path.parent.glob("trace.*.jsonl"))
+    except OSError:
+        return []
+    keyed: list[tuple[tuple[str, int], Path]] = []
+    for path in candidates:
+        match = _ROTATED_TRACE_RE.match(path.name)
+        if match:
+            keyed.append(((match.group(1), int(match.group(2) or 0)), path))
+    return [path for _key, path in sorted(keyed)]
+
+
+def serial_trace_rotation_stamp(path: Path) -> str | None:
+    """The YYYYmmdd-HHMMSS a rotated segment was rotated at, or None for any other file."""
+    match = _ROTATED_TRACE_RE.match(path.name)
+    return match.group(1) if match else None
+
+
+def _rotation_sequence(path: Path) -> int:
+    match = _ROTATED_TRACE_RE.match(path.name)
+    return int(match.group(2) or 0) if match else 0
+
+
+def serial_trace_stat(path: Path) -> tuple[int, str | None]:
+    """(size, identity) from one stat, so both describe the same file; (0, None) when it does not exist.
+
+    The identity survives a rename on the same volume; it is None when the filesystem reports none.
+    """
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return 0, None
+    file_id = f"{stat_result.st_dev}:{stat_result.st_ino}" if stat_result.st_ino else None
+    return stat_result.st_size, file_id
+
+
+def serial_trace_file_id(path: Path) -> str | None:
+    return serial_trace_stat(path)[1]
 
 
 class _TracedSerialPort:

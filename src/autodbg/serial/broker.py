@@ -22,6 +22,14 @@ from autodbg.serial.runtime import (
 )
 
 _REGISTRY_CHECK_INTERVAL = 2.0  # seconds between self-checks of our own registry entry
+# after the COM port drops (device reboot, USB replug) the reader reopens it on its own, first after
+# _RECONNECT_MIN_DELAY, then backing off to every _RECONNECT_MAX_DELAY seconds
+_RECONNECT_MIN_DELAY = 1.0
+_RECONNECT_MAX_DELAY = 2.0
+# a link that drops again within _RECONNECT_STABLE_SECONDS of opening waits twice as long before the next reopen
+# (up to _RECONNECT_FLAP_MAX_DELAY), or a wedged adapter would trace a connect/drop pair every second
+_RECONNECT_STABLE_SECONDS = 10.0
+_RECONNECT_FLAP_MAX_DELAY = 60.0
 
 
 class SerialBrokerStartError(RuntimeError):
@@ -61,6 +69,10 @@ class SerialBroker:
         self._registered = False
         self._registry_lock = threading.Lock()
         self._registry_thread: threading.Thread | None = None
+        self._reconnect_delay = _RECONNECT_MIN_DELAY
+        self._next_reconnect_at = 0.0
+        self._reopen_pause = _RECONNECT_MIN_DELAY
+        self._connected_at: float | None = None
 
     def start(self) -> None:
         self._serial_module = _import_serial()
@@ -77,6 +89,7 @@ class SerialBroker:
                 self._lock_context.__exit__(type(exc), exc, exc.__traceback__)
                 self._lock_context = None
             raise SerialBrokerStartError(f"Failed to open {self.serial_port}: {summary}") from exc
+        self._connected_at = time.monotonic()
         self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"BROKER_OPEN baudrate={self.baudrate}"))
         self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"SERIAL_CONNECTED baudrate={self.baudrate}"))
 
@@ -220,7 +233,9 @@ class SerialBroker:
         while not self._stop_event.is_set():
             serial_handle = self._get_serial_handle()
             if serial_handle is None:
-                time.sleep(0.1)
+                # used to wait for the next write to reconnect, so the screen froze after a device reboot
+                if not self._reconnect_when_due():
+                    time.sleep(0.1)
                 continue
             try:
                 raw = serial_handle.readline()
@@ -278,8 +293,24 @@ class SerialBroker:
                 self._serial = self._open_serial_handle()
             except Exception as exc:
                 raise RuntimeError(f"Failed to reconnect {self.serial_port}: {_serial_error_summary(exc)}") from exc
+            self._connected_at = time.monotonic()
         self._broadcast_trace(_append_trace_entry(self.serial_port, "sys", f"SERIAL_CONNECTED baudrate={self.baudrate}"))
         return self._serial
+
+    def _reconnect_when_due(self) -> bool:
+        """Try to reopen a dropped COM port once its backoff has elapsed; True when it is open again."""
+        now = time.monotonic()
+        if now < self._next_reconnect_at:
+            return False
+        try:
+            self._ensure_serial_connection()
+        except Exception:
+            # the failed attempt is not traced: a long unplug would otherwise flood the trace
+            self._next_reconnect_at = now + self._reconnect_delay
+            self._reconnect_delay = min(self._reconnect_delay * 2, _RECONNECT_MAX_DELAY)
+            return False
+        self._reconnect_delay = _RECONNECT_MIN_DELAY
+        return True
 
     def _mark_serial_unavailable(self, exc: BaseException) -> None:
         serial_handle = None
@@ -288,6 +319,13 @@ class SerialBroker:
                 return
             serial_handle = self._serial
             self._serial = None
+            now = time.monotonic()
+            if self._connected_at is not None and now - self._connected_at < _RECONNECT_STABLE_SECONDS:
+                self._reopen_pause = min(self._reopen_pause * 2, _RECONNECT_FLAP_MAX_DELAY)
+            else:
+                self._reopen_pause = _RECONNECT_MIN_DELAY
+            self._reconnect_delay = _RECONNECT_MIN_DELAY
+            self._next_reconnect_at = now + self._reopen_pause
         try:
             if serial_handle is not None:
                 serial_handle.close()
@@ -405,15 +443,14 @@ def serial_open_recovery_hints(serial_port: str, exc: BaseException | str) -> li
     summary = _serial_error_summary(exc) if isinstance(exc, BaseException) else str(exc)
     summary_lower = summary.lower()
     hints: list[str] = []
-    if (
-        "permissionerror" in summary_lower
-        or "access is denied" in summary_lower
-        or "permission denied" in summary_lower
-        or "拒绝访问" in summary
-        or "权限" in summary
-    ):
-        hints.append(f"Close other tools or stale observe-serial windows that may still hold {serial_port}.")
-    if (
+    # one cause per error, most specific first: pyserial reports WinError 31 as PermissionError(13, ...), and an
+    # access-denied open also says "could not open port", so keyword hits alone used to suggest unrelated fixes
+    if "already in use by another autodbg" in summary_lower:
+        hints.append(
+            f"Another autodbg observe-serial window or broker already owns {serial_port} (pid above); "
+            "use that window, or close it before opening a new one."
+        )
+    elif (
         "cannot configure port" in summary_lower
         or "winerror 31" in summary_lower
         or ", 31)" in summary_lower
@@ -424,9 +461,24 @@ def serial_open_recovery_hints(serial_port: str, exc: BaseException | str) -> li
             f"Windows reported the serial device is not functioning; unplug/replug the USB serial adapter for {serial_port} "
             "or disable/enable it in Device Manager."
         )
-    if "could not open port" in summary_lower or "file not found" in summary_lower or "找不到" in summary:
+    elif (
+        "permissionerror" in summary_lower
+        or "access is denied" in summary_lower
+        or "permission denied" in summary_lower
+        or "拒绝访问" in summary
+        or "权限" in summary
+    ):
+        hints.append(
+            f"Close other tools (SecureCRT, MobaXterm, PuTTY) or stale observe-serial windows that may still hold {serial_port}."
+        )
+    elif (
+        "filenotfounderror" in summary_lower
+        or "file not found" in summary_lower
+        or "cannot find" in summary_lower
+        or "找不到" in summary
+    ):
         hints.append(f"Confirm {serial_port} still exists in Device Manager and retry with the actual COM number.")
-    if not hints:
+    else:
         hints.append(f"Confirm {serial_port} exists, is not held by another program, then retry observe-serial.")
     hints.append(f"After the device is healthy, rerun: observe-serial -SerialPort {serial_port}")
     return hints

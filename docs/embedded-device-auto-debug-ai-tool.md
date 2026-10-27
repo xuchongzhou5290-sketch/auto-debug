@@ -141,7 +141,7 @@
 - AI 自己随后优先使用不带 `raw_live` 的 `watch-serial` 跟随共享 trace
 - `observe-serial` 的受保护 raw-live broker 是物理串口的单一拥有者
 - 其他 `autodbg` 命令应该复用 broker，而不是重新直接抢串口
-- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
+- 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`，达到 64 MiB 时轮转为同目录的 `trace.<YYYYmmdd-HHMMSS>.jsonl`（默认保留最近 30 个）
 
 对 AI 的实际含义：
 

@@ -1,7 +1,11 @@
 from pathlib import Path
 from contextlib import contextmanager
+import json
 import tempfile
+import threading
+import time
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 from autodbg.serial import runtime
@@ -164,6 +168,22 @@ class SerialRuntimeTest(unittest.TestCase):
             self.assertTrue(lock_path.exists())
             self.assertEqual(lock_path.read_text(encoding="ascii"), "999999")
 
+    def test_busy_port_error_names_the_process_holding_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as lock_dir:
+            lock_root = Path(lock_dir)
+            (lock_root / "com19.lock").write_text("5555", encoding="ascii")
+            with (
+                patch.object(runtime, "_serial_lock_dir", return_value=lock_root),
+                patch.object(runtime, "_pid_is_running", return_value=True),
+                patch.object(runtime, "pid_process_name", return_value="python.exe"),
+            ):
+                with self.assertRaises(runtime.SerialPortBusyError) as busy:
+                    with runtime._acquire_port_lock("COM19"):
+                        pass
+
+        self.assertIn("pid 5555", str(busy.exception))
+        self.assertIn("python.exe", str(busy.exception))
+
     def test_append_trace_entry_writes_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(runtime, "_serial_trace_dir", return_value=Path(temp_dir)):
@@ -197,14 +217,20 @@ class SerialRuntimeTest(unittest.TestCase):
         )
 
         with (
+            tempfile.TemporaryDirectory() as broker_dir,
+            patch.object(runtime, "_serial_broker_dir", return_value=Path(broker_dir)),
             patch.object(runtime, "load_serial_broker_registry", side_effect=[None, registry]),
             patch.object(runtime, "_launch_observe_serial_window") as launch_mock,
             patch.object(runtime.time, "sleep"),
         ):
+            launch_mock.return_value.poll.return_value = None
+            launch_mock.return_value.pid = 4242
             observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200, wait_timeout=0.5)
 
         self.assertEqual(observed, registry)
-        launch_mock.assert_called_once_with("COM19", baudrate=115200)
+        launch_mock.assert_called_once()
+        self.assertEqual(launch_mock.call_args.args, ("COM19",))
+        self.assertEqual(launch_mock.call_args.kwargs["baudrate"], 115200)
 
     def test_protect_serial_broker_registry_updates_existing_owner(self) -> None:
         with tempfile.TemporaryDirectory() as broker_dir:
@@ -375,6 +401,327 @@ class SerialRuntimeTest(unittest.TestCase):
         self.assertIsNotNone(registry)
         kill_mock.assert_called_once()
         self.assertFalse(broker_path.exists())
+
+
+class _FakeClock:
+    """Stands in for runtime.time: sleeping advances both clocks instantly."""
+
+    def __init__(self) -> None:
+        self.now = 1_000_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(seconds, 0.01)
+
+
+_PROTECTED_COM19 = runtime.SerialBrokerRegistry(
+    host="127.0.0.1",
+    tcp_port=9001,
+    pid=1234,
+    serial_port="COM19",
+    baudrate=115200,
+    owner="human-observe",
+    protected=True,
+)
+
+
+class ControlLockWaitTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = _FakeClock()
+        lock_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(lock_dir.cleanup)
+        self.lock_root = Path(lock_dir.name)
+        self.holder_lock = self.lock_root / "com19.lock"
+        self.holder_lock.write_text("5555", encoding="ascii")
+        for target, kwargs in (
+            ("time", {"new": self.clock}),
+            ("_serial_control_lock_dir", {"return_value": self.lock_root}),
+            ("_pid_is_running", {"side_effect": lambda pid: pid in {5555, runtime.os.getpid()}}),
+        ):
+            patcher = patch.object(runtime, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_waits_for_a_parallel_command_to_release_the_port(self) -> None:
+        started = self.clock.now
+        original_sleep = self.clock.sleep
+
+        def release_after_three_seconds(seconds: float) -> None:
+            original_sleep(seconds)
+            if self.clock.now - started >= 3.0 and self.holder_lock.exists():
+                self.holder_lock.unlink()
+
+        self.clock.sleep = release_after_three_seconds
+        with runtime._acquire_control_lock("COM19"):
+            self.assertEqual(self.holder_lock.read_text(encoding="ascii"), str(runtime.os.getpid()))
+
+        self.assertGreaterEqual(self.clock.now - started, 3.0)
+
+    def test_gives_up_after_the_deadline_and_names_the_holder(self) -> None:
+        started = self.clock.now
+
+        with self.assertRaises(runtime.SerialPortBusyError) as busy:
+            with runtime._acquire_control_lock("COM19", wait_timeout=10.0):
+                self.fail("must not acquire a lock held by a live process")
+
+        self.assertGreaterEqual(self.clock.now - started, 10.0)
+        self.assertLess(self.clock.now - started, 12.0)
+        self.assertIn("pid 5555", str(busy.exception))
+
+    def test_observe_window_input_does_not_freeze_while_an_ai_command_holds_the_port(self) -> None:
+        from autodbg.cli.watch import _send_watch_serial_text
+
+        started = self.clock.now
+        with patch.object(runtime, "load_serial_broker_registry", return_value=_PROTECTED_COM19):
+            ok, message = _send_watch_serial_text("COM19", 115200, "ls\n")
+
+        self.assertFalse(ok)
+        self.assertIn("already in use", message)
+        self.assertLessEqual(self.clock.now - started, 2.5)
+
+    def test_a_busy_error_raised_while_holding_the_lock_is_not_retried(self) -> None:
+        self.holder_lock.unlink()
+
+        with self.assertRaises(runtime.SerialPortBusyError) as raised:
+            with runtime._acquire_control_lock("COM19"):
+                raise runtime.SerialPortBusyError("from the command body")
+
+        self.assertEqual(str(raised.exception), "from the command body")
+        self.assertFalse(self.holder_lock.exists())
+
+
+class EnsureObserveSerialBrokerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = _FakeClock()
+        self.broker_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.broker_dir.cleanup)
+        self.ready_at: float | None = None
+        self.window = unittest.mock.Mock(pid=4242)
+        self.window.poll.return_value = None
+        self.status_files: list[Path] = []
+        self.launch_mock = unittest.mock.Mock(side_effect=self._launch)
+        self.alive_pids = {4242, runtime.os.getpid()}
+        for target, kwargs in (
+            ("time", {"new": self.clock}),
+            ("_serial_broker_dir", {"return_value": Path(self.broker_dir.name)}),
+            ("load_serial_broker_registry", {"side_effect": self._registry}),
+            ("_launch_observe_serial_window", {"new": self.launch_mock}),
+            ("_pid_is_running", {"side_effect": lambda pid: pid in self.alive_pids}),
+        ):
+            patcher = patch.object(runtime, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _launch(self, _port: str, *, baudrate: int, status_file: Path):
+        self.status_files.append(status_file)
+        return self.window
+
+    def _registry(self, _port: str):
+        if self.ready_at is not None and self.clock.now >= self.ready_at:
+            return _PROTECTED_COM19
+        return None
+
+    def _after(self, seconds: float, action) -> None:
+        """Run action once the fake clock has advanced `seconds` past now (it advances only while ensure sleeps)."""
+        due = self.clock.now + seconds
+        original_sleep = self.clock.sleep
+        done = {"value": False}
+
+        def sleep(step: float) -> None:
+            original_sleep(step)
+            if not done["value"] and self.clock.now >= due:
+                done["value"] = True
+                action()
+
+        self.clock.sleep = sleep
+
+    def _write_marker(self, **fields) -> Path:
+        marker_path = runtime._observe_launch_marker_path("COM19")
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(fields), encoding="utf-8")
+        return marker_path
+
+    def test_waits_for_an_observe_window_that_needs_twenty_seconds(self) -> None:
+        self.ready_at = self.clock.now + 20.0
+
+        observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+        self.launch_mock.assert_called_once()
+        self.assertFalse(runtime._observe_launch_marker_path("COM19").exists())
+
+    def test_a_retry_waits_for_the_window_already_starting_instead_of_opening_another(self) -> None:
+        with self.assertRaises(RuntimeError) as first:
+            runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+        self.assertIn("still starting", str(first.exception))
+        self.assertIn("4242", str(first.exception))
+
+        self.ready_at = self.clock.now + 5.0
+        observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+        self.launch_mock.assert_called_once()
+
+    def test_fails_fast_with_the_windows_reason_when_it_cannot_open_the_port(self) -> None:
+        started = self.clock.now
+
+        def window_records_its_error() -> None:
+            with patch.dict(runtime.os.environ, {"AUTO_DBG_OBSERVE_STATUS_FILE": str(self.status_files[-1])}):
+                runtime.record_observe_start_error(
+                    "COM19",
+                    "Failed to open COM19: Cannot configure port ... WinError 31",
+                    ["Windows reported the serial device is not functioning; unplug/replug the USB serial adapter"],
+                )
+
+        self._after(2.0, window_records_its_error)
+        with self.assertRaises(RuntimeError) as failure:
+            runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertLess(self.clock.now - started, 5.0)
+        self.assertIn("WinError 31", str(failure.exception))
+        self.assertIn("unplug/replug", str(failure.exception))
+        self.assertFalse(runtime._observe_launch_marker_path("COM19").exists())
+
+    def test_fails_fast_when_the_paused_window_reports_its_exit_code(self) -> None:
+        # python died before opening the port (no error recorded); observe-serial.ps1 then keeps the window open
+        # for the user to read, so the process never exits: the exit code it writes is the only signal
+        started = self.clock.now
+        self._after(3.0, lambda: self.status_files[-1].write_text('{"exit_code": 1}', encoding="ascii"))
+
+        with self.assertRaises(RuntimeError) as failure:
+            runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertLess(self.clock.now - started, 5.0)
+        self.assertIn("exited with code 1", str(failure.exception))
+
+    def test_fails_fast_when_the_window_process_exits(self) -> None:
+        started = self.clock.now
+        self.window.poll.side_effect = lambda: 1 if self.clock.now - started >= 3.0 else None
+
+        with self.assertRaises(RuntimeError) as failure:
+            runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertLess(self.clock.now - started, 5.0)
+        self.assertIn("exited with code 1", str(failure.exception))
+        self.assertFalse(runtime._observe_launch_marker_path("COM19").exists())
+
+    def test_another_windows_failure_is_not_taken_for_ours(self) -> None:
+        # e.g. a second window the user opened by hand, failing with "already in use" while ours starts
+        stale = Path(self.broker_dir.name) / "com19.launch-someoneelse.status"
+        stale.write_text(json.dumps({"error": "Serial port COM19 is already in use", "hints": []}), encoding="utf-8")
+        self.ready_at = self.clock.now + 3.0
+
+        observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+
+    def test_a_waiter_reports_the_launchers_failure_and_leaves_its_marker_alone(self) -> None:
+        status_file = Path(self.broker_dir.name) / "com19.launch-theirs.status"
+        marker_path = self._write_marker(
+            token="theirs",
+            launcher_pid=777,
+            window_pid=4242,
+            started_at=self.clock.now - 1.0,
+            status_file=str(status_file),
+        )
+        marker_text = marker_path.read_text(encoding="utf-8")
+        self._after(1.0, lambda: status_file.write_text(json.dumps({"error": "WinError 31", "hints": []}), encoding="utf-8"))
+
+        with self.assertRaises(RuntimeError) as failure:
+            runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertIn("WinError 31", str(failure.exception))
+        self.launch_mock.assert_not_called()
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), marker_text)
+
+    def test_a_waiting_caller_returns_the_broker_its_launcher_just_saw(self) -> None:
+        marker_path = self._write_marker(token="theirs", launcher_pid=777, window_pid=4242, started_at=self.clock.now - 1.0)
+        polls = {"count": 0}
+
+        def registry_appears_after_the_marker_is_cleared(_port: str):
+            polls["count"] += 1
+            if polls["count"] == 2:
+                # the launcher saw the broker and removed its marker between our two looks
+                marker_path.unlink()
+            return _PROTECTED_COM19 if polls["count"] >= 3 else None
+
+        with patch.object(runtime, "load_serial_broker_registry", side_effect=registry_appears_after_the_marker_is_cleared):
+            observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+        self.launch_mock.assert_not_called()
+
+    def test_an_abandoned_launch_claim_stops_blocking_after_a_short_grace(self) -> None:
+        # an older autodbg (or a crash between two writes) can leave an empty marker behind
+        marker_path = runtime._observe_launch_marker_path("COM19")
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("", encoding="utf-8")
+        runtime.os.utime(marker_path, (self.clock.now - 30.0, self.clock.now - 30.0))
+        self.ready_at = self.clock.now + 2.0
+
+        observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+        self.launch_mock.assert_called_once()
+
+    def test_relaunches_when_the_previous_window_is_gone(self) -> None:
+        self._write_marker(token="old", launcher_pid=777, window_pid=778, started_at=self.clock.now - 30.0)
+        self.ready_at = self.clock.now + 2.0
+
+        observed = runtime.ensure_observe_serial_broker("COM19", baudrate=115200)
+
+        self.assertEqual(observed, _PROTECTED_COM19)
+        self.launch_mock.assert_called_once()
+
+
+class EnsureObserveSerialBrokerConcurrencyTest(unittest.TestCase):
+    def test_simultaneous_callers_finding_a_stale_marker_open_one_window(self) -> None:
+        # real threads and clock: each caller judges the stale marker and would replace it
+        broker_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(broker_dir.cleanup)
+        launched: list[float] = []
+        launch_lock = threading.Lock()
+        window = unittest.mock.Mock(pid=4242)
+        window.poll.return_value = None
+
+        def launch(_port: str, *, baudrate: int, status_file: Path):
+            with launch_lock:
+                launched.append(time.monotonic())
+            return window
+
+        def registry(_port: str):
+            return _PROTECTED_COM19 if launched and time.monotonic() - launched[0] > 0.3 else None
+
+        with (
+            patch.object(runtime, "_serial_broker_dir", return_value=Path(broker_dir.name)),
+            patch.object(runtime, "load_serial_broker_registry", side_effect=registry),
+            patch.object(runtime, "_launch_observe_serial_window", side_effect=launch),
+            patch.object(runtime, "_pid_is_running", side_effect=lambda pid: pid in {4242, runtime.os.getpid()}),
+            patch.object(runtime, "_OBSERVE_LAUNCH_POLL_SECONDS", 0.02),
+        ):
+            runtime._observe_launch_marker_path("COM19").write_text(
+                json.dumps({"token": "dead", "launcher_pid": 777, "window_pid": 778, "started_at": time.time() - 30}),
+                encoding="utf-8",
+            )
+            results: list[object] = []
+            callers = [
+                threading.Thread(
+                    target=lambda: results.append(runtime.ensure_observe_serial_broker("COM19", baudrate=115200, wait_timeout=5.0))
+                )
+                for _ in range(6)
+            ]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(timeout=10.0)
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(results, [_PROTECTED_COM19] * 6)
 
 
 if __name__ == "__main__":

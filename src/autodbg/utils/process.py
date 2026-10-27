@@ -43,6 +43,35 @@ def pid_is_running(pid: int) -> bool:
     return pid_state(pid) != PID_DEAD
 
 
+def pid_process_name(pid: int) -> str | None:
+    """The executable name of pid (e.g. "python.exe"), or None when it cannot be determined."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        return _windows_process_name(int(pid))
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _windows_process_name(pid: int) -> str | None:  # pragma: no cover - exercised on Windows hosts
+    if pid > 0xFFFFFFFF:
+        return None
+    handle, _error = _open_process(pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not _kernel32().QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return os.path.basename(buffer.value) or None
+    finally:
+        _kernel32().CloseHandle(handle)
+
+
 def _windows_pid_state(pid: int) -> str:  # pragma: no cover - exercised on Windows hosts
     if pid > 0xFFFFFFFF:
         # not a Windows pid; OpenProcess would silently truncate it to another process's pid
@@ -72,6 +101,13 @@ def _kernel32():  # pragma: no cover - exercised on Windows hosts
         kernel32.GetExitCodeProcess.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
         _KERNEL32 = kernel32
     return _KERNEL32
 

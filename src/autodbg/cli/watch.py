@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from autodbg.control.controller import LoginResult
 from autodbg.serial.broker import SerialBroker, serial_open_recovery_hints
@@ -22,6 +22,8 @@ from autodbg.serial.runtime import (
     load_serial_broker_registry,
     open_serial_port,
     serial_trace_log_path,
+    serial_trace_rotated_paths,
+    serial_trace_stat,
     stop_serial_broker,
 )
 from autodbg.state.machine import StateSnapshot
@@ -33,30 +35,147 @@ def _cli_main_module():
     return cli_main
 
 
+_TRACE_TAIL_BLOCK_SIZE = 64 * 1024
+
+
+def _parse_trace_line(raw_line: bytes) -> SerialTraceEntry | None:
+    text = raw_line.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    try:
+        return SerialTraceEntry.from_json_line(text)
+    except Exception:
+        return None
+
+
+def _iter_trace_entries(trace_path: Path) -> Iterator[SerialTraceEntry]:
+    # line by line: a trace can be gigabytes, and decoding it as one string needed several times its size in RAM
+    try:
+        handle = trace_path.open("rb")
+    except FileNotFoundError:
+        return
+    with handle:
+        for raw_line in handle:
+            entry = _parse_trace_line(raw_line)
+            if entry is not None:
+                yield entry
+
+
 def _read_trace_entries(trace_path: Path) -> list[SerialTraceEntry]:
-    if not trace_path.exists():
+    return list(_iter_trace_entries(trace_path))
+
+
+def _iter_trace_history(trace_path: Path) -> Iterator[SerialTraceEntry]:
+    """Every entry, oldest first: the rotated segments (trace.<stamp>.jsonl), then trace.jsonl."""
+    for segment in [*serial_trace_rotated_paths(trace_path), trace_path]:
+        yield from _iter_trace_entries(segment)
+
+
+def _file_id(stat_result: os.stat_result) -> str | None:
+    # same form as serial_trace_stat()
+    return f"{stat_result.st_dev}:{stat_result.st_ino}" if stat_result.st_ino else None
+
+
+def _read_trace_tail(
+    trace_path: Path,
+    count: int,
+    *,
+    block_size: int = _TRACE_TAIL_BLOCK_SIZE,
+) -> list[SerialTraceEntry]:
+    """The last `count` entries, read backwards from the end so the cost does not grow with the trace size.
+
+    Continues into the newest rotated segments (trace.<stamp>.jsonl) when trace.jsonl was just rotated.
+    """
+    if count <= 0:
         return []
-    entries: list[SerialTraceEntry] = []
-    for raw_line in trace_path.read_text(encoding="utf-8").splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        try:
-            entries.append(SerialTraceEntry.from_json_line(raw_line))
-        except Exception:
-            continue
+    entries, current_id = _read_file_tail(trace_path, count, block_size=block_size)
+    # listed after reading trace.jsonl: a rotation in between then shows up here, under its new name
+    for segment in reversed(serial_trace_rotated_paths(trace_path)):
+        if len(entries) >= count:
+            break
+        older, segment_id = _read_file_tail(segment, count - len(entries), block_size=block_size)
+        if current_id is not None and segment_id == current_id:
+            continue  # the file just read, renamed meanwhile
+        entries[0:0] = older
     return entries
 
 
-def _resolve_watch_start_index(*, last_count: int, entry_count: int, tail: int, replay_existing: bool) -> int:
-    if replay_existing:
-        if tail <= 0:
-            return 0
-        return max(entry_count - tail, 0)
-    return min(last_count, entry_count)
+def _read_file_tail(path: Path, count: int, *, block_size: int) -> tuple[list[SerialTraceEntry], str | None]:
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return [], None
+    entries: list[SerialTraceEntry] = []
+    with handle:
+        file_id = _file_id(os.fstat(handle.fileno()))
+        position = handle.seek(0, os.SEEK_END)
+        carry = b""
+        while position > 0 and len(entries) < count:
+            read_size = min(block_size, position)
+            position -= read_size
+            handle.seek(position)
+            lines = (handle.read(read_size) + carry).split(b"\n")
+            # the first piece may be the end of a line that starts in an earlier block
+            carry = lines.pop(0) if position > 0 else b""
+            for raw_line in reversed(lines):
+                entry = _parse_trace_line(raw_line)
+                if entry is None:
+                    continue
+                entries.append(entry)
+                if len(entries) >= count:
+                    break
+    entries.reverse()
+    return entries, file_id
 
 
-def _print_trace_entries(entries: list[SerialTraceEntry], *, show_system: bool) -> None:
+TraceCursor = tuple[str | None, int]  # (identity of the file read, byte offset in it)
+
+
+def _trace_cursor(trace_path: Path) -> TraceCursor:
+    """The current end of the trace, to follow from."""
+    size, file_id = serial_trace_stat(trace_path)
+    return file_id, size
+
+
+def _read_trace_since(trace_path: Path, cursor: TraceCursor) -> tuple[list[SerialTraceEntry], TraceCursor]:
+    """Entries from the complete lines after cursor, and the cursor to continue from.
+
+    When trace.jsonl was rotated since, the rest of the old file (now trace.<stamp>.jsonl) comes first; a file
+    shorter than the offset (truncated, or no identity to tell) is read again from its beginning.
+    """
+    file_id, offset = cursor
+    try:
+        handle = trace_path.open("rb")
+    except FileNotFoundError:
+        return [], cursor  # mid-rotation: the next look finishes the old file
+    entries: list[SerialTraceEntry] = []
+    with handle:
+        stat_result = os.fstat(handle.fileno())
+        current_id = _file_id(stat_result)
+        if file_id is not None and current_id is not None and current_id != file_id:
+            for segment in reversed(serial_trace_rotated_paths(trace_path)):
+                if serial_trace_stat(segment)[1] == file_id:
+                    with segment.open("rb") as old_handle:
+                        entries.extend(_read_complete_lines(old_handle, offset, os.fstat(old_handle.fileno()).st_size)[0])
+                    break
+            offset = 0
+        elif stat_result.st_size < offset:
+            offset = 0
+        new_entries, offset = _read_complete_lines(handle, offset, stat_result.st_size)
+    return entries + new_entries, (current_id, offset)
+
+
+def _read_complete_lines(handle, offset: int, size: int) -> tuple[list[SerialTraceEntry], int]:
+    handle.seek(offset)
+    data = handle.read(max(size - offset, 0))
+    end = data.rfind(b"\n")
+    if end < 0:
+        return [], offset
+    entries = [entry for entry in map(_parse_trace_line, data[:end].split(b"\n")) if entry is not None]
+    return entries, offset + end + 1
+
+
+def _print_trace_entries(entries: Iterable[SerialTraceEntry], *, show_system: bool) -> None:
     for entry in entries:
         _print_watch_trace_entry(entry, show_system=show_system)
 
@@ -77,7 +196,7 @@ def _print_watch_trace_entry(entry: SerialTraceEntry, *, show_system: bool) -> b
         if entry.payload.startswith("SERIAL_UNAVAILABLE"):
             error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
             print(f"[ERROR] {entry.port} is unavailable: {error_summary}", flush=True)
-            print(f"[TODO] Press Enter to retry reconnecting {entry.port}.", flush=True)
+            print(f"[TODO] The broker keeps retrying {entry.port}; it reconnects once the device is back.", flush=True)
             return True
         if entry.payload.startswith("SERIAL_OPEN_FAILED"):
             error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
@@ -103,6 +222,8 @@ class _WatchStdinShellState:
         self.paused_new_lines = 0
         self.pause_log_end_index: int | None = None
         self.screen_dirty = True
+        # shown whenever no other message is: set while the serial link is down
+        self.link_lost_status: str | None = None
 
 
 _WATCH_TUI_SCROLLBACK_LIMIT = 2000
@@ -119,7 +240,7 @@ def _set_watch_status_message(
     *,
     transient_seconds: float | None = None,
 ) -> None:
-    state.status_message = message or _default_watch_status()
+    state.status_message = message or _resting_watch_status(state)
     state.status_expires_at = (
         time.monotonic() + max(transient_seconds, 0.1)
         if transient_seconds is not None
@@ -139,12 +260,16 @@ def _refresh_watch_status_message(
     if current < state.status_expires_at:
         return False
     state.status_expires_at = None
-    default_message = _default_watch_status()
-    if state.status_message != default_message:
-        state.status_message = default_message
+    resting_message = _resting_watch_status(state)
+    if state.status_message != resting_message:
+        state.status_message = resting_message
         state.screen_dirty = True
         return True
     return False
+
+
+def _resting_watch_status(state: _WatchStdinShellState) -> str:
+    return state.link_lost_status or _default_watch_status()
 
 
 def _watch_terminal_columns() -> int:
@@ -693,11 +818,14 @@ def _send_watch_newline_probe(serial_port: str, baudrate: int) -> tuple[bool, st
     return _send_watch_serial_text(serial_port, baudrate, "\n")
 
 
+_WATCH_INPUT_CONTROL_WAIT = 2.0  # the TUI is single-threaded: never block it for long on a busy port
+
+
 def _send_watch_serial_text(serial_port: str, baudrate: int, text: str) -> tuple[bool, str]:
     payload = text.encode("utf-8")
     display = text.rstrip("\r\n")
     try:
-        with open_serial_port(serial_port, baudrate, timeout=0.2) as handle:
+        with open_serial_port(serial_port, baudrate, timeout=0.2, control_wait=_WATCH_INPUT_CONTROL_WAIT) as handle:
             handle.write(payload)
             handle.flush()
         if not display:
@@ -892,6 +1020,9 @@ def _apply_watch_trace_entry_to_tui_state(
     if entry.direction == "sys":
         if entry.payload.startswith("SERIAL_CONNECTED"):
             baudrate = entry.payload.partition("baudrate=")[2] or "unknown"
+            if state.link_lost_status:
+                state.link_lost_status = None
+                _append_watch_recent_line(state, f"[DONE] {entry.port} connected again @ {baudrate}")
             _set_watch_status_message(
                 state,
                 f"{entry.port} connected successfully @ {baudrate}",
@@ -900,11 +1031,10 @@ def _apply_watch_trace_entry_to_tui_state(
             return
         if entry.payload.startswith("SERIAL_UNAVAILABLE"):
             error_summary = entry.payload.partition("error=")[2] or "serial link unavailable"
-            _set_watch_status_message(
-                state,
-                f"{entry.port} unavailable: {error_summary} | Enter=retry | Ctrl+L=login",
-                transient_seconds=_WATCH_TUI_TRANSIENT_STATUS_SECONDS,
-            )
+            # kept until SERIAL_CONNECTED: a status that vanished after 4 s left a silent, frozen-looking screen
+            state.link_lost_status = f"{entry.port} unavailable: {error_summary} | reconnecting... | Ctrl+L=login"
+            _append_watch_recent_line(state, f"[ERROR] {entry.port} unavailable: {error_summary}; reconnecting...")
+            _set_watch_status_message(state, state.link_lost_status, transient_seconds=None)
             return
         if not show_system:
             if not state.paused:
@@ -1001,9 +1131,9 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
     )
     assert serial_port is not None
     trace_path = cli_main.serial_trace_log_path(serial_port)
-    initial_entries = cli_main._read_trace_entries(trace_path)
     broker: SerialBroker | None = None
-    existing_broker = cli_main.load_serial_broker_registry(serial_port)
+    # announce first and open the port before any trace I/O: the observe window used to stay blank (and the
+    # port closed) while a multi-GB trace was parsed
     print("[ o.... ] 1/5 steps")
     print(f"[ACTIVE] Watching shared serial trace for {serial_port}")
     print(f"[TODO] Trace log: {trace_path}")
@@ -1011,6 +1141,7 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
         print("[ERROR] --stdin-shell requires --follow.")
         print("[TODO] Retry with watch-serial --follow --stdin-shell.")
         return 1
+    existing_broker = cli_main.load_serial_broker_registry(serial_port)
     if args.raw_live:
         if existing_broker is None:
             protect_human_session = bool(getattr(args, "protect_human_session", False))
@@ -1029,11 +1160,15 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 broker = None
+                hints = serial_open_recovery_hints(serial_port, exc)
                 print("[ xx... ] 2/5 steps")
                 print(f"[ERROR] Failed to open raw serial broker on {serial_port}.")
                 print(f"[TODO] {exc}")
-                for hint in serial_open_recovery_hints(serial_port, exc):
+                for hint in hints:
                     print(f"[TODO] {hint}")
+                if protect_human_session:
+                    # an AI caller that launched this window waits for its broker; give it the real reason
+                    cli_main.record_observe_start_error(serial_port, str(exc), hints)
                 return 1
             existing_broker = cli_main.load_serial_broker_registry(serial_port)
             print(f"[DONE] Raw serial broker started on {serial_port} @ {baudrate}")
@@ -1069,33 +1204,29 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
             print(f"[TODO] {exc}")
             return 1
         print(f"[DONE] observe-serial is active for {serial_port}; AI will attach without taking the COM port.")
+    replay_tail = args.tail > 0
+    # where the polling fallback continues from; taken before the tail so no line falls in between
+    follow_cursor = _trace_cursor(trace_path)
+    replay_entries = cli_main._read_trace_tail(trace_path, args.tail) if replay_tail else []
     if not trace_path.exists():
         print("[TODO] No shared trace file exists yet. observe-serial will create it after the first serial event.")
-    elif args.follow and args.tail == 0:
+    elif args.follow and not replay_tail:
         print("[TODO] Starting from the live edge; existing trace lines are hidden.")
-    elif args.tail > 0 and initial_entries:
-        print(f"[TODO] Replaying the latest {min(args.tail, len(initial_entries))} trace line(s) first.")
+    elif replay_entries:
+        print(f"[TODO] Replaying the latest {len(replay_entries)} trace line(s) first.")
     if args.follow and args.stdin_shell:
         print(f"[TODO] Interactive serial shell enabled on {serial_port}; TUI keeps status and operation hints inside the screen.")
     elif args.follow and args.stdin_probe:
         print(f"[TODO] Press Enter in this window to send a newline probe to {serial_port}.")
     try:
-        replay_existing = args.tail > 0
-        last_count = len(initial_entries) if args.follow and args.tail == 0 else 0
         seed_entries: list[SerialTraceEntry] = []
-        if initial_entries:
-            start_index = _resolve_watch_start_index(
-                last_count=last_count,
-                entry_count=len(initial_entries),
-                tail=args.tail,
-                replay_existing=replay_existing,
-            )
-            if args.follow and args.stdin_shell:
-                seed_entries = initial_entries[start_index:]
-            else:
-                _print_trace_entries(initial_entries[start_index:], show_system=args.show_system)
-            last_count = len(initial_entries)
-            replay_existing = False
+        if args.follow and args.stdin_shell:
+            seed_entries = replay_entries
+        elif replay_tail:
+            _print_trace_entries(replay_entries, show_system=args.show_system)
+        elif not args.follow:
+            # --tail 0 without --follow prints the whole history; stream it instead of loading it
+            _print_trace_entries(cli_main._iter_trace_history(trace_path), show_system=args.show_system)
         if not args.follow:
             return 0
         live_registry = cli_main.load_serial_broker_registry(serial_port)
@@ -1116,17 +1247,10 @@ def _command_watch_serial(args: argparse.Namespace) -> int:
                 initial_entries=seed_entries,
             )
             return 0
+        cursor = follow_cursor
         while True:
-            entries = cli_main._read_trace_entries(trace_path)
-            start_index = _resolve_watch_start_index(
-                last_count=last_count,
-                entry_count=len(entries),
-                tail=args.tail,
-                replay_existing=replay_existing,
-            )
-            _print_trace_entries(entries[start_index:], show_system=args.show_system)
-            last_count = len(entries)
-            replay_existing = False
+            entries, cursor = cli_main._read_trace_since(trace_path, cursor)
+            _print_trace_entries(entries, show_system=args.show_system)
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("[DONE] Shared serial trace stopped by user")

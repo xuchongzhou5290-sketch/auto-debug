@@ -162,6 +162,9 @@ AI 想先拿自描述清单时，可以直接调用：
 - 只要用户还在看串口，AI 就不应主动执行 `serial-broker-stop`
 - `observe-serial` 启动的 broker 会标记为人工观察会话；`serial-broker-stop` 默认拒绝停止，只有用户确认允许断开时才传 `force=true`
 - 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`（COM1~COM9 是 Windows 保留设备名，目录为 `<COMXX>_port`，如 `COM7_port`；注册与锁文件同理，如 `com7_port.json`）
+- `trace.jsonl` 达到 `AUTO_DBG_SERIAL_TRACE_MAX_BYTES`（默认 64 MiB）时，由持有串口的 broker 轮转为同目录的 `trace.<YYYYmmdd-HHMMSS>.jsonl`，默认保留最近 `AUTO_DBG_SERIAL_TRACE_KEEP=30` 个（设为 0 全部保留）；更早的行在这些文件里，`case-begin` / `case-end` 会跨轮转文件切片
+- AI 自动拉起 `observe-serial` 时最多等 60 秒；同一串口已有窗口在启动时，后续调用等它而不再开新窗口；窗口打不开串口时立即失败并带回窗口里的真实原因和处理建议，不要靠再开一个窗口重试
+- 串口读出错（设备重启、USB 拔插）后 broker 会每 1–2 秒自动重连，不再需要等下一次写入
 - 经串口发给设备的命令，每一行（连同 autodbg 加的包装）不得超过设备 profile `[serial] max_line_bytes`（默认 1000 字节，0 关闭检查）：busybox 行编辑一行只保留 1022 字节，超出部分连同右引号被丢掉，退出码丢失或 shell 停在续行提示符、吞掉之后所有命令。超长时不发送，状态为 `exec_refused` / `run_refused` / `collect_evidence_refused` / `bootstrap_network_refused` / `device_pull_refused` / `deploy_verify_refused`，`failure_stage=validate_command`、`retryable=false`，输出最后一行 `[TODO]` 带原因与改法。用户给的命令（exec、验证命令、`--shell-command`、bootstrap/check/post-pull/reboot/list）都在发送第一条之前全部检查，一条都不发；device-pull 的 auto 模式在探测选定传输方式后、发送任何传输命令前检查传输命令（此时只跑过 bootstrap/check/探测）。profile 把上限调低到内置命令放不下时，内置检查/证据命令逐条记为拒绝（结果里有 `error`），不中断整体流程。exec 的命令本身约可用 929 字节；run/health/collect-evidence/验证/post-pull/reboot 等命令外面还有约 260 字节的结构化包装，约可用 670 字节
 
 ## 4. `options` 字段

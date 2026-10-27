@@ -238,6 +238,7 @@ Get-Content .\docs\examples\agent-call-run.json | .\.venv\Scripts\python -m auto
 - 串口协同默认以 `observe-serial` 为物理 COM 口拥有者；如果目标串口还没有 `observe-serial` 人工观察会话，AI 侧串口动作会先唤醒系统默认终端打开 `observe-serial`
 - AI 后续使用 `watch-serial` 或控制命令连接这个受保护 broker，不直接抢物理 COM 口
 - 串口 trace 默认保存到 `<project_root>\autodbg\serial-log\<COMXX>\trace.jsonl`
+- `trace.jsonl` 达到 64 MiB 时自动轮转为同目录的 `trace.<YYYYmmdd-HHMMSS>.jsonl`，默认保留最近 30 个（环境变量 `AUTO_DBG_SERIAL_TRACE_MAX_BYTES` / `AUTO_DBG_SERIAL_TRACE_KEEP` 可调，`KEEP=0` 全部保留）
 
 详细约定见：
 
